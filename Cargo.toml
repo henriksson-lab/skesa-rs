@@ -1,0 +1,31 @@
+[package]
+name = "skesa-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of NCBI's SKESA genome assembler"
+license = "Unlicense"
+readme = "README.md"
+documentation = "https://docs.rs/skesa-rs"
+keywords = ["bioinformatics", "assembly", "genome", "kmer", "debruijn"]
+categories = ["science", "command-line-utilities"]
+exclude = ["SKESA/", "ffi/", "benches/"]
+
+[features]
+default = []
+ffi = ["dep:cc"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+noodles = { version = "0.109", features = ["fasta", "fastq"] }
+flate2 = "1"
+rayon = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+
+[[bench]]
+name = "kmer_bench"
+harness = false

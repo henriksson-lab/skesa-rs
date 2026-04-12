@@ -4,6 +4,13 @@ Pure Rust port of NCBI's [SKESA](https://github.com/ncbi/SKESA) (Strategic K-mer
 
 **Based on SKESA v2.4.0 / SAUTE v1.3.0** (commit [`27caba2`](https://github.com/ncbi/SKESA/commit/27caba2ed075c7f44dd5bd4a24332c23b5b2bdaa), 2024-10-11)
 
+This is a translation of the original code and not the authoritative implementation. This code should generate bitwise
+equal output to the original. Please report any deviations
+
+The aim of this project is to increase performance, especially by providing this code through a type-safe library interface.
+The code can also be compiled to be used for webassembly.
+
+
 ## Features
 
 - Pure Rust — no C/C++ dependencies, no Boost required

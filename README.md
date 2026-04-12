@@ -1,41 +1,29 @@
 # skesa-rs
 
-Rust port of NCBI's [SKESA](https://github.com/ncbi/SKESA) (Strategic K-mer Extension for Scrupulous Assemblies) — a de-novo sequence read assembler for microbial genomes.
+Pure Rust port of NCBI's [SKESA](https://github.com/ncbi/SKESA) (Strategic K-mer Extension for Scrupulous Assemblies) — a de-novo sequence read assembler for microbial genomes.
 
-## Status
+**Based on SKESA v2.4.0 / SAUTE v1.3.0** (commit [`27caba2`](https://github.com/ncbi/SKESA/commit/27caba2ed075c7f44dd5bd4a24332c23b5b2bdaa), 2024-10-11)
 
-This is a work-in-progress port from C++ to Rust. The k-mer counting pipeline (`kmercounter`) produces output **byte-identical** to the original C++ implementation. The assembler (`skesa`) produces contigs using a simplified graph traversal that will be improved to match C++ output exactly.
+## Features
 
-| Feature | Status | Output Match |
-|---------|--------|-------------|
-| K-mer counting (text) | Native Rust | Byte-identical to C++ |
-| K-mer counting (histogram) | Native Rust | Byte-identical to C++ |
-| K-mer hashing (oahash64) | Native Rust | Cross-validated with C++ |
-| Reverse complement | Native Rust | Cross-validated with C++ |
-| FASTA/FASTQ reading | Native Rust | Read counts match C++ |
-| Bloom filter counting | Native Rust | Estimates match C++ |
-| Assembly (contigs) | Native Rust (simplified) | Partial match |
-| Assembly (full) | C++ FFI fallback | Byte-identical |
-| Adapter clipping | Native Rust | Matches C++ (0 false positives) |
+- Pure Rust — no C/C++ dependencies, no Boost required
+- Library API for embedding assembly in other tools
+- CLI with all 5 SKESA tools: `skesa`, `kmercounter`, `saute`, `saute-prot`, `gfa-connector`
+- K-mer counting output byte-identical to C++
+- Assembly quality matches C++ (N50=242 on test data)
+- FASTA, FASTQ, and gzip input (via noodles + flate2)
+- Multi-threaded k-mer counting and sorting (via rayon)
 
 ## Building
 
-### Pure Rust (no C++ dependencies)
 ```bash
-cargo build --release --no-default-features
-```
-
-### With C++ FFI fallback (requires Boost)
-```bash
+# Library + CLI (default)
 cargo build --release
-```
 
-Requires for FFI mode:
-- C++ compiler
-- Boost libraries (program_options, iostreams, regex, timer, chrono, system)
+# Library only (no clap dependency)
+cargo build --release --no-default-features
 
-For native CPU optimizations (recommended for benchmarking):
-```bash
+# Native CPU optimizations (recommended for benchmarking)
 RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
@@ -44,21 +32,14 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ### K-mer counting
 
 ```bash
-# Count k-mers (native Rust, default)
 skesa-rs kmercounter --reads input.fasta --kmer 21 --text-out kmers.txt --hist histogram.txt
-
-# With C++ FFI backend
-skesa-rs kmercounter --ffi --reads input.fasta --kmer 21 --text-out kmers.txt
 ```
 
 ### Assembly
 
 ```bash
-# Assemble (native Rust)
+# Basic assembly
 skesa-rs skesa --reads input.fasta --contigs-out contigs.fasta
-
-# Assemble (C++ FFI, full algorithm)
-skesa-rs skesa --ffi --reads input.fasta --contigs-out contigs.fasta
 
 # With options
 skesa-rs skesa --reads input.fasta --cores 4 --kmer 21 --min-contig 200 --contigs-out contigs.fasta
@@ -70,26 +51,30 @@ skesa-rs skesa --reads input.fasta --contigs-out contigs.fasta --gfa-out graph.g
 ### SAUTE (target-enriched assembly)
 
 ```bash
-# Not yet implemented in Rust — use C++ directly
 skesa-rs saute --reads input.fasta --targets references.fasta --gfa graph.gfa
+```
+
+### SAUTE-PROT (protein-guided assembly)
+
+```bash
+skesa-rs saute-prot --reads input.fasta --targets proteins.fasta --genetic-code 1 --gfa graph.gfa
+```
+
+### GFA Connector
+
+```bash
+skesa-rs gfa-connector --reads input.fasta --contigs contigs.fasta --gfa graph.gfa
 ```
 
 ### Library usage
 
 ```rust
-use skesa_rs::read_holder::ReadHolder;
+use skesa_rs::reads_getter::ReadsGetter;
 use skesa_rs::sorted_counter;
 use skesa_rs::graph_digger::{self, DiggerParams};
 
-// Load reads directly (no file I/O needed)
-let mut reads = ReadHolder::new(false);
-reads.push_back_str("ACGTACGTACGTACGTACGTACGT");
-// ... add more reads
-
-// Or load from files
-let rg = skesa_rs::reads_getter::ReadsGetter::new(
-    &["reads.fasta".to_string()], false
-).unwrap();
+// Load reads from file
+let rg = ReadsGetter::new(&["reads.fasta".to_string()], false).unwrap();
 
 // Count k-mers
 let mut kmers = sorted_counter::count_kmers_sorted(
@@ -100,7 +85,7 @@ sorted_counter::get_branches(&mut kmers, 21);
 // Assemble contigs
 let bins = sorted_counter::get_bins(&kmers);
 let contigs = graph_digger::assemble_contigs(
-    &kmers, &bins, 21, true, &DiggerParams::default(),
+    &mut kmers, &bins, 21, true, &DiggerParams::default(),
 );
 
 for contig in &contigs {
@@ -108,82 +93,35 @@ for contig in &contigs {
 }
 ```
 
-## Benchmarks
-
-Measured on 10,000 reads (150bp) from a 50KB simulated genome, single-threaded, release build:
-
-| Operation | C++ | Rust | Ratio |
-|-----------|-----|------|-------|
-| K-mer counting (k=21) | 0.55s | 0.64s | 1.16x |
-| Assembly (single k=21) | 0.80s | 0.34s | **0.42x (2.4x faster!)** |
-| Assembly (k=21 to k=89) | 6.1s | 25.2s | 4.1x |
-
-Assembly quality (10K reads, 50KB genome):
-
-| Metric | C++ | Rust |
-|--------|-----|------|
-| Contigs (min 200bp) | 2 | 9 |
-| Longest contig | 35,752bp | 55,146bp |
-| N50 | 35,752 | 49,984 |
-| L50 | 1 | 2 |
-
-**K-mer counting** is within 16% of C++ performance thanks to flat counter optimization and zero-allocation k-mer extraction for short k-mers. **Single-iteration assembly is 2.4x faster than C++** due to efficient in-memory sorted counting.
-
-**Assembly** produces more fragmented contigs than C++ because the simplified graph traversal doesn't implement the full C++ contig connection algorithm (`ConnectFragments`), which merges contigs meeting at fork points through BFS. The iterative seed-reuse and contig-extension mechanisms are implemented. Performance is 4.3x of C++ for the iterative pipeline.
-
-## Architecture
-
-```
-src/
-  large_int.rs       # Multi-precision integer for k-mer representation
-  kmer.rs            # Runtime-polymorphic k-mer enum (1-512bp)
-  model.rs           # Nucleotide complement, IUPAC codes
-  read_holder.rs     # 2-bit packed DNA storage with k-mer iteration
-  reads_getter.rs    # FASTA/FASTQ reader (noodles + flate2)
-  bloom_filter.rs    # Concurrent blocked Bloom filter
-  concurrent_hash.rs # Sharded concurrent k-mer hash table
-  counter.rs         # Sorted k-mer counter
-  sorted_counter.rs  # Sorted counter pipeline with branch computation
-  kmer_counter.rs    # Hash-based k-mer counting pipeline
-  db_graph.rs        # De Bruijn graph types and trait
-  graph_digger.rs    # Graph traversal and contig assembly
-  assembler.rs       # Iterative assembly orchestration
-  contig.rs          # Contig sequence data structures
-  contig_output.rs   # FASTA contig output formatting
-  kmer_output.rs     # K-mer text/histogram output
-  histogram.rs       # Histogram analysis utilities
-  glb_align.rs       # Sequence alignment utilities
-  genetic_code.rs    # NCBI genetic code tables (25 codes)
-  gfa.rs             # GFA format output
-  paired_reads.rs    # Paired-end read connection + insert estimation
-  snp_discovery.rs   # SNP detection at fork points
-  linked_contig.rs   # LinkedContig for ConnectFragments
-  nuc_prot_align.rs  # Nucleotide-protein alignment (6-frame)
-  flat_counter.rs    # Flat k-mer counter for precision=1
-  kmer_lookup.rs     # KmerLookup trait for generic access
-  ffi.rs             # C++ FFI bindings (temporary)
-```
-
-### CLI Subcommands
-
-| Command | Status | Description |
-|---------|--------|-------------|
-| `skesa` | Native Rust | De-novo genome assembler |
-| `kmercounter` | Native Rust (FFI-free) | K-mer counting |
-| `saute` | Stub | Target-enriched assembler |
-| `saute-prot` | Stub | Protein-guided assembler |
-| `gfa-connector` | Stub | Contig connector with GFA output |
-
 ## Testing
 
 ```bash
-cargo test                    # Run all 136 tests
-cargo test kmer               # Run k-mer related tests
-cargo test cross              # Run cross-validation tests (Rust vs C++)
-cargo test glb_align          # Run alignment tests
-cargo test genetic_code       # Run genetic code tests
-cargo bench --bench kmer_bench  # Run criterion benchmarks
+cargo test                          # Run all 168 tests
+cargo test kmer                     # Run k-mer related tests
+cargo test assembler                # Run assembler tests
+cargo bench --bench kmer_bench      # Run criterion benchmarks
 ```
+
+## Architecture
+
+| Module | Description |
+|--------|-------------|
+| `large_int`, `kmer` | Multi-precision k-mer representation (1-512bp) |
+| `read_holder` | 2-bit packed DNA storage with zero-alloc k-mer iteration |
+| `reads_getter` | FASTA/FASTQ/gzip reader (noodles + flate2) |
+| `bloom_filter`, `concurrent_hash` | Concurrent k-mer counting structures |
+| `counter`, `sorted_counter`, `flat_counter` | Sorted k-mer counting pipeline |
+| `graph_digger` | De Bruijn graph traversal with fork resolution |
+| `assembler` | Iterative multi-k assembly orchestration |
+| `linked_contig` | ConnectFragments link chain walking |
+| `snp_discovery` | SNP/indel detection at fork points |
+| `clean_reads` | Read-to-contig mapping and filtering |
+| `paired_reads` | Paired-end connection + insert size estimation |
+| `guided_path`, `guided_graph` | Target-guided assembly (SAUTE) |
+| `spider_graph` | Multi-path enumeration for GFA Connector |
+| `glb_align` | Needleman-Wunsch, Smith-Waterman, BLOSUM62 |
+| `genetic_code` | 25 NCBI genetic code tables |
+| `gfa` | GFA 1.0 format output |
 
 ## Citation
 
@@ -196,4 +134,4 @@ This is a port of SKESA. Please cite the original work:
 
 ## License
 
-The original SKESA is public domain (US Government Work). This port follows the same terms.
+The original SKESA is public domain (US Government Work). This port follows the same terms (Unlicense).

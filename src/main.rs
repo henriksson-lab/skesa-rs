@@ -1,5 +1,3 @@
-#[cfg(feature = "ffi")]
-use std::ffi::CString;
 use std::fs::File;
 use std::io::BufWriter;
 use std::process;
@@ -8,8 +6,6 @@ use clap::{Parser, Subcommand};
 
 use skesa_rs::assembler::{self, AssemblerParams};
 use skesa_rs::contig_output;
-#[cfg(feature = "ffi")]
-use skesa_rs::ffi;
 use skesa_rs::kmer_counter;
 use skesa_rs::kmer_output;
 use skesa_rs::reads_getter::ReadsGetter;
@@ -143,9 +139,6 @@ struct SkesaArgs {
     #[arg(long)]
     gfa_out: Option<String>,
 
-    /// Use C++ FFI backend instead of native Rust
-    #[arg(long, default_value_t = false)]
-    ffi: bool,
 }
 
 #[derive(Parser)]
@@ -194,9 +187,6 @@ struct KmercounterArgs {
     #[arg(long, default_value_t = 0)]
     cores: i32,
 
-    /// Use C++ FFI backend instead of native Rust
-    #[arg(long, default_value_t = false)]
-    ffi: bool,
 }
 
 #[derive(Parser)]
@@ -613,33 +603,7 @@ fn run_saute(args: &SauteArgs) -> i32 {
     0
 }
 
-#[cfg(feature = "ffi")]
-fn to_cstring(s: &str) -> CString {
-    CString::new(s).expect("invalid string for C")
-}
-
-#[cfg(feature = "ffi")]
-fn opt_cstring(opt: &Option<String>) -> Option<CString> {
-    opt.as_ref().map(|s| to_cstring(s))
-}
-
-#[cfg(feature = "ffi")]
-fn opt_ptr(opt: &Option<CString>) -> *const i8 {
-    opt.as_ref().map_or(std::ptr::null(), |s| s.as_ptr())
-}
-
 fn run_skesa(args: &SkesaArgs) -> i32 {
-    if !args.ffi {
-        return run_skesa_rust(args);
-    }
-    #[cfg(feature = "ffi")]
-    { run_skesa_ffi(args)}
-    #[cfg(not(feature = "ffi"))]
-    { eprintln!("FFI not available. Build with default features for --ffi support."); return 1; }
-}
-
-/// Native Rust skesa assembly
-fn run_skesa_rust(args: &SkesaArgs) -> i32 {
     // Load reads
     let rg = match ReadsGetter::new(&args.reads, args.use_paired_ends) {
         Ok(rg) => rg,
@@ -745,57 +709,7 @@ fn run_skesa_rust(args: &SkesaArgs) -> i32 {
     0
 }
 
-#[cfg(feature = "ffi")]
-fn run_skesa_ffi(args: &SkesaArgs) -> i32 {
-    let c_files: Vec<CString> = args.reads.iter().map(|s| to_cstring(s)).collect();
-    let c_file_ptrs: Vec<*const i8> = c_files.iter().map(|s| s.as_ptr()).collect();
-
-    let min_count = args.min_count.unwrap_or(2);
-    let max_kmer_count = args.max_kmer_count.unwrap_or(10);
-    let estimate_min_count = args.min_count.is_none() && args.max_kmer_count.is_none();
-
-    let seeds = opt_cstring(&args.seeds);
-    let contigs_out = opt_cstring(&args.contigs_out);
-    let all_out = opt_cstring(&args.all);
-    let hist_out = opt_cstring(&args.hist);
-    let connected_reads = opt_cstring(&args.connected_reads);
-    let dbg_out = opt_cstring(&args.dbg_out);
-
-    unsafe {
-        ffi::skesa_run_assembler(
-            c_file_ptrs.as_ptr(),
-            c_file_ptrs.len() as i32,
-            args.cores,
-            args.hash_count as i32,
-            args.memory,
-            args.estimated_kmers,
-            args.skip_bloom_filter as i32,
-            args.kmer,
-            args.max_kmer,
-            args.steps,
-            min_count,
-            estimate_min_count as i32,
-            args.fraction,
-            args.vector_percent,
-            args.max_snp_len,
-            args.min_contig,
-            args.allow_snps as i32,
-            args.use_paired_ends as i32,
-            args.force_single_ends as i32,
-            args.insert_size,
-            max_kmer_count,
-            opt_ptr(&seeds),
-            opt_ptr(&contigs_out),
-            opt_ptr(&all_out),
-            opt_ptr(&hist_out),
-            opt_ptr(&connected_reads),
-            opt_ptr(&dbg_out),
-        )
-    }
-}
-
-/// Native Rust kmercounter implementation
-fn run_kmercounter_rust(args: &KmercounterArgs) -> i32 {
+fn run_kmercounter(args: &KmercounterArgs) -> i32 {
     // Load reads
     let rg = match ReadsGetter::new(&args.reads, false) {
         Ok(rg) => rg,
@@ -917,44 +831,6 @@ fn run_kmercounter_rust(args: &KmercounterArgs) -> i32 {
     0
 }
 
-/// FFI-based kmercounter (original C++ code)
-#[cfg(feature = "ffi")]
-fn run_kmercounter_ffi(args: &KmercounterArgs) -> i32 {
-    let c_files: Vec<CString> = args.reads.iter().map(|s| to_cstring(s)).collect();
-    let c_file_ptrs: Vec<*const i8> = c_files.iter().map(|s| s.as_ptr()).collect();
-
-    let text_out = opt_cstring(&args.text_out);
-    let hist_out = opt_cstring(&args.hist);
-    let dbg_out = opt_cstring(&args.dbg_out);
-
-    unsafe {
-        ffi::skesa_run_kmercounter(
-            c_file_ptrs.as_ptr(),
-            c_file_ptrs.len() as i32,
-            args.kmer,
-            args.min_count,
-            args.vector_percent,
-            args.estimated_kmers,
-            args.skip_bloom_filter as i32,
-            args.no_strand_info as i32,
-            args.cores,
-            opt_ptr(&text_out),
-            opt_ptr(&hist_out),
-            opt_ptr(&dbg_out),
-        )
-    }
-}
-
-fn run_kmercounter(args: &KmercounterArgs) -> i32 {
-    if args.ffi {
-        #[cfg(feature = "ffi")]
-        { run_kmercounter_ffi(args)}
-        #[cfg(not(feature = "ffi"))]
-        { eprintln!("FFI not available. Build with default features for --ffi support."); return 1; }
-    } else {
-        run_kmercounter_rust(args)
-    }
-}
 
 fn main() {
     let cli = Cli::parse();

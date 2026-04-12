@@ -74,10 +74,3 @@ pub mod sorted_counter;
 pub mod graph_digger;
 pub mod assembler;
 
-// FFI (C++ backend — disable with --no-default-features)
-#[cfg(feature = "ffi")]
-pub mod ffi;
-
-// Internal tests (require FFI)
-#[cfg(feature = "ffi")]
-mod cross_validation;

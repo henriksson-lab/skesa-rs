@@ -1,14 +1,14 @@
+use crate::counter::KmerCount;
+use crate::kmer::Kmer;
 /// Spider graph for GFA Connector: multi-path enumeration between contigs.
 ///
-/// Port of SKESA's Spider class from gfa.hpp.
+/// Partial Rust implementation of SKESA's Spider graph concepts from gfa.hpp.
 ///
 /// The spider graph explores paths between contig endpoints through the
 /// de Bruijn graph, enumerating possible orderings of contigs that are
 /// consistent with the graph structure. This produces a richer GFA output
 /// with links between segments.
 use std::collections::{HashMap, HashSet, VecDeque};
-use crate::counter::KmerCount;
-use crate::kmer::Kmer;
 
 /// A connection found between two contigs through the graph
 #[derive(Clone, Debug)]
@@ -55,14 +55,22 @@ pub fn find_contig_connections(
         // First k-mer (for left-side connections)
         let first_kmer = Kmer::from_kmer_str(&seq[..kmer_len]);
         let rc_first = first_kmer.revcomp(kmer_len);
-        let canonical = if first_kmer < rc_first { first_kmer } else { rc_first };
+        let canonical = if first_kmer < rc_first {
+            first_kmer
+        } else {
+            rc_first
+        };
         let key = canonical.to_words()[..precision].to_vec();
         target_kmers.entry(key).or_default().push((i, false));
 
         // Last k-mer (for right-side connections)
         let last_kmer = Kmer::from_kmer_str(&seq[seq.len() - kmer_len..]);
         let rc_last = last_kmer.revcomp(kmer_len);
-        let canonical_last = if last_kmer < rc_last { last_kmer } else { rc_last };
+        let canonical_last = if last_kmer < rc_last {
+            last_kmer
+        } else {
+            rc_last
+        };
         let key_last = canonical_last.to_words()[..precision].to_vec();
         target_kmers.entry(key_last).or_default().push((i, true));
     }
@@ -311,11 +319,20 @@ pub fn collapse_bubbles(
 
     for bubble in &bubbles {
         // Score each path by total contig length
-        let best_path_idx = bubble.paths.iter().enumerate()
+        let best_path_idx = bubble
+            .paths
+            .iter()
+            .enumerate()
             .max_by_key(|(_, path)| {
-                path.iter().map(|&idx| {
-                    if idx < contigs.len() { contigs[idx].len() } else { 0 }
-                }).sum::<usize>()
+                path.iter()
+                    .map(|&idx| {
+                        if idx < contigs.len() {
+                            contigs[idx].len()
+                        } else {
+                            0
+                        }
+                    })
+                    .sum::<usize>()
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -348,7 +365,9 @@ pub fn collapse_bubbles(
         }
     }
 
-    connections.iter().enumerate()
+    connections
+        .iter()
+        .enumerate()
         .filter(|(i, _)| keep[*i])
         .map(|(_, c)| c.clone())
         .collect()
@@ -370,10 +389,34 @@ mod tests {
     fn test_bubble_detection() {
         // Diamond: 0→1→3, 0→2→3
         let connections = vec![
-            ContigConnection { left_contig: 0, right_contig: 1, connecting_seq: vec!['A'], right_is_rc: false, left_is_rc: false },
-            ContigConnection { left_contig: 0, right_contig: 2, connecting_seq: vec!['C'], right_is_rc: false, left_is_rc: false },
-            ContigConnection { left_contig: 1, right_contig: 3, connecting_seq: vec!['G'], right_is_rc: false, left_is_rc: false },
-            ContigConnection { left_contig: 2, right_contig: 3, connecting_seq: vec!['T'], right_is_rc: false, left_is_rc: false },
+            ContigConnection {
+                left_contig: 0,
+                right_contig: 1,
+                connecting_seq: vec!['A'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
+            ContigConnection {
+                left_contig: 0,
+                right_contig: 2,
+                connecting_seq: vec!['C'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
+            ContigConnection {
+                left_contig: 1,
+                right_contig: 3,
+                connecting_seq: vec!['G'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
+            ContigConnection {
+                left_contig: 2,
+                right_contig: 3,
+                connecting_seq: vec!['T'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
         ];
         let bubbles = find_bubbles(&connections, 4, 5);
         assert!(!bubbles.is_empty(), "Should detect diamond bubble");
@@ -385,33 +428,84 @@ mod tests {
     #[test]
     fn test_bubble_collapse() {
         let connections = vec![
-            ContigConnection { left_contig: 0, right_contig: 1, connecting_seq: vec!['A'], right_is_rc: false, left_is_rc: false },
-            ContigConnection { left_contig: 0, right_contig: 2, connecting_seq: vec!['C'], right_is_rc: false, left_is_rc: false },
-            ContigConnection { left_contig: 1, right_contig: 3, connecting_seq: vec!['G'], right_is_rc: false, left_is_rc: false },
-            ContigConnection { left_contig: 2, right_contig: 3, connecting_seq: vec!['T'], right_is_rc: false, left_is_rc: false },
+            ContigConnection {
+                left_contig: 0,
+                right_contig: 1,
+                connecting_seq: vec!['A'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
+            ContigConnection {
+                left_contig: 0,
+                right_contig: 2,
+                connecting_seq: vec!['C'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
+            ContigConnection {
+                left_contig: 1,
+                right_contig: 3,
+                connecting_seq: vec!['G'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
+            ContigConnection {
+                left_contig: 2,
+                right_contig: 3,
+                connecting_seq: vec!['T'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
         ];
         let contigs = vec![
-            "AAAA".to_string(),        // 0
-            "CCCCCCCCCC".to_string(),   // 1 - longer, should be preferred
-            "GG".to_string(),           // 2 - shorter
-            "TTTT".to_string(),         // 3
+            "AAAA".to_string(),       // 0
+            "CCCCCCCCCC".to_string(), // 1 - longer, should be preferred
+            "GG".to_string(),         // 2 - shorter
+            "TTTT".to_string(),       // 3
         ];
         let collapsed = collapse_bubbles(&connections, 4, &contigs);
         // Should remove connections through the shorter path (via contig 2)
-        assert!(collapsed.len() < connections.len(), "Collapse should remove some connections");
+        assert!(
+            collapsed.len() < connections.len(),
+            "Collapse should remove some connections"
+        );
     }
 
     #[test]
     fn test_cycle_detection() {
         let connections = vec![
-            ContigConnection { left_contig: 0, right_contig: 1, connecting_seq: vec!['A'], right_is_rc: false, left_is_rc: false },
-            ContigConnection { left_contig: 1, right_contig: 2, connecting_seq: vec!['C'], right_is_rc: false, left_is_rc: false },
+            ContigConnection {
+                left_contig: 0,
+                right_contig: 1,
+                connecting_seq: vec!['A'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
+            ContigConnection {
+                left_contig: 1,
+                right_contig: 2,
+                connecting_seq: vec!['C'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
         ];
         assert!(!has_cycle(&connections, 3));
 
         let cyclic = vec![
-            ContigConnection { left_contig: 0, right_contig: 1, connecting_seq: vec!['A'], right_is_rc: false, left_is_rc: false },
-            ContigConnection { left_contig: 1, right_contig: 0, connecting_seq: vec!['C'], right_is_rc: false, left_is_rc: false },
+            ContigConnection {
+                left_contig: 0,
+                right_contig: 1,
+                connecting_seq: vec!['A'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
+            ContigConnection {
+                left_contig: 1,
+                right_contig: 0,
+                connecting_seq: vec!['C'],
+                right_is_rc: false,
+                left_is_rc: false,
+            },
         ];
         assert!(has_cycle(&cyclic, 2));
     }

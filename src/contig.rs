@@ -80,7 +80,11 @@ impl ContigSequence {
 
     /// Maximum length of any variant in a chunk
     pub fn chunk_len_max(&self, chunk: usize) -> usize {
-        self.chunks[chunk].iter().map(|v| v.len()).max().unwrap_or(0)
+        self.chunks[chunk]
+            .iter()
+            .map(|v| v.len())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Minimum length of any variant in a chunk
@@ -276,10 +280,9 @@ mod tests {
     #[test]
     fn test_contig_variable_chunk() {
         let mut contig = ContigSequence::new();
-        contig.chunks.push(vec![
-            "ACGT".chars().collect(),
-            "ACGA".chars().collect(),
-        ]);
+        contig
+            .chunks
+            .push(vec!["ACGT".chars().collect(), "ACGA".chars().collect()]);
         assert!(contig.variable_chunk(0));
         assert_eq!(contig.variants_number(0), 2);
     }

@@ -14,6 +14,10 @@ use crate::kmer::Kmer;
 
 /// Atomic k-mer counter matching SKESA's SKmerCounter.
 /// Lower 32 bits: total count, Upper 32 bits: plus-strand count.
+///
+/// The packed counter has the same limit as C++ SKESA: per-k-mer totals are
+/// expected to stay below `u32::MAX`. Overflow is not saturated; raw `u64`
+/// addition wraps/carries into the upper packed field.
 #[derive(Debug)]
 pub struct KmerCounter {
     pub data: AtomicU64,
@@ -151,10 +155,7 @@ impl KmerHashCount {
 
     /// Total number of k-mers in the table
     pub fn size(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|s| s.lock().unwrap().len())
-            .sum()
+        self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
     }
 
     /// K-mer length
@@ -185,9 +186,11 @@ impl KmerHashCount {
     }
 }
 
-/// K-mer hash counter that orchestrates bloom filter + hash table counting.
+/// K-mer hash counter orchestration type reserved for `--hash_count` assembly.
 ///
-/// Port of SKESA's CKmerHashCounter.
+/// This is not yet wired into the assembly path as a full CKmerHashCounter port.
+// Retained for the incomplete `--hash_count` assembly mode port. The lower-level
+// hash table is used today, but this orchestration type is not wired in yet.
 #[allow(dead_code)]
 pub struct KmerHashCounter {
     hash_table: KmerHashCount,
@@ -234,6 +237,17 @@ mod tests {
         counter.increment(false);
         assert_eq!(counter.count(), 2);
         assert_eq!(counter.plus_count(), 1);
+    }
+
+    #[test]
+    fn test_kmer_counter_preserves_cpp_count_spill_behavior() {
+        let counter = KmerCounter::new();
+        counter.store(u32::MAX as u64);
+
+        assert_eq!(counter.increment(false), 0);
+        assert_eq!(counter.count(), 0);
+        assert_eq!(counter.plus_count(), 1);
+        assert_eq!(counter.load(), 1u64 << 32);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 /// Target-guided path extension for SAUTE assembly.
 ///
-/// Port of SKESA's CGuidedPath from guidedpath_naa.hpp.
+/// Partial Rust implementation of SKESA's CGuidedPath concepts from guidedpath_naa.hpp.
 ///
 /// Extends through the de Bruijn graph while maintaining alignment
 /// against a target sequence. At each step, the extension chooses
@@ -136,7 +136,11 @@ impl BranchState {
         for j in self.j_min..=self.j_max {
             let j_idx = j as usize;
             // Match/mismatch score
-            let delta = if assembled_base == target[j_idx] { match_score } else { mismatch };
+            let delta = if assembled_base == target[j_idx] {
+                match_score
+            } else {
+                mismatch
+            };
             let ss = self.sm[j_idx] + delta;
 
             // Gap in assembled sequence (insertion in target)
@@ -216,7 +220,7 @@ impl BranchState {
 pub fn guided_extend_right(
     kmers: &KmerCount,
     start_kmer: &Kmer,
-    target: &[u8],       // target sequence to align against (from seed position onward)
+    target: &[u8], // target sequence to align against (from seed position onward)
     kmer_len: usize,
     params: &GuidedParams,
 ) -> GuidedExtensionResult {
@@ -289,9 +293,13 @@ pub fn guided_extend_right(
             let go = params.gap_open.unsigned_abs() as i32;
             let ge = params.gap_extend.unsigned_abs() as i32;
             let ok = test_branch.update_score(
-                base, target,
-                params.match_score, params.mismatch,
-                go, ge, params.dropoff,
+                base,
+                target,
+                params.match_score,
+                params.mismatch,
+                go,
+                ge,
+                params.dropoff,
             );
             if ok {
                 // Score = DP score + abundance bonus
@@ -311,9 +319,13 @@ pub fn guided_extend_right(
         let go = params.gap_open.unsigned_abs() as i32;
         let ge = params.gap_extend.unsigned_abs() as i32;
         let ok = branch.update_score(
-            chosen_base, target,
-            params.match_score, params.mismatch,
-            go, ge, params.dropoff,
+            chosen_base,
+            target,
+            params.match_score,
+            params.mismatch,
+            go,
+            ge,
+            params.dropoff,
         );
 
         if !ok {
@@ -348,7 +360,7 @@ pub fn guided_extend_right(
 pub fn guided_extend_right_protein(
     kmers: &KmerCount,
     start_kmer: &Kmer,
-    protein_target: &[u8],   // protein sequence (amino acids)
+    protein_target: &[u8], // protein sequence (amino acids)
     kmer_len: usize,
     params: &GuidedParams,
     genetic_code: &crate::genetic_code::GeneticCode,
@@ -495,7 +507,8 @@ pub fn guided_extend_with_fallback(
     params: &GuidedParams,
 ) -> GuidedExtensionResult {
     // Try primary extension first
-    let mut result = guided_extend_right(primary_kmers, start_kmer, target, primary_kmer_len, params);
+    let mut result =
+        guided_extend_right(primary_kmers, start_kmer, target, primary_kmer_len, params);
 
     // If we didn't reach the end and have a secondary graph, try fallback
     if !result.reached_target_end && result.target_pos < target.len() {
@@ -510,8 +523,11 @@ pub fn guided_extend_with_fallback(
                     // Extend in secondary graph from where we stopped
                     let remaining_target = &target[result.target_pos..];
                     let sec_result = guided_extend_right(
-                        sec_kmers, &sec_kmer, remaining_target,
-                        secondary_kmer_len, params,
+                        sec_kmers,
+                        &sec_kmer,
+                        remaining_target,
+                        secondary_kmer_len,
+                        params,
                     );
 
                     if !sec_result.sequence.is_empty() {
@@ -581,13 +597,12 @@ pub fn assemble_guided_contig(
 
     // Pick best seed: prefer middle of target, high abundance
     let target_mid = target.len() / 2;
-    let best_seed = seeds.iter()
-        .max_by_key(|(_, pos, idx)| {
-            let count = (kmers.get_count(*idx) & 0xFFFFFFFF) as u32;
-            let distance_from_mid = (target_mid as i64 - *pos as i64).unsigned_abs() as u32;
-            // Prefer high count and proximity to middle
-            (count as u64) * 1000 / (distance_from_mid as u64 + 1)
-        })?;
+    let best_seed = seeds.iter().max_by_key(|(_, pos, idx)| {
+        let count = (kmers.get_count(*idx) & 0xFFFFFFFF) as u32;
+        let distance_from_mid = (target_mid as i64 - *pos as i64).unsigned_abs() as u32;
+        // Prefer high count and proximity to middle
+        (count as u64) * 1000 / (distance_from_mid as u64 + 1)
+    })?;
 
     let (seed_kmer, seed_pos, _) = *best_seed;
     let seed_str = seed_kmer.to_kmer_string(kmer_len);
@@ -602,13 +617,24 @@ pub fn assemble_guided_contig(
 
     // Extend left: reverse complement seed, use reversed target before seed
     let rc_seed = seed_kmer.revcomp(kmer_len);
-    let left_target_str: String = target[..seed_pos].chars().rev()
+    let left_target_str: String = target[..seed_pos]
+        .chars()
+        .rev()
         .map(crate::model::complement)
         .collect();
-    let left_ext = guided_extend_right(kmers, &rc_seed, left_target_str.as_bytes(), kmer_len, params);
+    let left_ext = guided_extend_right(
+        kmers,
+        &rc_seed,
+        left_target_str.as_bytes(),
+        kmer_len,
+        params,
+    );
 
     // Combine: rev_comp(left_ext) + seed + right_ext
-    let left_seq: String = left_ext.sequence.iter().rev()
+    let left_seq: String = left_ext
+        .sequence
+        .iter()
+        .rev()
         .map(|&c| crate::model::complement(c))
         .collect();
 
@@ -641,11 +667,16 @@ mod tests {
 
         // Use first read as "target" — get it via string iterator on the unpaired holder
         let si = reads[0][1].string_iter();
-        if si.at_end() { return; } // no unpaired reads
+        if si.at_end() {
+            return;
+        } // no unpaired reads
         let read = si.get();
 
         let seeds = find_target_seeds(&read, &kmers, 21);
-        assert!(!seeds.is_empty(), "Should find seeds in graph matching a read");
+        assert!(
+            !seeds.is_empty(),
+            "Should find seeds in graph matching a read"
+        );
     }
 
     #[test]
@@ -661,14 +692,20 @@ mod tests {
 
         // Use first read as "target"
         let si = reads[0][1].string_iter();
-        if si.at_end() { return; }
+        if si.at_end() {
+            return;
+        }
         let read = si.get();
 
         let params = GuidedParams::default();
         let result = assemble_guided_contig(&read, &kmers, 21, &params);
         assert!(result.is_some(), "Should assemble a guided contig");
         let contig = result.unwrap();
-        assert!(contig.len() >= 21, "Guided contig should be at least kmer_len: got {}", contig.len());
+        assert!(
+            contig.len() >= 21,
+            "Guided contig should be at least kmer_len: got {}",
+            contig.len()
+        );
     }
 
     #[test]
@@ -684,7 +721,10 @@ mod tests {
         branch.na += 1;
         let ok2 = branch.update_score(b'C', target, 1, -1, 3, 1, 50);
         assert!(ok2, "Second match should continue");
-        assert!(branch.max_score > 0, "Score should be positive after matches");
+        assert!(
+            branch.max_score > 0,
+            "Score should be positive after matches"
+        );
     }
 
     #[test]
@@ -709,7 +749,10 @@ mod tests {
                 break;
             }
         }
-        assert!(failed, "Should fail after enough mismatches with small dropoff");
+        assert!(
+            failed,
+            "Should fail after enough mismatches with small dropoff"
+        );
     }
 
     #[test]

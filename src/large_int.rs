@@ -42,11 +42,16 @@ pub fn oahash64(elem: u64) -> u64 {
 /// Nucleotide character to 2-bit encoding
 #[inline]
 fn nt_to_bin(c: char) -> u64 {
+    nt_byte_to_bin(c as u8)
+}
+
+#[inline]
+fn nt_byte_to_bin(c: u8) -> u64 {
     match c {
-        'A' | 'a' => 0,
-        'C' | 'c' => 1,
-        'T' | 't' => 2,
-        'G' | 'g' => 3,
+        b'A' | b'a' => 0,
+        b'C' | b'c' => 1,
+        b'T' | b't' => 2,
+        b'G' | b'g' => 3,
         _ => 0, // matches C++ behavior (find returns begin, which is 'A'=0)
     }
 }
@@ -95,6 +100,16 @@ impl<const N: usize> LargeInt<N> {
         for c in iter {
             result = result.shl(2);
             result.value[0] += nt_to_bin(c);
+        }
+        result
+    }
+
+    /// Construct from ASCII nucleotide bytes.
+    pub fn from_ascii_bytes(kmer: &[u8]) -> Self {
+        let mut result = Self::new(0);
+        for &c in kmer {
+            result = result.shl(2);
+            result.value[0] += nt_byte_to_bin(c);
         }
         result
     }
@@ -645,8 +660,8 @@ mod tests {
             "ACGT",
             "AAAAAAAAA",
             "TTTTTTTTT",
-            "ACGTACGTACGTACGTACGTA",  // 21-mer
-            "ACGTACGTACGTACGTACGTACGTACGTACGT",  // 32-mer (max for LargeInt<1>)
+            "ACGTACGTACGTACGTACGTA",            // 21-mer
+            "ACGTACGTACGTACGTACGTACGTACGTACGT", // 32-mer (max for LargeInt<1>)
         ];
         for kmer in &test_kmers {
             let x: LargeInt<1> = LargeInt::from_kmer(kmer);

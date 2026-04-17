@@ -314,9 +314,9 @@ impl ReadHolder {
 pub struct KmerIterator<'a> {
     holder: &'a ReadHolder,
     read: usize,
-    position: usize,          // bit position in concatenated storage
+    position: usize, // bit position in concatenated storage
     kmer_len: u32,
-    position_in_read: u32,    // nucleotide position within current read
+    position_in_read: u32, // nucleotide position within current read
 }
 
 impl<'a> KmerIterator<'a> {
@@ -330,8 +330,13 @@ impl<'a> KmerIterator<'a> {
         }
         let num_words = (2 * kmer_len).div_ceil(64);
         let mut buf = vec![0u64; num_words];
-        self.holder
-            .copy_bits(self.position, self.position + 2 * kmer_len, &mut buf, 0, num_words);
+        self.holder.copy_bits(
+            self.position,
+            self.position + 2 * kmer_len,
+            &mut buf,
+            0,
+            num_words,
+        );
         let mut kmer = Kmer::zero(kmer_len);
         kmer.copy_words_from(&buf);
         kmer
@@ -539,6 +544,45 @@ mod tests {
     }
 
     #[test]
+    fn test_string_iterator_round_trip_varied_reads() {
+        let mut seed = 0x5EED_u64;
+        let mut expected = Vec::new();
+        let mut rh = ReadHolder::new(false);
+
+        for len in [
+            1usize, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 127,
+        ] {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let mut state = seed ^ len as u64;
+            let seq: String = (0..len)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(2862933555777941757)
+                        .wrapping_add(3037000493);
+                    BIN2NT[((state >> 33) & 3) as usize]
+                })
+                .collect();
+            rh.push_back_str(&seq);
+            expected.push(seq);
+        }
+
+        assert_eq!(rh.read_num(), expected.len());
+        assert_eq!(
+            rh.total_seq(),
+            expected.iter().map(String::len).sum::<usize>()
+        );
+
+        let mut actual = Vec::new();
+        let mut si = rh.string_iter();
+        while !si.at_end() {
+            actual.push(si.get());
+            si.advance();
+        }
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn test_kmer_iterator() {
         let mut rh = ReadHolder::new(false);
         rh.push_back_str("ACGTACGT"); // 8bp read
@@ -604,8 +648,8 @@ mod tests {
     fn test_kmer_num() {
         let mut rh = ReadHolder::new(false);
         rh.push_back_str("ACGTACGT"); // 5 kmers of length 4
-        rh.push_back_str("ACGT");      // 1 kmer
-        rh.push_back_str("AC");        // 0 kmers
+        rh.push_back_str("ACGT"); // 1 kmer
+        rh.push_back_str("AC"); // 0 kmers
         assert_eq!(rh.kmer_num(4), 6);
     }
 
@@ -638,7 +682,7 @@ mod tests {
         // Verify k-mer extraction (first k-mer from reversed storage = last 21bp of original)
         let ki = rh.kmer_iter(21);
         let first_kmer = ki.get().to_kmer_string(21);
-        assert_eq!(first_kmer, &seq[seq.len()-21..]);
+        assert_eq!(first_kmer, &seq[seq.len() - 21..]);
     }
 
     #[test]

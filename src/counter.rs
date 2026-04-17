@@ -11,6 +11,11 @@
 /// The count field is a u64 with:
 /// - Lower 32 bits: total count
 /// - Upper 32 bits: plus-strand count during counting, repurposed for branching info in CDBGraph
+///
+/// This intentionally preserves SKESA's packed `size_t` behavior. Counts are
+/// accumulated with ordinary wrapping `u64` addition and are assumed not to
+/// exceed `u32::MAX` per k-mer; spilling out of the low 32 bits would carry into
+/// the plus-strand/branching field just as it does in C++.
 use crate::kmer::Kmer;
 use crate::large_int::oahash64;
 
@@ -88,7 +93,11 @@ impl KmerCount {
     }
 
     /// Create from a flat iterator of (u64_key, u64_count) pairs.
-    pub fn from_flat_iter(kmer_len: usize, iter: impl Iterator<Item = (u64, u64)>, size_hint: usize) -> Self {
+    pub fn from_flat_iter(
+        kmer_len: usize,
+        iter: impl Iterator<Item = (u64, u64)>,
+        size_hint: usize,
+    ) -> Self {
         let precision = kmer_len.div_ceil(32);
         if precision == 1 {
             let mut entries = Vec::with_capacity(size_hint);
@@ -397,9 +406,10 @@ impl KmerCount {
         match &self.storage {
             Storage::Flat(v) => {
                 let kmer_len = self.kmer_len;
-                Box::new(v.iter().map(move |(val, count)| {
-                    (Kmer::from_u64(kmer_len, *val), *count)
-                }))
+                Box::new(
+                    v.iter()
+                        .map(move |(val, count)| (Kmer::from_u64(kmer_len, *val), *count)),
+                )
             }
             Storage::General(v) => {
                 let kmer_len = self.kmer_len;
@@ -502,6 +512,25 @@ mod tests {
         kc.sort_and_uniq(2);
         assert_eq!(kc.size(), 1);
         assert_eq!(kc.get_count(0), 3);
+    }
+
+    #[test]
+    fn test_sort_and_uniq_preserves_cpp_count_spill_behavior() {
+        for kmer in [
+            "ACGTACGTACGTACGTACGTA",
+            "ACGTACGTACGTACGTACGTACGTACGTACGTACG",
+        ] {
+            let mut kc = KmerCount::new(kmer.len());
+            let k1 = Kmer::from_kmer_str(kmer);
+
+            kc.push_back(&k1, u32::MAX as u64);
+            kc.push_back(&k1, 1);
+            kc.sort_and_uniq(0);
+
+            assert_eq!(kc.size(), 1);
+            assert_eq!(kc.get_count(0), 1u64 << 32);
+            assert_eq!(kc.get_count(0) as u32, 0);
+        }
     }
 
     #[test]

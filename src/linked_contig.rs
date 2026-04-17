@@ -66,25 +66,24 @@ impl LinkedContig {
         if self.seq.is_empty() {
             return true;
         }
-        let max_edge = self.seq.chunk_len_max(0)
-            .max(if !self.seq.is_empty() { self.seq.chunk_len_max(self.seq.len() - 1) } else { 0 });
+        let max_edge = self.seq.chunk_len_max(0).max(if !self.seq.is_empty() {
+            self.seq.chunk_len_max(self.seq.len() - 1)
+        } else {
+            0
+        });
         max_edge < self.kmer_len && self.seq.len() <= 3
     }
 
     /// Whether the right end has an SNP (variable chunk near the right end)
     pub fn right_snp(&self) -> bool {
         let n = self.seq.len();
-        n >= 3
-            && self.seq.unique_chunk(n - 1)
-            && self.seq.chunk_len_max(n - 1) < self.kmer_len
+        n >= 3 && self.seq.unique_chunk(n - 1) && self.seq.chunk_len_max(n - 1) < self.kmer_len
     }
 
     /// Whether the left end has an SNP
     pub fn left_snp(&self) -> bool {
         let n = self.seq.len();
-        n >= 3
-            && self.seq.unique_chunk(0)
-            && self.seq.chunk_len_max(0) < self.kmer_len
+        n >= 3 && self.seq.unique_chunk(0) && self.seq.chunk_len_max(0) < self.kmer_len
     }
 
     /// Get the first k-mer of the contig
@@ -136,7 +135,9 @@ impl LinkedContig {
                 if chunk_end >= self.kmer_len {
                     let kmer_start = chunk_end - self.kmer_len;
                     if kmer_start + self.kmer_len <= primary.len() {
-                        return Some(Kmer::from_kmer_str(&primary[kmer_start..kmer_start + self.kmer_len]));
+                        return Some(Kmer::from_kmer_str(
+                            &primary[kmer_start..kmer_start + self.kmer_len],
+                        ));
                     }
                 }
             }
@@ -186,6 +187,82 @@ impl LinkedContig {
         std::mem::swap(&mut self.left_shift, &mut self.right_shift);
     }
 
+    /// Clip bases from the right end, matching C++ SContig::ClipRight side effects.
+    pub fn clip_right(&mut self, clip: usize) {
+        if clip == 0 {
+            return;
+        }
+
+        self.seq.circular = false;
+        self.next_right = None;
+        self.right_link = None;
+        self.right_shift = 0;
+        self.seq.right_endpoint = None;
+
+        let mut remaining = clip;
+        while !self.seq.is_empty() {
+            let last = self.seq.len() - 1;
+            let chunk_len = self.seq.chunk_len_max(last);
+            if !self.seq.variable_chunk(last) && chunk_len > remaining {
+                break;
+            }
+
+            remaining = remaining.saturating_sub(chunk_len);
+            self.right_extend = (self.right_extend - chunk_len as i32).max(0);
+            self.seq.chunks.pop();
+        }
+
+        if remaining > 0 && !self.seq.is_empty() {
+            let last = self.seq.len() - 1;
+            self.right_extend = (self.right_extend - remaining as i32).max(0);
+            if let Some(top) = self.seq.chunks[last].first_mut() {
+                let keep = top.len().saturating_sub(remaining);
+                top.truncate(keep);
+            }
+        }
+
+        if self.seq.len_min() < self.kmer_len.saturating_sub(1) {
+            self.seq.chunks.clear();
+        }
+    }
+
+    /// Clip bases from the left end, matching C++ SContig::ClipLeft side effects.
+    pub fn clip_left(&mut self, clip: usize) {
+        if clip == 0 {
+            return;
+        }
+
+        self.seq.circular = false;
+        self.next_left = None;
+        self.left_link = None;
+        self.left_shift = 0;
+        self.seq.left_endpoint = None;
+
+        let mut remaining = clip;
+        while !self.seq.is_empty() {
+            let chunk_len = self.seq.chunk_len_max(0);
+            if !self.seq.variable_chunk(0) && chunk_len > remaining {
+                break;
+            }
+
+            remaining = remaining.saturating_sub(chunk_len);
+            self.left_extend = (self.left_extend - chunk_len as i32).max(0);
+            self.seq.chunks.remove(0);
+        }
+
+        if remaining > 0 && !self.seq.is_empty() {
+            self.left_extend = (self.left_extend - remaining as i32).max(0);
+            if let Some(top) = self.seq.chunks[0].first_mut() {
+                let drain = remaining.min(top.len());
+                top.drain(..drain);
+            }
+        }
+
+        if self.seq.len_min() < self.kmer_len.saturating_sub(1) {
+            self.seq.chunks.clear();
+        }
+    }
+
     /// Add another contig to the right, merging with k-1 overlap.
     /// This is the C++ AddToRight.
     pub fn add_to_right(&mut self, other: &LinkedContig) {
@@ -229,9 +306,8 @@ impl LinkedContig {
 
         // Handle SNP skipping: if both ends have SNPs, skip the SNP chunks
         if self.right_snp() && other.left_snp() {
-            actual_overlap = last_chunk_len
-                + other.seq.chunk_len_max(1)
-                + other.seq.chunks[0][0].len();
+            actual_overlap =
+                last_chunk_len + other.seq.chunk_len_max(1) + other.seq.chunks[0][0].len();
             other_start_chunk = 2;
         }
 
@@ -319,7 +395,11 @@ impl LinkedContig {
 /// Canonical form for a kmer (min of kmer and its reverse complement)
 fn canonical_kmer(kmer: &Kmer, kmer_len: usize) -> Kmer {
     let rc = kmer.revcomp(kmer_len);
-    if *kmer < rc { *kmer } else { rc }
+    if *kmer < rc {
+        *kmer
+    } else {
+        rc
+    }
 }
 
 /// Key for hash maps — canonical kmer as word vector
@@ -331,7 +411,7 @@ fn kmer_key(kmer: &Kmer, kmer_len: usize) -> Vec<u64> {
 
 /// Connect fragments using denied-node matching and chain walking.
 ///
-/// This is the full port of C++ SContig::ConnectFragments:
+/// Compatibility-oriented implementation of C++ SContig::ConnectFragments:
 /// 1. Normalize orientation (if next_left > next_right, reverse complement)
 /// 2. Build denied_left_nodes and denied_right_nodes maps
 /// 3. On collision at a denied node, propagate link info
@@ -564,10 +644,7 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
 
 /// Convert ContigSequences to LinkedContigs, run ConnectFragments, and convert back.
 /// This is the main entry point for the assembler to use.
-pub fn connect_fragments_from_contigs(
-    contigs: &mut Vec<ContigSequence>,
-    kmer_len: usize,
-) {
+pub fn connect_fragments_from_contigs(contigs: &mut Vec<ContigSequence>, kmer_len: usize) {
     if contigs.len() < 2 {
         return;
     }
@@ -646,6 +723,78 @@ mod tests {
     }
 
     #[test]
+    fn test_clip_right_updates_sequence_and_link_metadata() {
+        let mut seq = ContigSequence::new();
+        seq.insert_new_chunk_with("AAAACCCC".chars().collect());
+        let mut lc = LinkedContig::new(seq, 4);
+        lc.seq.circular = true;
+        lc.next_right = Some(Kmer::from_kmer_str("CCCC"));
+        lc.right_link = Some(3);
+        lc.right_shift = 7;
+        lc.seq.right_endpoint = Some(vec![1]);
+
+        lc.clip_right(3);
+
+        assert_eq!(lc.seq.primary_sequence(), "AAAAC");
+        assert!(!lc.seq.circular);
+        assert!(lc.next_right.is_none());
+        assert!(lc.right_link.is_none());
+        assert_eq!(lc.right_shift, 0);
+        assert!(lc.seq.right_endpoint.is_none());
+        assert_eq!(lc.right_extend, 5);
+        assert_eq!(lc.left_extend, 8);
+    }
+
+    #[test]
+    fn test_clip_left_updates_sequence_and_link_metadata() {
+        let mut seq = ContigSequence::new();
+        seq.insert_new_chunk_with("AAAACCCC".chars().collect());
+        let mut lc = LinkedContig::new(seq, 4);
+        lc.seq.circular = true;
+        lc.next_left = Some(Kmer::from_kmer_str("AAAA"));
+        lc.left_link = Some(2);
+        lc.left_shift = -5;
+        lc.seq.left_endpoint = Some(vec![2]);
+
+        lc.clip_left(3);
+
+        assert_eq!(lc.seq.primary_sequence(), "ACCCC");
+        assert!(!lc.seq.circular);
+        assert!(lc.next_left.is_none());
+        assert!(lc.left_link.is_none());
+        assert_eq!(lc.left_shift, 0);
+        assert!(lc.seq.left_endpoint.is_none());
+        assert_eq!(lc.left_extend, 5);
+        assert_eq!(lc.right_extend, 8);
+    }
+
+    #[test]
+    fn test_clip_removes_terminal_variable_chunks_like_cpp() {
+        let mut seq = ContigSequence::new();
+        seq.insert_new_chunk_with("AAAAAA".chars().collect());
+        seq.insert_new_chunk_with("GG".chars().collect());
+        seq.insert_new_variant_slice(&"TTT".chars().collect::<Vec<_>>());
+        let mut lc = LinkedContig::new(seq, 4);
+
+        lc.clip_right(1);
+
+        assert_eq!(lc.seq.primary_sequence(), "AAAAAA");
+        assert_eq!(lc.right_extend, 6);
+    }
+
+    #[test]
+    fn test_clip_clears_sequence_shorter_than_k_minus_one() {
+        let mut seq = ContigSequence::new();
+        seq.insert_new_chunk_with("AAAAAA".chars().collect());
+        let mut lc = LinkedContig::new(seq, 6);
+
+        lc.clip_right(2);
+
+        assert!(lc.seq.is_empty());
+        assert_eq!(lc.right_extend, 4);
+    }
+
+    #[test]
     fn test_connect_fragments_empty() {
         let mut contigs = Vec::new();
         connect_fragments(&mut contigs);
@@ -666,8 +815,15 @@ mod tests {
         lc1.add_to_right(&lc2);
         let result = lc1.seq.primary_sequence();
         // Should contain the full merged sequence
-        assert!(result.len() > 28, "Merged should be longer than either input: got {}", result.len());
-        assert!(result.starts_with("ACGTACGTACGTACGTACGTACGTAAAA"), "Should start with lc1 sequence");
+        assert!(
+            result.len() > 28,
+            "Merged should be longer than either input: got {}",
+            result.len()
+        );
+        assert!(
+            result.starts_with("ACGTACGTACGTACGTACGTACGTAAAA"),
+            "Should start with lc1 sequence"
+        );
     }
 
     #[test]
@@ -682,7 +838,11 @@ mod tests {
 
         lc1.add_to_left(&lc2);
         let result = lc1.seq.primary_sequence();
-        assert!(result.len() > 28, "Merged should be longer: got {}", result.len());
+        assert!(
+            result.len() > 28,
+            "Merged should be longer: got {}",
+            result.len()
+        );
         assert!(result.ends_with("AAAA"), "Should end with lc1's right end");
     }
 
@@ -712,7 +872,12 @@ mod tests {
         connect_fragments(&mut contigs);
         // Chain walking: lc1's RightConnectingNode = BackKmer should be found
         // in denied_left_nodes (which has lc2's next_left = BackKmer)
-        assert_eq!(contigs.len(), 1, "Should merge into 1 contig, got {}", contigs.len());
+        assert_eq!(
+            contigs.len(),
+            1,
+            "Should merge into 1 contig, got {}",
+            contigs.len()
+        );
     }
 
     #[test]
@@ -732,7 +897,10 @@ mod tests {
         let rck = lc.right_connecting_kmer();
         assert!(rck.is_some());
         // Right connecting kmer = last 21 chars = BackKmer
-        assert_eq!(rck.unwrap().to_kmer_string(21), "TACGTACGTACGTACGTAAAA"[..21].to_string());
+        assert_eq!(
+            rck.unwrap().to_kmer_string(21),
+            "TACGTACGTACGTACGTAAAA"[..21].to_string()
+        );
 
         let lck = lc.left_connecting_kmer();
         assert!(lck.is_some());

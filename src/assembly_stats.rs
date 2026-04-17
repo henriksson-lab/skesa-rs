@@ -29,8 +29,15 @@ impl AssemblyStats {
     pub fn from_lengths(lengths: &[usize]) -> Self {
         if lengths.is_empty() {
             return AssemblyStats {
-                num_contigs: 0, total_length: 0, longest: 0, shortest: 0,
-                n50: 0, l50: 0, n90: 0, l90: 0, avg_length: 0.0,
+                num_contigs: 0,
+                total_length: 0,
+                longest: 0,
+                shortest: 0,
+                n50: 0,
+                l50: 0,
+                n90: 0,
+                l90: 0,
+                avg_length: 0.0,
             };
         }
 
@@ -102,8 +109,8 @@ fn lxx(sorted_desc: &[usize], total: usize, fraction: f64) -> usize {
 /// Parse a FASTA/FASTQ file and return sequence lengths.
 /// Auto-detects format from first character (> = FASTA, @ = FASTQ).
 pub fn fasta_lengths(path: &str) -> Result<Vec<usize>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Can't read {}: {}", path, e))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Can't read {}: {}", path, e))?;
 
     let first_char = content.chars().next().unwrap_or(' ');
 

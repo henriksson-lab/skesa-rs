@@ -1,0 +1,53 @@
+{
+  "command": [
+    "/data/henriksson/github/claude/skesa-rs/SKESA/skesa",
+    "--reads",
+    "/data/henriksson/github/claude/skesa-rs/tests/data/precision2_sorted_reads.fasta",
+    "--kmer",
+    "35",
+    "--max_kmer",
+    "39",
+    "--steps",
+    "2",
+    "--min_contig",
+    "1",
+    "--estimated_kmers",
+    "100000",
+    "--cores",
+    "1",
+    "--contigs_out",
+    "/tmp/skesa_multi_probe/cpp_contigs.fasta",
+    "--all",
+    "/tmp/skesa_multi_probe/cpp_all.fasta",
+    "--hist",
+    "/tmp/skesa_multi_probe/cpp_hist.txt",
+    "--dbg_out",
+    "/tmp/skesa_multi_probe/cpp_dbg.bin"
+  ],
+  "date_utc": "2026-04-16T18:26:36.911574+00:00",
+  "dbg_out": {
+    "bytes": 4766,
+    "note": "not tracked as a byte-for-byte golden; structural graph tests compare serialized records",
+    "sha256": "e9c71e06f0fbebc71d6ee658425ef1d85558cac11a03ad8af5d591e52d87919b"
+  },
+  "input": {
+    "path": "tests/data/precision2_sorted_reads.fasta",
+    "sha256": "7671bb3d996c6d9e09901595f754168431febbadad2ea63287f73269bf10b35c"
+  },
+  "note": "C++ emits WARNING: iterations are disabled for this small input, so this covers precision-2 assembly output parity but not medium multi-iteration parity.",
+  "outputs": {
+    "expected_precision2_sorted_all_k35.fasta": {
+      "bytes": 157,
+      "sha256": "25c58d74240e00d8827e3c2f805907dc7e49a41121ebaacb8fcdf1229edc013a"
+    },
+    "expected_precision2_sorted_assembly_hist_k35.txt": {
+      "bytes": 17,
+      "sha256": "2db95ae4b06f4036e2d27f7a7632a4be078a34d43caffa6537d9846a87f8325f"
+    },
+    "expected_precision2_sorted_contigs_k35.fasta": {
+      "bytes": 159,
+      "sha256": "3a388a9d9dc5f03b0eaa860dcda18531c43964df93f2420b69b59863721f573b"
+    }
+  },
+  "platform": "Linux-6.8.0-58-generic-x86_64-with-glibc2.35"
+}

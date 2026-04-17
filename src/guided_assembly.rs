@@ -1,10 +1,10 @@
+use crate::kmer::Kmer;
+use crate::large_int::LargeInt;
 /// Guided (target-enriched) assembly infrastructure.
 ///
 /// Shared code for SAUTE and SAUTE_PROT tools.
 /// Provides target sequence loading, k-mer indexing, and read-to-target mapping.
 use std::collections::HashMap;
-use crate::kmer::Kmer;
-use crate::large_int::LargeInt;
 
 /// A target/reference sequence for guided assembly
 #[derive(Clone, Debug)]
@@ -15,8 +15,8 @@ pub struct Target {
 
 /// Load target sequences from a FASTA file
 pub fn load_targets(path: &str) -> Result<Vec<Target>, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("Can't read {}: {}", path, e))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("Can't read {}: {}", path, e))?;
 
     let mut targets = Vec::new();
     let mut name = String::new();
@@ -25,7 +25,10 @@ pub fn load_targets(path: &str) -> Result<Vec<Target>, String> {
     for line in content.lines() {
         if line.starts_with('>') {
             if !seq.is_empty() {
-                targets.push(Target { name: name.clone(), sequence: seq.clone() });
+                targets.push(Target {
+                    name: name.clone(),
+                    sequence: seq.clone(),
+                });
                 seq.clear();
             }
             name = line[1..].trim().to_string();
@@ -34,7 +37,10 @@ pub fn load_targets(path: &str) -> Result<Vec<Target>, String> {
         }
     }
     if !seq.is_empty() {
-        targets.push(Target { name, sequence: seq });
+        targets.push(Target {
+            name,
+            sequence: seq,
+        });
     }
 
     Ok(targets)
@@ -123,9 +129,10 @@ mod tests {
 
     #[test]
     fn test_target_kmer_index() {
-        let targets = vec![
-            Target { name: "ref1".to_string(), sequence: "ACGTACGTACGTACGTACGTACGT".to_string() },
-        ];
+        let targets = vec![Target {
+            name: "ref1".to_string(),
+            sequence: "ACGTACGTACGTACGTACGTACGT".to_string(),
+        }];
         let index = TargetKmerIndex::new(&targets, 21);
         assert!(index.size() > 0);
 
@@ -137,9 +144,10 @@ mod tests {
 
     #[test]
     fn test_no_match() {
-        let targets = vec![
-            Target { name: "ref1".to_string(), sequence: "AAAAAAAAAAAAAAAAAAAAAAAAA".to_string() },
-        ];
+        let targets = vec![Target {
+            name: "ref1".to_string(),
+            sequence: "AAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        }];
         let index = TargetKmerIndex::new(&targets, 21);
         let hits = index.map_read("TTTTTTTTTTTTTTTTTTTTTTTTT");
         // Revcomp of T...T is A...A, so it SHOULD match

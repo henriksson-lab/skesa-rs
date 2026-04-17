@@ -4,8 +4,8 @@
 /// See http://gfa-spec.github.io/GFA-spec/
 ///
 /// This module provides basic GFA 1.0 output for assembled contigs.
-use std::io::Write;
 use crate::contig::ContigSequence;
+use std::io::Write;
 
 /// Write an assembly in GFA 1.0 format.
 /// Each contig becomes a segment (S line).
@@ -33,13 +33,16 @@ pub fn write_gfa<W: Write>(
 
     // Detect overlaps between segments and output links
     // Check forward-forward, forward-RC, and RC-forward orientations
-    let rc_segments: Vec<String> = segments.iter()
+    let rc_segments: Vec<String> = segments
+        .iter()
         .map(|(_, seq)| seq.chars().rev().map(crate::model::complement).collect())
         .collect();
 
     for i in 0..segments.len() {
         for j in 0..segments.len() {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let (id_a, ref seq_a) = segments[i];
             let (id_b, ref seq_b) = segments[j];
 
@@ -47,17 +50,26 @@ pub fn write_gfa<W: Write>(
             let max_overlap = seq_a.len().min(seq_b.len()).min(1000);
             for overlap in (20..=max_overlap).rev() {
                 if seq_a.ends_with(&seq_b[..overlap]) {
-                    writeln!(out, "L\tContig_{}\t+\tContig_{}\t+\t{}M", id_a, id_b, overlap)?;
+                    writeln!(
+                        out,
+                        "L\tContig_{}\t+\tContig_{}\t+\t{}M",
+                        id_a, id_b, overlap
+                    )?;
                     break;
                 }
             }
 
             // Check: suffix of A+ matches prefix of B- (reverse complement)
-            if i < j { // avoid duplicate RC checks
+            if i < j {
+                // avoid duplicate RC checks
                 let rc_b = &rc_segments[j];
                 for overlap in (20..=max_overlap).rev() {
                     if seq_a.ends_with(&rc_b[..overlap]) {
-                        writeln!(out, "L\tContig_{}\t+\tContig_{}\t-\t{}M", id_a, id_b, overlap)?;
+                        writeln!(
+                            out,
+                            "L\tContig_{}\t+\tContig_{}\t-\t{}M",
+                            id_a, id_b, overlap
+                        )?;
                         break;
                     }
                 }
@@ -115,7 +127,11 @@ impl Ord for VarNum {
         let m = other.data.len();
         // Find effective lengths (ignore trailing zeros)
         let eff_n = self.data.iter().rposition(|&x| x != 0).map_or(1, |p| p + 1);
-        let eff_m = other.data.iter().rposition(|&x| x != 0).map_or(1, |p| p + 1);
+        let eff_m = other
+            .data
+            .iter()
+            .rposition(|&x| x != 0)
+            .map_or(1, |p| p + 1);
         if eff_n != eff_m {
             return eff_n.cmp(&eff_m);
         }
@@ -148,6 +164,44 @@ mod tests {
         assert!(result.contains("H\tVN:Z:1.0"));
         assert!(result.contains("S\tContig_1"));
         assert!(result.contains("S\tContig_2"));
+    }
+
+    #[test]
+    fn test_write_gfa_forward_overlap_link() {
+        let mut c1 = ContigSequence::new();
+        c1.insert_new_chunk_with("GGGGAAAAAAAAAAAAAAAAAAAA".chars().collect());
+        let mut c2 = ContigSequence::new();
+        c2.insert_new_chunk_with("AAAAAAAAAAAAAAAAAAAATTTT".chars().collect());
+
+        let mut output = Vec::new();
+        write_gfa(&mut output, &[c1, c2], 1).unwrap();
+        let result = String::from_utf8(output).unwrap();
+        assert!(
+            result.contains(
+                "L	Contig_1	+	Contig_2	+	20M
+"
+            ),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn test_write_gfa_reverse_complement_overlap_link() {
+        let mut c1 = ContigSequence::new();
+        c1.insert_new_chunk_with("GGGGAAAAAAAAAAAAAAAAAAAA".chars().collect());
+        let mut c2 = ContigSequence::new();
+        c2.insert_new_chunk_with("CCCCTTTTTTTTTTTTTTTTTTTT".chars().collect());
+
+        let mut output = Vec::new();
+        write_gfa(&mut output, &[c1, c2], 1).unwrap();
+        let result = String::from_utf8(output).unwrap();
+        assert!(
+            result.contains(
+                "L	Contig_1	+	Contig_2	-	20M
+"
+            ),
+            "{result}"
+        );
     }
 
     #[test]

@@ -35,42 +35,43 @@
 //! ```
 
 // Core types
-pub mod large_int;
 pub mod kmer;
+pub mod large_int;
 pub mod model;
 
 // Data structures
-pub mod read_holder;
-pub mod counter;
-pub mod flat_counter;
-pub mod kmer_lookup;
 pub mod bloom_filter;
 pub mod concurrent_hash;
-pub mod histogram;
 pub mod contig;
+pub mod counter;
 pub mod db_graph;
+pub mod flat_counter;
+pub mod histogram;
+pub mod kmer_lookup;
+pub mod read_holder;
 
 // I/O
-pub mod reads_getter;
-pub mod kmer_output;
+pub mod assembly_stats;
+pub mod clean_reads;
 pub mod contig_output;
-pub mod glb_align;
 pub mod genetic_code;
 pub mod gfa;
-pub mod paired_reads;
-pub mod snp_discovery;
-pub mod linked_contig;
-pub mod clean_reads;
-pub mod nuc_prot_align;
-pub mod assembly_stats;
+pub mod glb_align;
+pub mod graph_io;
 pub mod guided_assembly;
-pub mod guided_path;
 pub mod guided_graph;
+pub mod guided_path;
+pub mod hash_graph_output;
+pub mod kmer_output;
+pub mod linked_contig;
+pub mod nuc_prot_align;
+pub mod paired_reads;
+pub mod reads_getter;
+pub mod snp_discovery;
 pub mod spider_graph;
 
 // Processing pipelines
+pub mod assembler;
+pub mod graph_digger;
 pub mod kmer_counter;
 pub mod sorted_counter;
-pub mod graph_digger;
-pub mod assembler;
-

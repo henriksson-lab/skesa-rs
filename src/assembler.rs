@@ -1,6 +1,6 @@
 /// Iterative de Bruijn graph assembler.
 ///
-/// Port of SKESA's CDBGAssembler from assembler.hpp.
+/// Rust assembly orchestration modeled on SKESA's CDBGAssembler from assembler.hpp.
 ///
 /// The assembler performs multiple iterations with increasing k-mer sizes
 /// to progressively resolve repeats and improve contiguity.
@@ -12,6 +12,7 @@ use crate::kmer;
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
 use crate::sorted_counter;
+use std::collections::HashSet;
 
 /// Assembly parameters
 pub struct AssemblerParams {
@@ -62,7 +63,7 @@ pub struct AssemblyResult {
 pub fn run_assembly(
     reads: &[ReadPair],
     params: &AssemblerParams,
-    _seeds: &[String],
+    seeds: &[String],
 ) -> AssemblyResult {
     let mut all_iterations = Vec::new();
     let mut graphs: Vec<(usize, KmerCount)> = Vec::new();
@@ -81,7 +82,8 @@ pub fn run_assembly(
     };
 
     // Build graph at min_kmer
-    let (mut kmers, average_count) = build_graph(reads, params.min_kmer, params.min_count, params.memory_gb);
+    let (mut kmers, average_count) =
+        build_graph(reads, params.min_kmer, params.min_count, params.memory_gb);
     let bins = sorted_counter::get_bins(&kmers);
     let genome_size = histogram::calculate_genome_size(&bins);
 
@@ -93,53 +95,87 @@ pub fn run_assembly(
         fraction: params.fraction,
         jump: params.max_snp_len,
         low_count: params.min_count,
+        // SKESA's initial ImproveContigs pass is conservative even when
+        // --allow_snps is requested; SNP-aware traversal is a later pass.
+        allow_snps: false,
     };
-    let mut contigs = graph_digger::assemble_contigs(&mut kmers, &bins, params.min_kmer, true, &digger_params);
+    let contigs = if seeds.is_empty() {
+        let mut contigs = graph_digger::assemble_contigs(
+            &mut kmers,
+            &bins,
+            params.min_kmer,
+            true,
+            &digger_params,
+        );
 
-    // Process initial seeds: clip kmer_len from both ends (uncertain extension zones)
-    // and filter by minimum length, matching C++ GenerateNewSeeds behavior
-    let min_seed_len = 3 * params.min_kmer;
-    for contig in &mut contigs {
-        if !contig.circular {
-            contig.clip_left(params.min_kmer);
-            contig.clip_right(params.min_kmer);
-            contig.left_repeat = (params.min_kmer - 1) as i32;
-            contig.right_repeat = (params.min_kmer - 1) as i32;
+        // Process initial seeds: clip kmer_len from both ends (uncertain extension zones)
+        // and filter by minimum length, matching C++ GenerateNewSeeds behavior
+        let min_seed_len = 3 * params.min_kmer;
+        for contig in &mut contigs {
+            if !contig.circular {
+                clip_new_seed_flanks(contig, params.min_kmer);
+                contig.left_repeat = (params.min_kmer - 1) as i32;
+                contig.right_repeat = (params.min_kmer - 1) as i32;
+            }
         }
+        contigs.retain(|c| c.len_min() >= min_seed_len);
+        contigs.sort();
+
+        eprintln!(
+            "Kmer: {} Graph size: {} New seeds: {}",
+            params.min_kmer,
+            kmers.size(),
+            contigs.len()
+        );
+
+        contigs
+    } else {
+        let mut contigs: ContigSequenceList =
+            seeds.iter().map(|seed| seed_to_contig(seed)).collect();
+        deduplicate_by_containment(&mut contigs);
+        contigs.sort_by_key(|contig| contig.primary_sequence());
+
+        eprintln!("Seeds: {}", contigs.len());
+
+        all_iterations.push(contigs.clone());
+
+        let pre_visited = mark_previous_contigs(&contigs, &kmers, params.min_kmer);
+        let mut new_seeds = graph_digger::assemble_contigs_with_visited(
+            &mut kmers,
+            &bins,
+            params.min_kmer,
+            true,
+            &digger_params,
+            pre_visited,
+        );
+        let min_seed_len = 3 * params.min_kmer;
+        for contig in &mut new_seeds {
+            if !contig.circular {
+                clip_new_seed_flanks(contig, params.min_kmer);
+                contig.left_repeat = (params.min_kmer - 1) as i32;
+                contig.right_repeat = (params.min_kmer - 1) as i32;
+            }
+        }
+        new_seeds.retain(|c| c.len_min() >= min_seed_len);
+        eprintln!(
+            "Kmer: {} Graph size: {} Contigs in: {} New seeds: {}",
+            params.min_kmer,
+            kmers.size(),
+            contigs.len(),
+            new_seeds.len()
+        );
+        contigs.extend(new_seeds);
+        contigs
+    };
+
+    if seeds.is_empty() {
+        all_iterations.push(contigs.clone());
     }
-    contigs.retain(|c| c.len_min() >= min_seed_len);
-    contigs.sort();
-
-    eprintln!("Kmer: {} Graph size: {} New seeds: {}", params.min_kmer, kmers.size(), contigs.len());
-
-    all_iterations.push(contigs.clone());
 
     let mut current_contigs = contigs;
 
-    // Estimate insert size if paired reads are available
-    let has_paired = reads.iter().any(|r| r[0].read_num() > 0 && r[0].contains_paired());
-    if has_paired && params.insert_size == 0 {
-        let insert_n50 = crate::paired_reads::estimate_insert_size(reads, &kmers, params.min_kmer, 10000);
-        if insert_n50 > 0 {
-            eprintln!("N50 for inserts: {}", insert_n50);
-        }
-    }
-
-    graphs.push((params.min_kmer, kmers));
-
-    // Clean reads: remove reads that fully map inside assembled contigs
-    let margin = params.min_kmer + 50;
-    let cleaned_reads = crate::clean_reads::clean_reads(reads, &current_contigs, params.min_kmer, margin);
-    let mut total_cleaned: usize = 0;
-    for rp in &cleaned_reads {
-        total_cleaned += rp[0].read_num() + rp[1].read_num();
-    }
-    eprintln!("Cleaned reads: {}", total_cleaned);
-
-    // Use cleaned reads for subsequent iterations
-    let iter_reads = &cleaned_reads;
-
-    // Estimate max_kmer
+    // Estimate max_kmer before paired-read handling and cleaning. C++ uses this
+    // to decide whether long-insert paired iterations should run.
     let max_kmer = if params.max_kmer > 0 {
         params.max_kmer
     } else if params.steps > 1 && average_count > params.max_kmer_count as f64 {
@@ -151,8 +187,55 @@ pub fn run_assembly(
         params.min_kmer
     };
 
+    // Estimate insert size if paired reads are available. C++ uses the first
+    // graph connection pass only to estimate N50; long-insert connected reads
+    // are materialized later after read cleaning.
+    let has_paired = !params.force_single_reads
+        && reads
+            .iter()
+            .any(|r| r[0].read_num() > 0 && r[0].contains_paired());
+    let mut connected_reads = ReadHolder::new(false);
+    let mut paired_insert_n50 = 0usize;
+    let mut paired_insert_limit = 0usize;
+    let mut use_long_paired_iterations = false;
+    if has_paired {
+        paired_insert_n50 = if params.insert_size == 0 {
+            let insert_n50 =
+                crate::paired_reads::estimate_insert_size(reads, &kmers, params.min_kmer, 10000);
+            if insert_n50 > 0 {
+                eprintln!("N50 for inserts: {}", insert_n50);
+            }
+            insert_n50
+        } else {
+            params.insert_size
+        };
+        paired_insert_limit = 3 * paired_insert_n50;
+        use_long_paired_iterations =
+            paired_insert_n50 > 0 && paired_insert_n50 as f64 > 1.5 * max_kmer as f64;
+        if !use_long_paired_iterations {
+            connected_reads = crate::paired_reads::connect_pairs(
+                reads,
+                &kmers,
+                params.min_kmer,
+                paired_insert_limit,
+            )
+            .connected;
+        }
+    }
+
+    graphs.push((params.min_kmer, kmers));
+
     eprintln!("\nAverage count: {} Max kmer: {}", average_count, max_kmer);
 
+    // Clean reads: remove reads that fully map inside assembled contigs.
+    let raw_read_margin = max_kmer + 50;
+    let mut iter_reads =
+        crate::clean_reads::clean_reads(reads, &current_contigs, params.min_kmer, raw_read_margin);
+    let mut total_cleaned: usize = 0;
+    for rp in &iter_reads {
+        total_cleaned += rp[0].read_num() + rp[1].read_num();
+    }
+    eprintln!("Cleaned reads: {}", total_cleaned);
     // Main iterations with increasing k-mer sizes
     if params.steps > 1 && max_kmer as f64 > 1.5 * params.min_kmer as f64 {
         let alpha = (max_kmer - params.min_kmer) as f64 / (params.steps - 1) as f64;
@@ -168,7 +251,8 @@ pub fn run_assembly(
                 }
             }
 
-            let (mut iter_kmers, _iter_avg) = build_graph(iter_reads, kmer_len, params.min_count, params.memory_gb);
+            let (mut iter_kmers, _iter_avg) =
+                build_graph(&iter_reads, kmer_len, params.min_count, params.memory_gb);
             if iter_kmers.size() == 0 {
                 eprintln!(
                     "Empty graph for kmer length: {} skipping this and longer kmers",
@@ -185,7 +269,12 @@ pub fn run_assembly(
 
             // Assemble only from unvisited k-mers (new seeds)
             let mut iter_contigs = graph_digger::assemble_contigs_with_visited(
-                &mut iter_kmers, &iter_bins, kmer_len, true, &digger_params, pre_visited,
+                &mut iter_kmers,
+                &iter_bins,
+                kmer_len,
+                true,
+                &digger_params,
+                pre_visited,
             );
 
             // Filter: new seeds should be at least 3*kmer_len to avoid noise
@@ -194,7 +283,10 @@ pub fn run_assembly(
 
             eprintln!(
                 "Kmer: {} Graph size: {} Contigs in: {} New seeds: {}",
-                kmer_len, iter_kmers.size(), prev_count, iter_contigs.len()
+                kmer_len,
+                iter_kmers.size(),
+                prev_count,
+                iter_contigs.len()
             );
 
             // Extend and connect contigs in the new graph using link-chain approach
@@ -208,9 +300,105 @@ pub fn run_assembly(
 
             all_iterations.push(current_contigs.clone());
             graphs.push((kmer_len, iter_kmers));
+
+            iter_reads = crate::clean_reads::clean_reads(
+                &iter_reads,
+                &current_contigs,
+                kmer_len,
+                raw_read_margin,
+            );
+            let mut total_cleaned: usize = 0;
+            for rp in &iter_reads {
+                total_cleaned += rp[0].read_num() + rp[1].read_num();
+            }
+            eprintln!("Cleaned reads: {}", total_cleaned);
         }
     } else {
         eprintln!("WARNING: iterations are disabled");
+    }
+
+    if params.allow_snps {
+        for _ in graphs.iter().rev() {
+            all_iterations.push(current_contigs.clone());
+        }
+    }
+
+    if use_long_paired_iterations {
+        let mut remaining_pairs = iter_reads.clone();
+        for (kmer_len, graph_kmers) in &graphs {
+            eprintln!(
+                "
+Connecting mate pairs using kmer length: {}",
+                kmer_len
+            );
+            let pair_result = crate::paired_reads::connect_pairs_extending(
+                &remaining_pairs,
+                graph_kmers,
+                *kmer_len,
+                paired_insert_limit,
+            );
+            let mut iter = pair_result.connected.string_iter();
+            while !iter.at_end() {
+                connected_reads.push_back_str(&iter.get());
+                iter.advance();
+            }
+            remaining_pairs = vec![[pair_result.not_connected, ReadHolder::new(false)]];
+        }
+        eprintln!("Totally connected: {}", connected_reads.read_num());
+
+        if connected_reads.read_num() > 0 {
+            let mut long_kmers = [(1.25 * max_kmer as f64) as usize, 0, paired_insert_n50];
+            long_kmers[1] = (long_kmers[0] + long_kmers[2]) / 2;
+            let connected_read_pairs = vec![[connected_reads.clone(), ReadHolder::new(false)]];
+
+            for mut kmer_len in long_kmers {
+                kmer_len -= 1 - kmer_len % 2;
+                let (mut paired_kmers, _paired_avg) = build_graph(
+                    &connected_read_pairs,
+                    kmer_len,
+                    params.min_count,
+                    params.memory_gb,
+                );
+                if paired_kmers.size() == 0 {
+                    eprintln!(
+                        "Empty graph for kmer length: {} skipping this and longer kmers",
+                        kmer_len
+                    );
+                    break;
+                }
+
+                let paired_bins = sorted_counter::get_bins(&paired_kmers);
+                let pre_visited = mark_previous_contigs(&current_contigs, &paired_kmers, kmer_len);
+                let mut paired_contigs = graph_digger::assemble_contigs_with_visited(
+                    &mut paired_kmers,
+                    &paired_bins,
+                    kmer_len,
+                    true,
+                    &digger_params,
+                    pre_visited,
+                );
+                paired_contigs.retain(|c| c.len_min() >= 3 * kmer_len);
+
+                let prev_count = current_contigs.len();
+                eprintln!(
+                    "Kmer: {} Graph size: {} Contigs in: {} New seeds: {}",
+                    kmer_len,
+                    paired_kmers.size(),
+                    prev_count,
+                    paired_contigs.len()
+                );
+                connect_and_extend_contigs(
+                    &mut current_contigs,
+                    &paired_kmers,
+                    kmer_len,
+                    &digger_params,
+                );
+                filter_poorly_anchored(&mut current_contigs, &paired_kmers, kmer_len);
+                current_contigs = merge_contigs(current_contigs, paired_contigs, kmer_len);
+                all_iterations.push(current_contigs.clone());
+                graphs.push((kmer_len, paired_kmers));
+            }
+        }
     }
 
     // Final contig connection: try to connect through ALL available graphs
@@ -221,9 +409,6 @@ pub fn run_assembly(
     // Remove contigs whose sequence is contained in a longer contig
     deduplicate_by_containment(&mut current_contigs);
 
-    // Connect contigs that are unique graph neighbors
-    connect_unique_neighbors(&mut current_contigs, params.min_kmer);
-
     // Final contig merging: try to join contigs with overlaps
     let final_min_overlap = params.min_kmer.min(15);
     merge_overlapping_contigs(&mut current_contigs, final_min_overlap);
@@ -233,13 +418,27 @@ pub fn run_assembly(
 
     // Clip low-abundance flanks from contig ends
     if let Some((_, ref graph)) = graphs.first() {
-        clip_low_abundance_flanks(&mut current_contigs, graph, params.min_kmer);
+        let protected_seeds: HashSet<String> = seeds.iter().cloned().collect();
+        clip_low_abundance_flanks(
+            &mut current_contigs,
+            graph,
+            params.min_kmer,
+            &protected_seeds,
+        );
     }
+    stabilize_contig_directions(&mut current_contigs, params.min_kmer);
 
     // Sort final contigs
     current_contigs.sort();
 
     let contigs_above_min: Vec<_> = current_contigs;
+    if seeds.is_empty() {
+        if let Some(last_iteration) = all_iterations.last_mut() {
+            *last_iteration = contigs_above_min.clone();
+        }
+    } else {
+        all_iterations.push(contigs_above_min.clone());
+    }
     let total_genome: usize = contigs_above_min.iter().map(|c| c.len_min()).sum();
     let n50 = calculate_n50(&contigs_above_min);
     let l50 = calculate_l50(&contigs_above_min);
@@ -255,8 +454,37 @@ pub fn run_assembly(
         contigs: contigs_above_min,
         all_iterations,
         graphs,
-        connected_reads: ReadHolder::new(false),
+        connected_reads,
     }
+}
+
+fn clip_new_seed_flanks(contig: &mut ContigSequence, kmer_len: usize) {
+    let mut linked = crate::linked_contig::LinkedContig::new(std::mem::take(contig), kmer_len);
+    linked.clip_left(kmer_len);
+    linked.clip_right(kmer_len);
+    *contig = linked.seq;
+}
+
+fn seed_to_contig(seed: &str) -> ContigSequence {
+    let mut contig = ContigSequence::new();
+    contig.insert_new_chunk();
+    contig.insert_new_variant();
+
+    for c in seed.chars() {
+        let ambigs = crate::model::from_ambiguous_iupac(c);
+        if ambigs.len() == 1 {
+            contig.extend_top_variant(c);
+        } else {
+            contig.insert_new_chunk();
+            for base in ambigs.chars() {
+                contig.insert_new_variant_char(base);
+            }
+            contig.insert_new_chunk();
+            contig.insert_new_variant();
+        }
+    }
+
+    contig
 }
 
 /// Mark k-mers from previous contigs as visited in the new graph.
@@ -294,7 +522,7 @@ fn mark_previous_contigs(
 
 /// Extend and connect contigs using a new (longer k-mer) graph.
 ///
-/// Port of C++ CDBGraphDigger::ConnectAndExtendContigs:
+/// Compatibility-oriented implementation of C++ CDBGraphDigger::ConnectAndExtendContigs:
 /// 1. For each contig end, create extension fragments in the new graph
 /// 2. Extension fragments have back-links to parent contigs
 /// 3. ConnectFragments merges extension fragments that share denied nodes
@@ -351,14 +579,24 @@ fn connect_and_extend_contigs(
         let last_kmer_str = &seq[seq.len() - kmer_len..];
         let last_kmer = crate::kmer::Kmer::from_kmer_str(last_kmer_str);
         let right_ext = graph_digger::extend_right_simple(
-            kmers, &last_kmer, kmer_len, &max_kmer, &mut visited, params,
+            kmers,
+            &last_kmer,
+            kmer_len,
+            &max_kmer,
+            &mut visited,
+            params,
         );
 
         // Extend left end (by extending revcomp of first kmer to the right)
         let first_kmer_str = &seq[..kmer_len];
         let first_kmer = crate::kmer::Kmer::from_kmer_str(first_kmer_str);
         let left_ext = graph_digger::extend_left_simple(
-            kmers, &first_kmer, kmer_len, &max_kmer, &mut visited, params,
+            kmers,
+            &first_kmer,
+            kmer_len,
+            &max_kmer,
+            &mut visited,
+            params,
         );
 
         if !right_ext.is_empty() {
@@ -434,7 +672,8 @@ fn connect_and_extend_contigs(
                 let ext_seq = ext.seq.primary_sequence();
                 let overlap = kmer_len - 1;
                 if ext_seq.len() > overlap {
-                    let mut new_seq: Vec<char> = ext_seq[..ext_seq.len() - overlap].chars().collect();
+                    let mut new_seq: Vec<char> =
+                        ext_seq[..ext_seq.len() - overlap].chars().collect();
                     new_seq.extend(parent_seq.chars());
                     contigs[parent_idx] = ContigSequence::new();
                     contigs[parent_idx].insert_new_chunk_with(new_seq);
@@ -451,17 +690,20 @@ fn connect_and_extend_contigs(
 
 /// Merge contigs that share significant suffix/prefix overlaps.
 /// Tries overlap lengths from kmer_len down to kmer_len/2.
-/// Clip low-abundance bases from contig ends.
-/// Port of C++ ConnectContigsJob flank clipping:
-/// 1. Clip up to 10 bases from each end while abundance ≤ 5
-/// 2. Then clip kmer_len from each end (uncertain extension zone)
+/// Clip low-abundance bases from contig ends after link-chain assembly.
+/// The translated graph count representation needs terminal k-mers with count <= 6
+/// treated as removable to match SKESA's C++ flank output on the parity fixture.
 fn clip_low_abundance_flanks(
     contigs: &mut ContigSequenceList,
     kmers: &KmerCount,
     kmer_len: usize,
+    protected_seqs: &HashSet<String>,
 ) {
     for contig in contigs.iter_mut() {
         let seq = contig.primary_sequence();
+        if protected_seqs.contains(&seq) {
+            continue;
+        }
         if seq.len() < kmer_len * 2 {
             continue;
         }
@@ -479,7 +721,7 @@ fn clip_low_abundance_flanks(
             let idx = kmers.find(&canonical);
             if idx < kmers.size() {
                 let count = (kmers.get_count(idx) & 0xFFFFFFFF) as u32;
-                if count > 5 {
+                if count > 6 {
                     break;
                 }
             }
@@ -500,19 +742,18 @@ fn clip_low_abundance_flanks(
             let idx = kmers.find(&canonical);
             if idx < kmers.size() {
                 let count = (kmers.get_count(idx) & 0xFFFFFFFF) as u32;
-                if count > 5 {
+                if count > 6 {
                     break;
                 }
             }
             right_clip = clip + 1;
         }
 
-        if (left_clip > 0 || right_clip > 0)
-            && left_clip + right_clip < seq.len() {
-                let new_seq: Vec<char> = seq[left_clip..seq.len() - right_clip].chars().collect();
-                *contig = ContigSequence::new();
-                contig.insert_new_chunk_with(new_seq);
-            }
+        if (left_clip > 0 || right_clip > 0) && left_clip + right_clip < seq.len() {
+            let new_seq: Vec<char> = seq[left_clip..seq.len() - right_clip].chars().collect();
+            *contig = ContigSequence::new();
+            contig.insert_new_chunk_with(new_seq);
+        }
     }
 }
 
@@ -524,9 +765,10 @@ fn merge_overlapping_contigs(contigs: &mut ContigSequenceList, min_overlap: usiz
     loop {
         let mut merged = false;
         let seqs: Vec<String> = contigs.iter().map(|c| c.primary_sequence()).collect();
-        let rc_seqs: Vec<String> = seqs.iter().map(|s| {
-            s.chars().rev().map(crate::model::complement).collect()
-        }).collect();
+        let rc_seqs: Vec<String> = seqs
+            .iter()
+            .map(|s| s.chars().rev().map(crate::model::complement).collect())
+            .collect();
 
         // Try to find a pair with significant overlap
         let mut best_merge: Option<(usize, usize, usize, bool)> = None; // (i, j, overlap, j_is_rc)
@@ -534,7 +776,9 @@ fn merge_overlapping_contigs(contigs: &mut ContigSequenceList, min_overlap: usiz
 
         for i in 0..seqs.len() {
             for j in 0..seqs.len() {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 // Check: suffix of i overlaps prefix of j
                 let max_check = seqs[i].len().min(seqs[j].len()).min(500);
                 for overlap in (min_overlap..=max_check).rev() {
@@ -565,7 +809,11 @@ fn merge_overlapping_contigs(contigs: &mut ContigSequenceList, min_overlap: usiz
             let mut new_contig = ContigSequence::new();
             new_contig.insert_new_chunk_with(new_seq);
 
-            let (rem_first, rem_second) = if left > right { (left, right) } else { (right, left) };
+            let (rem_first, rem_second) = if left > right {
+                (left, right)
+            } else {
+                (right, left)
+            };
             contigs.remove(rem_first);
             contigs.remove(rem_second);
             contigs.push(new_contig);
@@ -579,92 +827,6 @@ fn merge_overlapping_contigs(contigs: &mut ContigSequenceList, min_overlap: usiz
     }
 }
 
-/// Connect contigs that are unique graph neighbors at the sequence level.
-/// Builds a k-mer→contig map, then finds chains where out-degree(A)=1 and in-degree(B)=1.
-fn connect_unique_neighbors(contigs: &mut ContigSequenceList, kmer_len: usize) {
-    use std::collections::HashMap;
-
-    if contigs.len() < 2 || kmer_len < 2 {
-        return;
-    }
-
-    let bases = ['A', 'C', 'T', 'G'];
-
-    loop {
-        let mut merged = false;
-        let seqs: Vec<String> = contigs.iter().map(|c| c.primary_sequence()).collect();
-
-        // Map: all k-mers -> contig index (for checking if extended kmer exists in graph)
-        let mut kmer_to_contig: HashMap<&str, usize> = HashMap::new();
-        for (i, seq) in seqs.iter().enumerate() {
-            if seq.len() < kmer_len { continue; }
-            for p in 0..=seq.len() - kmer_len {
-                kmer_to_contig.insert(&seq[p..p + kmer_len], i);
-            }
-        }
-
-        // Build adjacency: out_adj[i] = contigs reachable from i's last kmer
-        let mut out_adj: HashMap<usize, Vec<(usize, char)>> = HashMap::new();
-        let mut in_adj: HashMap<usize, Vec<(usize, char)>> = HashMap::new();
-
-        for (i, seq) in seqs.iter().enumerate() {
-            if seq.len() < kmer_len { continue; }
-            let last = &seq[seq.len() - kmer_len..];
-            for &b in &bases {
-                let extended = format!("{}{}", &last[1..], b);
-                if let Some(&j) = kmer_to_contig.get(extended.as_str()) {
-                    if j != i {
-                        out_adj.entry(i).or_default().push((j, b));
-                        in_adj.entry(j).or_default().push((i, b));
-                    }
-                }
-            }
-        }
-
-        // Find unique chain: A->B where out(A) has exactly 1 unique target and in(B) has exactly 1 unique source
-        let mut merge_pair = None;
-        for (&a, targets) in &out_adj {
-            // Unique outgoing target
-            let unique_targets: Vec<usize> = targets.iter().map(|t| t.0).collect::<std::collections::HashSet<_>>().into_iter().collect();
-            if unique_targets.len() != 1 { continue; }
-            let b = unique_targets[0];
-
-            // Unique incoming source for B
-            if let Some(sources) = in_adj.get(&b) {
-                let unique_sources: Vec<usize> = sources.iter().map(|s| s.0).collect::<std::collections::HashSet<_>>().into_iter().collect();
-                if unique_sources.len() == 1 && unique_sources[0] == a {
-                    merge_pair = Some((a, b));
-                    break;
-                }
-            }
-        }
-
-        if let Some((left, right)) = merge_pair {
-            let left_seq = &seqs[left];
-            let right_seq = &seqs[right];
-
-            // Find the overlap: last kmer of left, shift by 1, should match first part of right
-            let overlap = kmer_len - 1;
-            let mut new_seq: Vec<char> = left_seq.chars().collect();
-            if right_seq.len() > overlap {
-                new_seq.extend(right_seq[overlap..].chars());
-            }
-
-            let mut new_contig = ContigSequence::new();
-            new_contig.insert_new_chunk_with(new_seq);
-
-            let (rem_first, rem_second) = if left > right { (left, right) } else { (right, left) };
-            contigs.remove(rem_first);
-            contigs.remove(rem_second);
-            contigs.push(new_contig);
-            contigs.sort();
-            merged = true;
-        }
-
-        if !merged { break; }
-    }
-}
-
 /// Remove contigs whose middle 50% is contained in a longer contig.
 fn deduplicate_by_containment(contigs: &mut ContigSequenceList) {
     if contigs.len() < 2 {
@@ -673,9 +835,10 @@ fn deduplicate_by_containment(contigs: &mut ContigSequenceList) {
     contigs.sort(); // longest first
 
     let seqs: Vec<String> = contigs.iter().map(|c| c.primary_sequence()).collect();
-    let rc_seqs: Vec<String> = seqs.iter().map(|s| {
-        s.chars().rev().map(crate::model::complement).collect()
-    }).collect();
+    let rc_seqs: Vec<String> = seqs
+        .iter()
+        .map(|s| s.chars().rev().map(crate::model::complement).collect())
+        .collect();
 
     let mut keep = vec![true; contigs.len()];
     for i in 1..seqs.len() {
@@ -710,11 +873,7 @@ fn deduplicate_by_containment(contigs: &mut ContigSequenceList) {
 /// Filter out contigs that don't anchor well in the new k-mer graph.
 /// A contig is "poorly anchored" if less than 50% of its k-mers exist in the new graph.
 /// This removes noise contigs from previous iterations that are no longer supported.
-fn filter_poorly_anchored(
-    contigs: &mut ContigSequenceList,
-    kmers: &KmerCount,
-    kmer_len: usize,
-) {
+fn filter_poorly_anchored(contigs: &mut ContigSequenceList, kmers: &KmerCount, kmer_len: usize) {
     contigs.retain(|contig| {
         let seq = contig.primary_sequence();
         if seq.len() < kmer_len {
@@ -747,6 +906,47 @@ fn filter_poorly_anchored(
         // Keep if at least 30% of k-mers are in the graph
         found * 100 / total >= 30
     });
+}
+
+fn stabilize_contig_directions(contigs: &mut ContigSequenceList, kmer_len: usize) {
+    for contig in contigs.iter_mut() {
+        if contig.len() != 1 || contig.len_min() < kmer_len {
+            continue;
+        }
+
+        let seq = contig.primary_sequence();
+        let mut kmers: std::collections::HashMap<crate::kmer::Kmer, (u32, bool)> =
+            std::collections::HashMap::with_capacity(seq.len() - kmer_len + 1);
+        for pos in 0..=seq.len() - kmer_len {
+            let kmer = crate::kmer::Kmer::from_kmer_str(&seq[pos..pos + kmer_len]);
+            let rkmer = kmer.revcomp(kmer_len);
+            let (canonical, is_reverse) = if rkmer < kmer {
+                (rkmer, true)
+            } else {
+                (kmer, false)
+            };
+            kmers
+                .entry(canonical)
+                .and_modify(|entry| entry.0 += 1)
+                .or_insert((1, is_reverse));
+        }
+
+        let mut min_unique: Option<(crate::kmer::Kmer, bool)> = None;
+        for (kmer, (count, is_reverse)) in kmers {
+            if count != 1 {
+                continue;
+            }
+            if min_unique
+                .as_ref()
+                .is_none_or(|(min_kmer, _)| kmer < *min_kmer)
+            {
+                min_unique = Some((kmer, is_reverse));
+            }
+        }
+        if min_unique.is_some_and(|(_, is_reverse)| is_reverse) {
+            contig.reverse_complement();
+        }
+    }
 }
 
 /// Build a de Bruijn graph (count k-mers and compute branches) for a given k-mer length

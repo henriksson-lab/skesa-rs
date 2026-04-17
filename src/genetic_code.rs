@@ -3,8 +3,8 @@
 
 /// A genetic code table entry: (amino_acids, starts_stops, code_number, name)
 struct TableInfo {
-    amino_acids: &'static str,   // 64 characters: amino acid for each codon
-    starts_stops: &'static str,  // 64 characters: M for start, * for stop
+    amino_acids: &'static str,  // 64 characters: amino acid for each codon
+    starts_stops: &'static str, // 64 characters: M for start, * for stop
     code_number: u32,
     name: &'static str,
 }
@@ -190,31 +190,156 @@ fn all_tables() -> &'static [TableInfo] {
 }
 
 static GENETIC_CODE_TABLES: [TableInfo; 25] = [
-    TableInfo { amino_acids: "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "---M------**--*----M---------------M----------------------------", code_number: 1, name: "Standard Code" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSS**VVVVAAAADDEEGGGG", starts_stops: "----------**--------------------MMMM----------**---M------------", code_number: 2, name: "Vertebrate Mitochondrial Code" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCWWTTTTPPPPHHQQRRRRIIMMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "----------**----------------------MM---------------M------------", code_number: 3, name: "Yeast Mitochondrial Code" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "--MM------**-------M------------MMMM---------------M------------", code_number: 4, name: "Mold/Protozoan/Coelenterate Mitochondrial" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSSSSVVVVAAAADDEEGGGG", starts_stops: "---M------**--------------------MMMM---------------M------------", code_number: 5, name: "Invertebrate Mitochondrial Code" },
-    TableInfo { amino_acids: "FFLLSSSSYYQQCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "--------------*--------------------M----------------------------", code_number: 6, name: "Ciliate/Dasycladacean/Hexamita Nuclear" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNNKSSSSVVVVAAAADDEEGGGG", starts_stops: "----------**-----------------------M---------------M------------", code_number: 9, name: "Echinoderm/Flatworm Mitochondrial" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCCWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "----------**-----------------------M----------------------------", code_number: 10, name: "Euplotid Nuclear Code" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "---M------**--*----M------------MMMM---------------M------------", code_number: 11, name: "Bacterial/Archaeal/Plant Plastid" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CC*WLLLSPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "----------**--*----M---------------M----------------------------", code_number: 12, name: "Alternative Yeast Nuclear Code" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSSGGVVVVAAAADDEEGGGG", starts_stops: "---M------**----------------------MM---------------M------------", code_number: 13, name: "Ascidian Mitochondrial Code" },
-    TableInfo { amino_acids: "FFLLSSSSYYY*CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNNKSSSSVVVVAAAADDEEGGGG", starts_stops: "-----------*-----------------------M----------------------------", code_number: 14, name: "Alternative Flatworm Mitochondrial" },
-    TableInfo { amino_acids: "FFLLSSSSYY*LCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "----------*---*--------------------M----------------------------", code_number: 16, name: "Chlorophycean Mitochondrial Code" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNNKSSSSVVVVAAAADDEEGGGG", starts_stops: "----------**-----------------------M---------------M------------", code_number: 21, name: "Trematode Mitochondrial Code" },
-    TableInfo { amino_acids: "FFLLSS*SYY*LCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "------*---*---*--------------------M----------------------------", code_number: 22, name: "Scenedesmus obliquus Mitochondrial" },
-    TableInfo { amino_acids: "FF*LSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "--*-------**--*-----------------M--M---------------M------------", code_number: 23, name: "Thraustochytrium Mitochondrial Code" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSSKVVVVAAAADDEEGGGG", starts_stops: "---M------**-------M---------------M---------------M------------", code_number: 24, name: "Pterobranchia Mitochondrial Code" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CCGWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "---M------**-----------------------M---------------M------------", code_number: 25, name: "Candidate Division SR1/Gracilibacteria" },
-    TableInfo { amino_acids: "FFLLSSSSYY**CC*WLLLAPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "----------**--*----M---------------M----------------------------", code_number: 26, name: "Pachysolen tannophilus Nuclear" },
-    TableInfo { amino_acids: "FFLLSSSSYYQQCCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "--------------*--------------------M----------------------------", code_number: 27, name: "Karyorelict Nuclear Code" },
-    TableInfo { amino_acids: "FFLLSSSSYYQQCCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "----------**--*--------------------M----------------------------", code_number: 28, name: "Condylostoma Nuclear Code" },
-    TableInfo { amino_acids: "FFLLSSSSYYYYCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "--------------*--------------------M----------------------------", code_number: 29, name: "Mesodinium Nuclear Code" },
-    TableInfo { amino_acids: "FFLLSSSSYYEECC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "--------------*--------------------M----------------------------", code_number: 30, name: "Peritrich Nuclear Code" },
-    TableInfo { amino_acids: "FFLLSSSSYYEECCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG", starts_stops: "----------**-----------------------M----------------------------", code_number: 31, name: "Blastocrithidia Nuclear Code" },
-    TableInfo { amino_acids: "FFLLSSSSYYY*CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSSKVVVVAAAADDEEGGGG", starts_stops: "---M-------*-------M---------------M---------------M------------", code_number: 33, name: "Cephalodiscidae Mitochondrial" },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "---M------**--*----M---------------M----------------------------",
+        code_number: 1,
+        name: "Standard Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSS**VVVVAAAADDEEGGGG",
+        starts_stops: "----------**--------------------MMMM----------**---M------------",
+        code_number: 2,
+        name: "Vertebrate Mitochondrial Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCWWTTTTPPPPHHQQRRRRIIMMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "----------**----------------------MM---------------M------------",
+        code_number: 3,
+        name: "Yeast Mitochondrial Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "--MM------**-------M------------MMMM---------------M------------",
+        code_number: 4,
+        name: "Mold/Protozoan/Coelenterate Mitochondrial",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSSSSVVVVAAAADDEEGGGG",
+        starts_stops: "---M------**--------------------MMMM---------------M------------",
+        code_number: 5,
+        name: "Invertebrate Mitochondrial Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYYQQCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "--------------*--------------------M----------------------------",
+        code_number: 6,
+        name: "Ciliate/Dasycladacean/Hexamita Nuclear",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNNKSSSSVVVVAAAADDEEGGGG",
+        starts_stops: "----------**-----------------------M---------------M------------",
+        code_number: 9,
+        name: "Echinoderm/Flatworm Mitochondrial",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCCWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "----------**-----------------------M----------------------------",
+        code_number: 10,
+        name: "Euplotid Nuclear Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "---M------**--*----M------------MMMM---------------M------------",
+        code_number: 11,
+        name: "Bacterial/Archaeal/Plant Plastid",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CC*WLLLSPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "----------**--*----M---------------M----------------------------",
+        code_number: 12,
+        name: "Alternative Yeast Nuclear Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNKKSSGGVVVVAAAADDEEGGGG",
+        starts_stops: "---M------**----------------------MM---------------M------------",
+        code_number: 13,
+        name: "Ascidian Mitochondrial Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYYY*CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNNKSSSSVVVVAAAADDEEGGGG",
+        starts_stops: "-----------*-----------------------M----------------------------",
+        code_number: 14,
+        name: "Alternative Flatworm Mitochondrial",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY*LCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "----------*---*--------------------M----------------------------",
+        code_number: 16,
+        name: "Chlorophycean Mitochondrial Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIMMTTTTNNNKSSSSVVVVAAAADDEEGGGG",
+        starts_stops: "----------**-----------------------M---------------M------------",
+        code_number: 21,
+        name: "Trematode Mitochondrial Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSS*SYY*LCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "------*---*---*--------------------M----------------------------",
+        code_number: 22,
+        name: "Scenedesmus obliquus Mitochondrial",
+    },
+    TableInfo {
+        amino_acids: "FF*LSSSSYY**CC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "--*-------**--*-----------------M--M---------------M------------",
+        code_number: 23,
+        name: "Thraustochytrium Mitochondrial Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSSKVVVVAAAADDEEGGGG",
+        starts_stops: "---M------**-------M---------------M---------------M------------",
+        code_number: 24,
+        name: "Pterobranchia Mitochondrial Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CCGWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "---M------**-----------------------M---------------M------------",
+        code_number: 25,
+        name: "Candidate Division SR1/Gracilibacteria",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYY**CC*WLLLAPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "----------**--*----M---------------M----------------------------",
+        code_number: 26,
+        name: "Pachysolen tannophilus Nuclear",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYYQQCCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "--------------*--------------------M----------------------------",
+        code_number: 27,
+        name: "Karyorelict Nuclear Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYYQQCCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "----------**--*--------------------M----------------------------",
+        code_number: 28,
+        name: "Condylostoma Nuclear Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYYYYCC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "--------------*--------------------M----------------------------",
+        code_number: 29,
+        name: "Mesodinium Nuclear Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYYEECC*WLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "--------------*--------------------M----------------------------",
+        code_number: 30,
+        name: "Peritrich Nuclear Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYYEECCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSRRVVVVAAAADDEEGGGG",
+        starts_stops: "----------**-----------------------M----------------------------",
+        code_number: 31,
+        name: "Blastocrithidia Nuclear Code",
+    },
+    TableInfo {
+        amino_acids: "FFLLSSSSYYY*CCWWLLLLPPPPHHQQRRRRIIIMTTTTNNKKSSSKVVVVAAAADDEEGGGG",
+        starts_stops: "---M-------*-------M---------------M---------------M------------",
+        code_number: 33,
+        name: "Cephalodiscidae Mitochondrial",
+    },
 ];
 
 #[cfg(test)]

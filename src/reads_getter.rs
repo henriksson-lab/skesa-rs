@@ -56,9 +56,30 @@ fn longest_unambiguous(seq: &str) -> &str {
 
 /// Convert sequence to uppercase ACGT
 fn normalize_sequence(seq: &str) -> String {
-    seq.chars()
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
+    seq.chars().map(|c| c.to_ascii_uppercase()).collect()
+}
+
+fn validate_read_symbols(seq: &str) -> Result<(), String> {
+    for c in seq.chars() {
+        let upper = c.to_ascii_uppercase();
+        if !"ACGTYRWSKMDVHBXN-".contains(upper) {
+            return Err(format!("Invalid symbol {}", c));
+        }
+    }
+    Ok(())
+}
+
+fn match_pair_ids(acc1: &str, acc2: &str) -> bool {
+    if acc1 == acc2 {
+        return true;
+    }
+
+    fn pair_prefix<'a>(acc: &'a str, mate: char) -> Option<&'a str> {
+        acc.strip_suffix(mate)
+            .and_then(|prefix| prefix.strip_suffix(['.', '/']))
+    }
+
+    pair_prefix(acc1, '1') == pair_prefix(acc2, '2') && pair_prefix(acc1, '1').is_some()
 }
 
 /// Detect if a file is FASTA or FASTQ by looking at the first character
@@ -85,7 +106,8 @@ fn read_one_file(path: &str, use_paired_ends: bool) -> Result<ReadPair, String> 
     };
 
     let mut reader = reader;
-    let first_char = detect_format(&mut reader).map_err(|e| format!("Error reading {}: {}", path, e))?;
+    let first_char =
+        detect_format(&mut reader).map_err(|e| format!("Error reading {}: {}", path, e))?;
 
     match first_char {
         '>' => read_fasta(reader, use_paired_ends, &mut paired, &mut unpaired)?,
@@ -103,23 +125,58 @@ fn read_fasta(
     paired: &mut ReadHolder,
     unpaired: &mut ReadHolder,
 ) -> Result<(), String> {
+    let mut pending_pair: Option<(String, String)> = None;
     let mut current_seq = String::new();
-    let mut read_count = 0;
+    let mut current_id = String::new();
+    let mut in_record = false;
+    let mut saw_sequence_line = false;
 
     for line in reader.lines() {
         let line = line.map_err(|e| format!("Error reading: {}", e))?;
         if line.starts_with('>') {
-            if !current_seq.is_empty() {
-                add_read(&current_seq, use_paired_ends, read_count, paired, unpaired);
-                read_count += 1;
+            if in_record {
+                if !saw_sequence_line {
+                    return Err("fasta record must have sequence line".to_string());
+                }
+                add_record(
+                    &current_id,
+                    &current_seq,
+                    use_paired_ends,
+                    &mut pending_pair,
+                    paired,
+                    unpaired,
+                );
                 current_seq.clear();
             }
+            let seq_id = line[1..].split([' ', '\t']).next().unwrap_or("");
+            if seq_id.is_empty() {
+                return Err("fasta record must have seq ID".to_string());
+            }
+            current_id.clear();
+            current_id.push_str(seq_id);
+            in_record = true;
+            saw_sequence_line = false;
         } else {
-            current_seq.push_str(line.trim());
+            validate_read_symbols(&line).map_err(|e| format!("{} in FASTA", e))?;
+            saw_sequence_line = true;
+            current_seq.push_str(&line);
         }
     }
-    if !current_seq.is_empty() {
-        add_read(&current_seq, use_paired_ends, read_count, paired, unpaired);
+    if in_record {
+        if !saw_sequence_line {
+            return Err("fasta record must have sequence line".to_string());
+        }
+        add_record(
+            &current_id,
+            &current_seq,
+            use_paired_ends,
+            &mut pending_pair,
+            paired,
+            unpaired,
+        );
+    }
+    if let Some((_, seq)) = pending_pair {
+        add_single_read(&seq, unpaired);
     }
 
     Ok(())
@@ -133,7 +190,7 @@ fn read_fastq(
     unpaired: &mut ReadHolder,
 ) -> Result<(), String> {
     let mut lines = reader.lines();
-    let mut read_count = 0;
+    let mut pending_pair: Option<(String, String)> = None;
 
     loop {
         // Line 1: @ header
@@ -143,7 +200,14 @@ fn read_fastq(
             None => break,
         };
         if !header.starts_with('@') {
-            return Err(format!("Expected '@' in FASTQ, got: {}", &header[..1.min(header.len())]));
+            return Err(format!(
+                "Expected '@' in FASTQ, got: {}",
+                &header[..1.min(header.len())]
+            ));
+        }
+        let seq_id = &header[1..];
+        if seq_id.is_empty() {
+            return Err("fastq record must have seq ID".to_string());
         }
 
         // Line 2: sequence
@@ -151,6 +215,7 @@ fn read_fastq(
             Some(Ok(l)) => l,
             _ => return Err("Truncated FASTQ".to_string()),
         };
+        validate_read_symbols(&seq).map_err(|e| format!("{} in FASTQ", e))?;
 
         // Line 3: + separator
         let sep = match lines.next() {
@@ -158,7 +223,10 @@ fn read_fastq(
             _ => return Err("Truncated FASTQ".to_string()),
         };
         if !sep.starts_with('+') {
-            return Err(format!("Expected '+' in FASTQ, got: {}", &sep[..1.min(sep.len())]));
+            return Err(format!(
+                "Expected '+' in FASTQ, got: {}",
+                &sep[..1.min(sep.len())]
+            ));
         }
 
         // Line 4: quality
@@ -167,37 +235,79 @@ fn read_fastq(
             _ => return Err("Truncated FASTQ".to_string()),
         };
 
-        add_read(&seq, use_paired_ends, read_count, paired, unpaired);
-        read_count += 1;
+        add_record(
+            seq_id,
+            &seq,
+            use_paired_ends,
+            &mut pending_pair,
+            paired,
+            unpaired,
+        );
+    }
+
+    if let Some((_, seq)) = pending_pair {
+        add_single_read(&seq, unpaired);
     }
 
     Ok(())
 }
 
-/// Add a read to the appropriate holder (paired or unpaired)
-fn add_read(
+fn add_record(
+    seq_id: &str,
     seq: &str,
     use_paired_ends: bool,
-    _read_count: usize,
+    pending_pair: &mut Option<(String, String)>,
     paired: &mut ReadHolder,
     unpaired: &mut ReadHolder,
 ) {
-    let normalized = normalize_sequence(seq);
-    let clean = longest_unambiguous(&normalized);
-    if clean.is_empty() {
+    if !use_paired_ends {
+        add_single_read(seq, unpaired);
         return;
     }
 
-    if use_paired_ends {
-        paired.push_back_str(clean);
+    if let Some((pending_id, pending_seq)) = pending_pair.take() {
+        if match_pair_ids(&pending_id, seq_id) {
+            add_read_pair(&pending_seq, seq, paired, unpaired);
+        } else {
+            add_single_read(&pending_seq, unpaired);
+            *pending_pair = Some((seq_id.to_string(), seq.to_string()));
+        }
     } else {
-        unpaired.push_back_str(clean);
+        *pending_pair = Some((seq_id.to_string(), seq.to_string()));
+    }
+}
+
+fn clean_read(seq: &str) -> Option<String> {
+    let normalized = normalize_sequence(seq);
+    let clean = longest_unambiguous(&normalized);
+    if clean.is_empty() {
+        None
+    } else {
+        Some(clean.to_string())
+    }
+}
+
+fn add_single_read(seq: &str, unpaired: &mut ReadHolder) {
+    if let Some(clean) = clean_read(seq) {
+        unpaired.push_back_str(&clean);
+    }
+}
+
+fn add_read_pair(seq1: &str, seq2: &str, paired: &mut ReadHolder, unpaired: &mut ReadHolder) {
+    match (clean_read(seq1), clean_read(seq2)) {
+        (Some(read1), Some(read2)) => {
+            paired.push_back_str(&read1);
+            paired.push_back_str(&read2);
+        }
+        (Some(read), None) | (None, Some(read)) => unpaired.push_back_str(&read),
+        (None, None) => {}
     }
 }
 
 /// Clip adapters from reads using k-mer frequency analysis.
-/// Adapters are 19-mers that appear in more than vector_percent of reads.
-pub fn clip_adapters(reads: &mut [ReadPair], vector_percent: f64) {
+/// Adapters are 19-mers that pass SKESA's adapter counter threshold and appear
+/// in more than vector_percent of reads.
+pub fn clip_adapters(reads: &mut [ReadPair], vector_percent: f64, min_count_for_adapters: u32) {
     if vector_percent >= 1.0 {
         eprintln!("Adapters clip is disabled");
         return;
@@ -206,7 +316,10 @@ pub fn clip_adapters(reads: &mut [ReadPair], vector_percent: f64) {
     let adapter_kmer_len = 19;
 
     // Count total reads
-    let total_reads: usize = reads.iter().map(|r| r[0].read_num() + r[1].read_num()).sum();
+    let total_reads: usize = reads
+        .iter()
+        .map(|r| r[0].read_num() + r[1].read_num())
+        .sum();
     let max_count = (vector_percent * total_reads as f64) as u32;
 
     if max_count == 0 {
@@ -223,7 +336,9 @@ pub fn clip_adapters(reads: &mut [ReadPair], vector_percent: f64) {
             while !ki.at_end() {
                 let kmer = ki.get();
                 let val = kmer.get_val();
-                let rc_val = crate::large_int::LargeInt::<1>::new(val).revcomp(adapter_kmer_len).get_val();
+                let rc_val = crate::large_int::LargeInt::<1>::new(val)
+                    .revcomp(adapter_kmer_len)
+                    .get_val();
                 let canonical = val.min(rc_val);
                 flat.push(canonical, 1);
                 ki.advance();
@@ -231,7 +346,7 @@ pub fn clip_adapters(reads: &mut [ReadPair], vector_percent: f64) {
         }
     }
 
-    flat.sort_and_uniq(1);
+    flat.sort_and_uniq(min_count_for_adapters);
 
     // Find adapter k-mers (those exceeding max_count)
     let mut adapter_set: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -239,14 +354,19 @@ pub fn clip_adapters(reads: &mut [ReadPair], vector_percent: f64) {
         if (count as u32) > max_count {
             adapter_set.insert(val);
             // Also insert revcomp
-            let rc = crate::large_int::LargeInt::<1>::new(val).revcomp(adapter_kmer_len).get_val();
+            let rc = crate::large_int::LargeInt::<1>::new(val)
+                .revcomp(adapter_kmer_len)
+                .get_val();
             adapter_set.insert(rc);
         }
     }
 
     let num_adapters = adapter_set.len() / 2;
     if num_adapters == 0 {
-        let total_seq: usize = reads.iter().map(|r| r[0].total_seq() + r[1].total_seq()).sum();
+        let total_seq: usize = reads
+            .iter()
+            .map(|r| r[0].total_seq() + r[1].total_seq())
+            .sum();
         eprintln!(
             "Adapters: 0 Reads before: {} Sequence before: {} Reads after: {} Sequence after: {} Reads clipped: 0",
             total_reads, total_seq, total_reads, total_seq
@@ -256,7 +376,10 @@ pub fn clip_adapters(reads: &mut [ReadPair], vector_percent: f64) {
 
     // Clip reads containing adapter k-mers
     let reads_before = total_reads;
-    let seq_before: usize = reads.iter().map(|r| r[0].total_seq() + r[1].total_seq()).sum();
+    let seq_before: usize = reads
+        .iter()
+        .map(|r| r[0].total_seq() + r[1].total_seq())
+        .sum();
     let mut clipped_count = 0usize;
 
     for read_pair in reads.iter_mut() {
@@ -299,8 +422,14 @@ pub fn clip_adapters(reads: &mut [ReadPair], vector_percent: f64) {
         }
     }
 
-    let reads_after: usize = reads.iter().map(|r| r[0].read_num() + r[1].read_num()).sum();
-    let seq_after: usize = reads.iter().map(|r| r[0].total_seq() + r[1].total_seq()).sum();
+    let reads_after: usize = reads
+        .iter()
+        .map(|r| r[0].read_num() + r[1].read_num())
+        .sum();
+    let seq_after: usize = reads
+        .iter()
+        .map(|r| r[0].total_seq() + r[1].total_seq())
+        .sum();
     eprintln!(
         "Adapters: {} Reads before: {} Sequence before: {} Reads after: {} Sequence after: {} Reads clipped: {}",
         num_adapters, reads_before, seq_before, reads_after, seq_after, clipped_count
@@ -326,10 +455,13 @@ impl ReadsGetter {
                 // Paired files
                 let parts: Vec<&str> = file_spec.split(',').collect();
                 if parts.len() != 2 {
-                    return Err(format!("Expected exactly 2 comma-separated files, got {}", parts.len()));
+                    return Err(format!(
+                        "Expected exactly 2 comma-separated files, got {}",
+                        parts.len()
+                    ));
                 }
-                let r1 = read_one_file(parts[0].trim(), true)?;
-                let r2 = read_one_file(parts[1].trim(), true)?;
+                let r1 = read_one_file(parts[0].trim(), false)?;
+                let r2 = read_one_file(parts[1].trim(), false)?;
 
                 // Interleave the paired reads
                 let mut paired = ReadHolder::new(true);
@@ -341,6 +473,12 @@ impl ReadsGetter {
                     si1.advance();
                     si2.advance();
                 }
+                if !si1.at_end() {
+                    return Err(format!(
+                        "Files {} contain different number of mates",
+                        file_spec
+                    ));
+                }
                 let unpaired = ReadHolder::new(false);
                 reads.push([paired, unpaired]);
             } else {
@@ -349,12 +487,20 @@ impl ReadsGetter {
             }
         }
 
-        let total: usize = reads.iter().map(|r| r[0].read_num() + r[1].read_num()).sum();
+        let total: usize = reads
+            .iter()
+            .map(|r| r[0].read_num() + r[1].read_num())
+            .sum();
         if total == 0 {
             return Err("No valid reads available for assembly".to_string());
         }
 
-        eprintln!("Total reads: {}", total);
+        let paired_mates: usize = reads.iter().map(|r| r[0].read_num()).sum();
+        if paired_mates > 0 {
+            eprintln!("Total mates: {} Paired reads: {}", total, paired_mates / 2);
+        } else {
+            eprintln!("Total reads: {}", total);
+        }
 
         Ok(ReadsGetter { reads })
     }
@@ -371,12 +517,18 @@ impl ReadsGetter {
 
     /// Total number of reads across all sources
     pub fn total_reads(&self) -> usize {
-        self.reads.iter().map(|r| r[0].read_num() + r[1].read_num()).sum()
+        self.reads
+            .iter()
+            .map(|r| r[0].read_num() + r[1].read_num())
+            .sum()
     }
 
     /// Total sequence length across all sources
     pub fn total_seq(&self) -> usize {
-        self.reads.iter().map(|r| r[0].total_seq() + r[1].total_seq()).sum()
+        self.reads
+            .iter()
+            .map(|r| r[0].total_seq() + r[1].total_seq())
+            .sum()
     }
 }
 
@@ -405,10 +557,7 @@ mod tests {
         let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
         let fasta = data_dir.join("small_test.fasta");
 
-        let rg = ReadsGetter::new(
-            &[fasta.to_str().unwrap().to_string()],
-            false,
-        ).unwrap();
+        let rg = ReadsGetter::new(&[fasta.to_str().unwrap().to_string()], false).unwrap();
 
         assert_eq!(rg.total_reads(), 200);
     }
@@ -420,10 +569,7 @@ mod tests {
         let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
         let fasta = data_dir.join("small_test.fasta");
 
-        let rg = ReadsGetter::new(
-            &[fasta.to_str().unwrap().to_string()],
-            false,
-        ).unwrap();
+        let rg = ReadsGetter::new(&[fasta.to_str().unwrap().to_string()], false).unwrap();
 
         assert_eq!(rg.total_reads(), 200);
         // Each read is 100bp, so total seq should be 20000

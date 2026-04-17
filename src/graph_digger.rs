@@ -1,6 +1,6 @@
 /// De Bruijn graph traversal and contig assembly.
 ///
-/// Port of SKESA's CDBGraphDigger from graphdigger.hpp.
+/// Rust graph traversal modeled on SKESA's CDBGraphDigger from graphdigger.hpp.
 ///
 /// This module implements the core graph traversal algorithm that:
 /// 1. Finds unvisited k-mers as seeds
@@ -23,6 +23,8 @@ pub struct DiggerParams {
     pub jump: usize,
     /// Minimum k-mer count for contig inclusion
     pub low_count: usize,
+    /// Whether SNP/fork traversal is allowed during extension
+    pub allow_snps: bool,
 }
 
 impl Default for DiggerParams {
@@ -31,21 +33,21 @@ impl Default for DiggerParams {
             fraction: 0.1,
             jump: 150,
             low_count: 2,
+            allow_snps: false,
         }
     }
 }
 
 /// Assemble contigs from a sorted k-mer counter using the de Bruijn graph approach.
 ///
-/// This simplified implementation:
+/// This compatibility-oriented implementation:
 /// 1. Iterates over k-mers as seeds
-/// 2. Extends each seed left and right following the unique path
-/// 3. Stops at forks (>1 successor) or dead ends (0 successors)
-/// 4. Collects contigs longer than kmer_len
+/// 2. Extends each seed left and right through filtered graph successors
+/// 3. Stops at hard forks unless SNP-aware traversal is explicitly enabled
+/// 4. Tracks endpoints for later contig connection and overlap passes
 ///
-/// This matches the C++ CDBGraphDigger's core logic for simple genomes
-/// but doesn't yet handle SNP discovery, paired-end connection, or
-/// complex fork resolution with noise filtering.
+/// The small de novo fixtures match C++ output, but full SKESA parity still
+/// depends on broader `ImproveContigs`, SNP recovery, and repeat fixtures.
 pub fn assemble_contigs(
     kmers: &mut KmerCount,
     _bins: &Bins,
@@ -101,14 +103,26 @@ pub fn assemble_contigs_with_visited(
         visited[seed_idx] = true;
 
         // Extend right with endpoint tracking
-        let right_ext = extend_right_with_endpoint(kmers, &seed_kmer, kmer_len, &max_kmer, &mut visited, params);
+        let right_ext = extend_right_with_endpoint(
+            kmers,
+            &seed_kmer,
+            kmer_len,
+            &max_kmer,
+            &mut visited,
+            params,
+        );
         // Extend left (extend revcomp to the right)
         let rc_seed = seed_kmer.revcomp(kmer_len);
-        let left_ext = extend_right_with_endpoint(kmers, &rc_seed, kmer_len, &max_kmer, &mut visited, params);
+        let left_ext =
+            extend_right_with_endpoint(kmers, &rc_seed, kmer_len, &max_kmer, &mut visited, params);
 
         // Combine: reverse(left) + seed_kmer + right
-        let mut left_seq: Vec<char> = left_ext.sequence.iter().rev().map(|&c| crate::model::complement(c)).collect();
-        left_seq.reverse(); // now in correct left-to-right order
+        let left_seq: Vec<char> = left_ext
+            .sequence
+            .iter()
+            .rev()
+            .map(|&c| crate::model::complement(c))
+            .collect();
         let seed_str = seed_kmer.to_kmer_string(kmer_len);
         let mut full_seq: Vec<char> = left_seq;
         full_seq.extend(seed_str.chars());
@@ -123,7 +137,11 @@ pub fn assemble_contigs_with_visited(
                 c.insert_new_chunk_with(full_seq.clone());
                 c
             } else {
-                build_multi_chunk_contig(&full_seq, &right_ext.forks, left_ext.sequence.len() + seed_str.len())
+                build_multi_chunk_contig(
+                    &full_seq,
+                    &right_ext.forks,
+                    left_ext.sequence.len() + seed_str.len(),
+                )
             };
 
             // Record endpoint k-mers (denied nodes) for contig connection
@@ -160,17 +178,16 @@ pub fn assemble_contigs_with_visited(
     connect_contigs_through_graph(&mut contigs, kmers, kmer_len);
 
     // Remove contigs that are contained within longer contigs
-    
 
     deduplicate_contigs(contigs)
 }
 
 /// A successor candidate with its graph information
 struct SuccessorCandidate {
-    kmer: Kmer,        // the oriented (not canonical) next k-mer
-    index: usize,      // index in the sorted k-mer array
-    nt: u64,           // nucleotide added (0-3)
-    abundance: u32,    // k-mer count
+    kmer: Kmer,     // the oriented (not canonical) next k-mer
+    index: usize,   // index in the sorted k-mer array
+    nt: u64,        // nucleotide added (0-3)
+    abundance: u32, // k-mer count
 }
 
 /// Find the index and branch info of the current kmer in the graph.
@@ -210,7 +227,11 @@ fn find_successors_from_branches(
 
     if let Some((_idx, branch_bits, is_minus)) = branch_info {
         // Use branch bits to only check known neighbors
-        let bits = if is_minus { branch_bits >> 4 } else { branch_bits & 0x0F };
+        let bits = if is_minus {
+            branch_bits >> 4
+        } else {
+            branch_bits & 0x0F
+        };
 
         for nt in 0..4u64 {
             if bits & (1 << nt) == 0 {
@@ -296,7 +317,7 @@ fn is_extendable(
     let bin2nt_mask = *max_kmer; // reuse for shifting
 
     for _step in 0..min_len {
-        // Inline successor search for speed — skip allocation
+        // Inline successor search for speed - skip allocation
         let shifted = (current.shl(2)) & bin2nt_mask;
         let mut best_kmer = None;
         let mut best_abundance = 0u32;
@@ -350,7 +371,15 @@ fn find_and_filter_successors(
         let mut i = successors.len();
         while i > 1 {
             i -= 1;
-            if !is_extendable(kmers, &successors[i].kmer, kmer_len, max_kmer, check_len, fraction, low_count) {
+            if !is_extendable(
+                kmers,
+                &successors[i].kmer,
+                kmer_len,
+                max_kmer,
+                check_len,
+                fraction,
+                low_count,
+            ) {
                 successors.remove(i);
             }
         }
@@ -360,8 +389,7 @@ fn find_and_filter_successors(
 }
 
 /// Check backward reachability from a node to an expected predecessor.
-/// The C++ ExtendToRight checks: predecessors filtered → size must be 1 → must match.
-/// We relax this: just check that the expected predecessor is among filtered predecessors.
+/// The C++ ExtendToRight checks: predecessors filtered -> size must be 1 -> must match.
 fn has_backward_reachability(
     kmers: &KmerCount,
     node: &Kmer,
@@ -375,19 +403,41 @@ fn has_backward_reachability(
     let mut predecessors = find_all_successors(kmers, &rc, kmer_len, max_kmer, low_count);
     filter_by_abundance(&mut predecessors, fraction);
 
-    if predecessors.is_empty() {
+    if predecessors.len() != 1 {
         return false;
     }
 
-    // Check if any filtered predecessor matches the expected one
-    for pred in &predecessors {
-        let pred_rc = pred.kmer.revcomp(kmer_len);
-        if pred_rc == *expected_predecessor {
-            return true;
-        }
+    let pred_rc = predecessors[0].kmer.revcomp(kmer_len);
+    pred_rc == *expected_predecessor
+}
+
+fn validate_reverse_snp(
+    forward: &crate::snp_discovery::SnpResult,
+    backward: &crate::snp_discovery::SnpResult,
+) -> bool {
+    let forward_max = forward.variants.iter().map(|v| v.len()).max().unwrap_or(0);
+    let backward_max = backward.variants.iter().map(|v| v.len()).max().unwrap_or(0);
+    if forward_max != backward_max || forward.shift != backward.shift {
+        return false;
     }
 
-    false
+    let mut forward_variants = forward.variants.clone();
+    forward_variants.sort();
+
+    let mut backward_variants: Vec<Vec<char>> = backward
+        .variants
+        .iter()
+        .map(|variant| {
+            variant
+                .iter()
+                .rev()
+                .map(|&base| crate::model::complement(base))
+                .collect()
+        })
+        .collect();
+    backward_variants.sort();
+
+    forward_variants == backward_variants
 }
 
 /// Extend a k-mer to the right, following successors with fork resolution
@@ -407,7 +457,14 @@ fn extend_right(
 
     loop {
         let successors = find_and_filter_successors(
-            kmers, &current, kmer_len, max_kmer, visited, params.fraction, params.low_count, params.jump,
+            kmers,
+            &current,
+            kmer_len,
+            max_kmer,
+            visited,
+            params.fraction,
+            params.low_count,
+            params.jump,
         );
 
         if successors.is_empty() {
@@ -417,11 +474,23 @@ fn extend_right(
         // Take the strongest successor
         let suc = &successors[0];
 
-        // If single successor, do backward reachability check
+        if successors.len() > 1 && !params.allow_snps {
+            break;
+        }
+
         if successors.len() == 1
-            && !has_backward_reachability(kmers, &suc.kmer, &current, kmer_len, max_kmer, params.fraction, params.low_count) {
-                break; // End of unique sequence before repeat
-            }
+            && !has_backward_reachability(
+                kmers,
+                &suc.kmer,
+                &current,
+                kmer_len,
+                max_kmer,
+                params.fraction,
+                params.low_count,
+            )
+        {
+            break; // End of unique sequence before repeat
+        }
 
         // Check if this k-mer is already visited
         if visited[suc.index] {
@@ -440,10 +509,8 @@ fn extend_right(
 pub struct ForkInfo {
     /// Position in the extension sequence where the fork occurs
     pub position: usize,
-    /// The primary nucleotide (highest abundance)
-    pub primary: char,
-    /// Alternative nucleotides at this position
-    pub alternatives: Vec<char>,
+    /// Variant paths at this fork, with the primary/highest-abundance path first.
+    pub variants: Vec<Vec<char>>,
 }
 
 /// Result of extending a contig in one direction
@@ -472,57 +539,87 @@ fn extend_right_with_endpoint(
 
     loop {
         let successors = find_and_filter_successors(
-            kmers, &current, kmer_len, max_kmer, visited, params.fraction, params.low_count, params.jump,
+            kmers,
+            &current,
+            kmer_len,
+            max_kmer,
+            visited,
+            params.fraction,
+            params.low_count,
+            params.jump,
         );
 
         if successors.is_empty() {
-            return ExtensionResult { sequence: extension, last_kmer: None, forks };
+            return ExtensionResult {
+                sequence: extension,
+                last_kmer: None,
+                forks,
+            };
         }
 
         let suc = &successors[0];
 
         if successors.len() == 1 {
-            if !has_backward_reachability(kmers, &suc.kmer, &current, kmer_len, max_kmer, params.fraction, params.low_count) {
-                return ExtensionResult { sequence: extension, last_kmer: Some(suc.kmer), forks };
+            if !has_backward_reachability(
+                kmers,
+                &suc.kmer,
+                &current,
+                kmer_len,
+                max_kmer,
+                params.fraction,
+                params.low_count,
+            ) {
+                return ExtensionResult {
+                    sequence: extension,
+                    last_kmer: Some(suc.kmer),
+                    forks,
+                };
             }
+        } else if !params.allow_snps {
+            return ExtensionResult {
+                sequence: extension,
+                last_kmer: Some(suc.kmer),
+                forks,
+            };
         } else {
             // Try SNP discovery: check if all branches converge
-            let snp_succs: Vec<(Kmer, u64, char)> = successors.iter()
+            let snp_succs: Vec<(Kmer, u64, char)> = successors
+                .iter()
                 .map(|s| (s.kmer, s.abundance as u64, bin2nt[s.nt as usize]))
                 .collect();
 
-            if let Some(snp) = crate::snp_discovery::discover_snp(kmers, &snp_succs, kmer_len, params.jump) {
+            if let Some(snp) =
+                crate::snp_discovery::discover_snp(kmers, &snp_succs, kmer_len, params.jump)
+            {
                 if let Some(conv) = snp.convergence_kmer {
                     // Backward validation: check SNP from reverse complement of convergence
                     let rc_conv = conv.revcomp(kmer_len);
-                    let mut back_succs_raw = find_all_successors(kmers, &rc_conv, kmer_len, max_kmer, params.low_count);
+                    let mut back_succs_raw =
+                        find_all_successors(kmers, &rc_conv, kmer_len, max_kmer, params.low_count);
                     filter_by_abundance(&mut back_succs_raw, params.fraction);
 
-                    let back_snp_succs: Vec<(Kmer, u64, char)> = back_succs_raw.iter()
+                    let back_snp_succs: Vec<(Kmer, u64, char)> = back_succs_raw
+                        .iter()
                         .map(|s| (s.kmer, s.abundance as u64, bin2nt[s.nt as usize]))
                         .collect();
 
                     let backward_ok = if back_snp_succs.len() >= 2 {
-                        if let Some(back_snp) = crate::snp_discovery::discover_snp(kmers, &back_snp_succs, kmer_len, params.jump) {
-                            // Check variant sizes match
-                            let fwd_max: usize = snp.variants.iter().map(|v| v.len()).max().unwrap_or(0);
-                            let bwd_max: usize = back_snp.variants.iter().map(|v| v.len()).max().unwrap_or(0);
-                            fwd_max == bwd_max
-                        } else {
-                            false
-                        }
+                        crate::snp_discovery::discover_snp(
+                            kmers,
+                            &back_snp_succs,
+                            kmer_len,
+                            params.jump,
+                        )
+                        .is_some_and(|back_snp| validate_reverse_snp(&snp, &back_snp))
                     } else {
-                        // Single backward successor — still accept if forward is unambiguous
-                        back_succs_raw.len() == 1
+                        false
                     };
 
                     if backward_ok {
                         // SNP validated! Record and skip through
-                        let alternatives: Vec<char> = successors[1..].iter().map(|s| bin2nt[s.nt as usize]).collect();
                         forks.push(ForkInfo {
                             position: extension.len(),
-                            primary: bin2nt[suc.nt as usize],
-                            alternatives,
+                            variants: snp.variants.clone(),
                         });
 
                         for &c in &snp.variants[0] {
@@ -542,16 +639,22 @@ fn extend_right_with_endpoint(
             }
 
             // No SNP convergence — record fork and continue with strongest
-            let alternatives: Vec<char> = successors[1..].iter().map(|s| bin2nt[s.nt as usize]).collect();
+            let variants = successors
+                .iter()
+                .map(|s| vec![bin2nt[s.nt as usize]])
+                .collect();
             forks.push(ForkInfo {
                 position: extension.len(),
-                primary: bin2nt[suc.nt as usize],
-                alternatives,
+                variants,
             });
         }
 
         if visited[suc.index] {
-            return ExtensionResult { sequence: extension, last_kmer: Some(suc.kmer), forks };
+            return ExtensionResult {
+                sequence: extension,
+                last_kmer: Some(suc.kmer),
+                forks,
+            };
         }
 
         visited[suc.index] = true;
@@ -611,14 +714,12 @@ fn build_multi_chunk_contig(
             contig.insert_new_chunk_with(seq[pos..fork_pos].to_vec());
         }
 
-        // Add variable chunk at the fork
-        let mut variants = vec![vec![fork.primary]];
-        for &alt in &fork.alternatives {
-            variants.push(vec![alt]);
-        }
-        contig.chunks.push(variants);
+        // Add variable chunk at the fork. For validated SNP/indel clusters this
+        // is the full branch path, while unresolved forks use one-base paths.
+        contig.chunks.push(fork.variants.clone());
 
-        pos = fork_pos + 1;
+        let primary_len = fork.variants.first().map_or(1, Vec::len);
+        pos = fork_pos + primary_len;
     }
 
     // Add remaining uniq chunk
@@ -630,12 +731,7 @@ fn build_multi_chunk_contig(
 }
 
 /// Mark all k-mers along a contig sequence as visited in the visited array.
-fn mark_contig_kmers(
-    seq: &[char],
-    kmers: &KmerCount,
-    kmer_len: usize,
-    visited: &mut [bool],
-) {
+fn mark_contig_kmers(seq: &[char], kmers: &KmerCount, kmer_len: usize, visited: &mut [bool]) {
     if seq.len() < kmer_len {
         return;
     }
@@ -679,9 +775,11 @@ fn extend_left(
 }
 
 /// Find a unique path between two k-mers in the graph using BFS.
-#[allow(dead_code)]
 /// Returns the connecting sequence (nucleotides only, excluding start/end k-mers)
 /// or None if no unique path exists within max_steps.
+// Retained for the ConnectFragments parity audit; the current small fixtures do
+// not yet exercise this helper.
+#[allow(dead_code)]
 fn find_unique_path(
     kmers: &KmerCount,
     start: &Kmer,
@@ -704,7 +802,11 @@ fn find_unique_path(
     for suc in &succs {
         let canonical = {
             let r = suc.kmer.revcomp(kmer_len);
-            if suc.kmer < r { suc.kmer } else { r }
+            if suc.kmer < r {
+                suc.kmer
+            } else {
+                r
+            }
         };
         let key = canonical.to_words();
         if key[..precision] == *end_canonical {
@@ -724,7 +826,11 @@ fn find_unique_path(
             for suc in &succs {
                 let canonical = {
                     let r = suc.kmer.revcomp(kmer_len);
-                    if suc.kmer < r { suc.kmer } else { r }
+                    if suc.kmer < r {
+                        suc.kmer
+                    } else {
+                        r
+                    }
                 };
                 let key = canonical.to_words();
                 if key[..precision] == *end_canonical {
@@ -783,7 +889,11 @@ pub fn connect_contigs_through_graph(
             if seq.len() >= kmer_len {
                 let first_kmer = Kmer::from_kmer_str(&seq[..kmer_len]);
                 let rkmer = first_kmer.revcomp(kmer_len);
-                let canonical = if first_kmer < rkmer { first_kmer } else { rkmer };
+                let canonical = if first_kmer < rkmer {
+                    first_kmer
+                } else {
+                    rkmer
+                };
                 let key = canonical.to_words()[..precision].to_vec();
                 first_kmer_map.entry(key).or_insert(i);
             }
@@ -805,7 +915,11 @@ pub fn connect_contigs_through_graph(
             for suc in &succs {
                 let canonical = {
                     let r = suc.kmer.revcomp(kmer_len);
-                    if suc.kmer < r { suc.kmer } else { r }
+                    if suc.kmer < r {
+                        suc.kmer
+                    } else {
+                        r
+                    }
                 };
                 let key = canonical.to_words()[..precision].to_vec();
                 if let Some(&right_idx) = first_kmer_map.get(&key) {
@@ -834,7 +948,11 @@ pub fn connect_contigs_through_graph(
                     for suc in &succs {
                         let canonical = {
                             let r = suc.kmer.revcomp(kmer_len);
-                            if suc.kmer < r { suc.kmer } else { r }
+                            if suc.kmer < r {
+                                suc.kmer
+                            } else {
+                                r
+                            }
                         };
                         let key = canonical.to_words()[..precision].to_vec();
                         if let Some(&right_idx) = first_kmer_map.get(&key) {
@@ -884,7 +1002,11 @@ pub fn connect_contigs_through_graph(
             let mut new_contig = ContigSequence::new();
             new_contig.insert_new_chunk_with(merged);
 
-            let (rem_first, rem_second) = if left > right { (left, right) } else { (right, left) };
+            let (rem_first, rem_second) = if left > right {
+                (left, right)
+            } else {
+                (right, left)
+            };
             contigs.remove(rem_first);
             contigs.remove(rem_second);
             contigs.push(new_contig);
@@ -913,15 +1035,15 @@ fn deduplicate_contigs(contigs: ContigSequenceList) -> ContigSequenceList {
         let rc_seq: String = seq.chars().rev().map(crate::model::complement).collect();
 
         // Check if this contig is contained in any longer contig
-        let is_contained = kept_seqs.iter().any(|existing| {
-            existing.contains(&seq) || existing.contains(&rc_seq)
-        });
+        let is_contained = kept_seqs
+            .iter()
+            .any(|existing| existing.contains(&seq) || existing.contains(&rc_seq));
 
         // Check if most of this contig can be found in a longer one
         // (either as a substring, suffix/prefix overlap, or multiple chunks)
         let is_mostly_covered = if !is_contained && seq.len() > 100 {
             // Check: does a longer contig contain a significant chunk from the middle of this one?
-            let chunk_size = seq.len() / 2;  // Check if half the contig is in a longer one
+            let chunk_size = seq.len() / 2; // Check if half the contig is in a longer one
             kept_seqs.iter().any(|existing| {
                 if existing.len() <= seq.len() {
                     return false;
@@ -929,7 +1051,9 @@ fn deduplicate_contigs(contigs: ContigSequenceList) -> ContigSequenceList {
                 // Check middle portion
                 let mid_start = seq.len() / 4;
                 let mid_chunk = &seq[mid_start..mid_start + chunk_size.min(seq.len() - mid_start)];
-                let mid_chunk_rc = &rc_seq[rc_seq.len() - mid_start - chunk_size.min(seq.len() - mid_start)..rc_seq.len() - mid_start];
+                let mid_chunk_rc =
+                    &rc_seq[rc_seq.len() - mid_start - chunk_size.min(seq.len() - mid_start)
+                        ..rc_seq.len() - mid_start];
                 existing.contains(mid_chunk) || existing.contains(mid_chunk_rc)
             })
         } else {
@@ -947,6 +1071,8 @@ fn deduplicate_contigs(contigs: ContigSequenceList) -> ContigSequenceList {
 
 /// Check if two sequences share an overlap of at least min_overlap bases
 /// (suffix of a matches prefix of b, or vice versa)
+// Retained for the overlap-merge parity audit; current overlap tests use the
+// more specific merge helpers.
 #[allow(dead_code)]
 fn has_significant_overlap(a: &str, b: &str, min_overlap: usize) -> bool {
     let a_bytes = a.as_bytes();
@@ -1087,7 +1213,11 @@ pub fn join_overlapping_contigs(contigs: &mut ContigSequenceList, kmer_len: usiz
 
             // Replace: remove both, add merged
             // Remove higher index first to preserve lower index
-            let (rem_first, rem_second) = if left > right { (left, right) } else { (right, left) };
+            let (rem_first, rem_second) = if left > right {
+                (left, right)
+            } else {
+                (right, left)
+            };
             contigs.remove(rem_first);
             contigs.remove(rem_second);
             contigs.push(new_contig);
@@ -1113,6 +1243,52 @@ mod tests {
         assert!((params.fraction - 0.1).abs() < f64::EPSILON);
         assert_eq!(params.jump, 150);
         assert_eq!(params.low_count, 2);
+    }
+
+    #[test]
+    fn test_reverse_snp_validation_requires_matching_reverse_complement_variants() {
+        let forward = crate::snp_discovery::SnpResult {
+            variants: vec![vec!['A', 'C'], vec!['G', 'T']],
+            convergence_kmer: None,
+            shift: 0,
+        };
+        let backward = crate::snp_discovery::SnpResult {
+            variants: vec![vec!['G', 'T'], vec!['A', 'C']],
+            convergence_kmer: None,
+            shift: 0,
+        };
+        let mismatched = crate::snp_discovery::SnpResult {
+            variants: vec![vec!['G', 'T'], vec!['A', 'A']],
+            convergence_kmer: None,
+            shift: 0,
+        };
+        let shifted = crate::snp_discovery::SnpResult {
+            variants: vec![vec!['G', 'T'], vec!['A', 'C']],
+            convergence_kmer: None,
+            shift: 1,
+        };
+
+        assert!(validate_reverse_snp(&forward, &backward));
+        assert!(!validate_reverse_snp(&forward, &mismatched));
+        assert!(!validate_reverse_snp(&forward, &shifted));
+    }
+
+    #[test]
+    fn test_build_multi_chunk_contig_preserves_full_variant_paths() {
+        let seq: Vec<char> = "AAACCCGGG".chars().collect();
+        let forks = vec![ForkInfo {
+            position: 3,
+            variants: vec![vec!['C', 'C', 'C'], vec!['G', 'G', 'G']],
+        }];
+
+        let contig = build_multi_chunk_contig(&seq, &forks, 0);
+        assert_eq!(contig.chunks.len(), 3);
+        assert_eq!(contig.chunks[0], vec![vec!['A', 'A', 'A']]);
+        assert_eq!(
+            contig.chunks[1],
+            vec![vec!['C', 'C', 'C'], vec!['G', 'G', 'G']]
+        );
+        assert_eq!(contig.chunks[2], vec![vec!['G', 'G', 'G']]);
     }
 
     #[test]

@@ -1,3 +1,6 @@
+use crate::contig::ContigSequence;
+use crate::read_holder::ReadHolder;
+use crate::reads_getter::ReadPair;
 /// Read cleaning: remove reads that fully map inside assembled contigs.
 ///
 /// Port of SKESA's CleanReads / RemoveUsedReadsJob from assembler.hpp.
@@ -6,9 +9,6 @@
 /// from the read set. This improves subsequent iteration quality by focusing
 /// on reads that extend beyond current contigs.
 use std::collections::HashMap;
-use crate::contig::ContigSequence;
-use crate::read_holder::ReadHolder;
-use crate::reads_getter::ReadPair;
 
 /// Information about where a k-mer appears in a contig
 struct KmerPosition {

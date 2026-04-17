@@ -1,0 +1,38 @@
+# Mapping used with /data/henriksson/github/claude/code-complexity-comparator
+# to compare the bundled C++ graph-digger implementation with the Rust port.
+# Regenerate reports with:
+#   ccc-rs analyze SKESA/graphdigger.hpp -l cpp -o /tmp/skesa_graphdigger_cpp.json
+#   ccc-rs analyze src/assembler.rs -l rust -o /tmp/skesa_assembler_rust.json
+#   ccc-rs analyze src/linked_contig.rs -l rust -o /tmp/skesa_linked_contig_rust.json
+
+[[entries]]
+rust = "connect_and_extend_contigs"
+other = "ConnectAndExtendContigs"
+
+[[entries]]
+rust = "connect_fragments"
+other = "ConnectFragments"
+
+[[entries]]
+rust = "add_to_right"
+other = "AddToRight"
+
+[[entries]]
+rust = "add_to_left"
+other = "AddToLeft"
+
+[[entries]]
+rust = "connect_pairs_impl"
+other = "ConnectPairsJob"
+
+[[entries]]
+rust = "clip_read_for_connection"
+other = "CheckAndClipRead"
+
+[[entries]]
+rust = "clip_left"
+other = "ClipLeft"
+
+[[entries]]
+rust = "clip_right"
+other = "ClipRight"

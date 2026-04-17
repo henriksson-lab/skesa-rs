@@ -15,6 +15,61 @@ use crate::reads_getter::ReadPair;
 
 use rayon::prelude::*;
 
+const GB: i64 = 1_000_000_000;
+const SORTED_COUNTER_MEMORY_BUFFER_BYTES: i64 = 2 * GB;
+const SORTED_COUNTER_MAX_CYCLES: i64 = 10;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SortedCounterPlan {
+    pub raw_kmer_num: usize,
+    pub element_size: usize,
+    pub memory_needed_bytes: i64,
+    pub memory_available_after_buffer_bytes: i64,
+    pub cycles: usize,
+    pub jobs: usize,
+    pub kmer_buckets: usize,
+}
+
+pub fn sorted_counter_plan(
+    raw_kmer_num: usize,
+    read_pair_count: usize,
+    kmer_len: usize,
+    mem_available_gb: usize,
+) -> Result<SortedCounterPlan, String> {
+    let element_size = KmerCount::new(kmer_len).element_size();
+    let memory_needed_bytes = (1.2 * raw_kmer_num as f64 * element_size as f64) as i64;
+    let memory_available_after_buffer_bytes =
+        (mem_available_gb as i64 * GB) - SORTED_COUNTER_MEMORY_BUFFER_BYTES;
+
+    if memory_available_after_buffer_bytes <= 0
+        || memory_needed_bytes >= SORTED_COUNTER_MAX_CYCLES * memory_available_after_buffer_bytes
+    {
+        return Err(
+            "Memory provided is insufficient to do runs in 10 cycles for the read coverage. We find that 16 Gb for 20x coverage of a 5 Mb genome is usually sufficient"
+                .to_string(),
+        );
+    }
+
+    let cycles = if memory_needed_bytes == 0 {
+        0
+    } else {
+        ((memory_needed_bytes as f64) / (memory_available_after_buffer_bytes as f64)).ceil()
+            as usize
+    };
+    let jobs = 8 * read_pair_count;
+    let kmer_buckets = cycles * jobs;
+
+    Ok(SortedCounterPlan {
+        raw_kmer_num,
+        element_size,
+        memory_needed_bytes,
+        memory_available_after_buffer_bytes,
+        cycles,
+        jobs,
+        kmer_buckets,
+    })
+}
+
 /// Count k-mers using the sorted counter approach.
 ///
 /// Returns a KmerCount with all unique k-mers above min_count,
@@ -32,21 +87,32 @@ pub fn count_kmers_sorted(
     for read_pair in reads {
         raw_kmer_num += read_pair[0].kmer_num(kmer_len) + read_pair[1].kmer_num(kmer_len);
     }
-    eprintln!("Raw kmers: {}", raw_kmer_num);
+    let plan = sorted_counter_plan(raw_kmer_num, reads.len(), kmer_len, _mem_available_gb)
+        .unwrap_or_else(|e| panic!("{e}"));
+    eprintln!(
+        "Raw kmers: {} Memory needed (GB): {} Memory available (GB): {} {} cycle(s) will be performed",
+        plan.raw_kmer_num,
+        plan.memory_needed_bytes as f64 / GB as f64,
+        plan.memory_available_after_buffer_bytes as f64 / GB as f64,
+        plan.cycles
+    );
 
     // Parallel k-mer extraction: each read pair produces its own KmerCount,
     // then we merge them. This parallelizes the extraction across read files.
     if reads.len() > 1 && kmer_len <= 32 {
         // Parallel path: extract from each ReadPair independently
-        let partial_counts: Vec<KmerCount> = reads.par_iter().map(|read_pair| {
-            let mut partial = KmerCount::new(kmer_len);
-            let est = read_pair[0].kmer_num(kmer_len) + read_pair[1].kmer_num(kmer_len);
-            partial.reserve(est);
-            for holder_idx in 0..2 {
-                spawn_kmers(&read_pair[holder_idx], kmer_len, &mut partial);
-            }
-            partial
-        }).collect();
+        let partial_counts: Vec<KmerCount> = reads
+            .par_iter()
+            .map(|read_pair| {
+                let mut partial = KmerCount::new(kmer_len);
+                let est = read_pair[0].kmer_num(kmer_len) + read_pair[1].kmer_num(kmer_len);
+                partial.reserve(est);
+                for holder_idx in 0..2 {
+                    spawn_kmers(&read_pair[holder_idx], kmer_len, &mut partial);
+                }
+                partial
+            })
+            .collect();
 
         let mut all_kmers = KmerCount::new(kmer_len);
         all_kmers.reserve(raw_kmer_num);
@@ -84,6 +150,8 @@ fn spawn_kmers(holder: &ReadHolder, kmer_len: usize, output: &mut KmerCount) {
 }
 
 /// Fast k-mer extraction into FlatKmerCount (zero-alloc inner loop for precision=1).
+// Retained for the planned flat-counter optimization path once downstream graph
+// construction can consume FlatKmerCount directly.
 #[allow(dead_code)]
 fn spawn_kmers_flat(holder: &ReadHolder, kmer_len: usize, output: &mut FlatKmerCount) {
     let mut ki = holder.kmer_iter(kmer_len);
@@ -104,6 +172,7 @@ fn spawn_kmers_flat(holder: &ReadHolder, kmer_len: usize, output: &mut FlatKmerC
 }
 
 /// Convert FlatKmerCount to KmerCount for downstream compatibility.
+// Retained with spawn_kmers_flat for the flat-counter optimization path.
 #[allow(dead_code)]
 fn flat_to_kmer_count(flat: FlatKmerCount, kmer_len: usize) -> KmerCount {
     let size = flat.size();
@@ -172,7 +241,11 @@ pub fn get_branches_flat(kmers: &mut FlatKmerCount, kmer_len: usize) {
 
     kmers.build_hash_index();
 
-    let max_kmer_val = if kmer_len >= 32 { u64::MAX } else { (1u64 << (2 * kmer_len)) - 1 };
+    let max_kmer_val = if kmer_len >= 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * kmer_len)) - 1
+    };
     let mut branches = vec![0u8; size];
 
     for index in 0..size {
@@ -232,7 +305,11 @@ pub fn get_branches(kmers: &mut KmerCount, kmer_len: usize) {
 
     // Fast path for precision=1: operate directly on u64 without Kmer enum
     if kmer_len <= 32 {
-        let max_val = if kmer_len >= 32 { u64::MAX } else { (1u64 << (2 * kmer_len)) - 1 };
+        let max_val = if kmer_len >= 32 {
+            u64::MAX
+        } else {
+            (1u64 << (2 * kmer_len)) - 1
+        };
 
         for index in 0..size {
             let (kmer, _) = kmers.get_kmer_count(index);
@@ -337,6 +414,30 @@ mod tests {
     }
 
     #[test]
+    fn test_sorted_counter_plan_matches_cpp_formula() {
+        let plan = sorted_counter_plan(1_000, 3, 21, 32).unwrap();
+        assert_eq!(plan.raw_kmer_num, 1_000);
+        assert_eq!(plan.element_size, 16);
+        assert_eq!(plan.memory_needed_bytes, 19_200);
+        assert_eq!(plan.memory_available_after_buffer_bytes, 30_000_000_000);
+        assert_eq!(plan.cycles, 1);
+        assert_eq!(plan.jobs, 24);
+        assert_eq!(plan.kmer_buckets, 24);
+
+        let precision_two = sorted_counter_plan(1_000, 3, 35, 32).unwrap();
+        assert_eq!(precision_two.element_size, 24);
+        assert_eq!(precision_two.memory_needed_bytes, 28_800);
+    }
+
+    #[test]
+    fn test_sorted_counter_plan_rejects_cpp_insufficient_memory_case() {
+        assert!(sorted_counter_plan(1, 1, 21, 2).is_err());
+
+        let max_ten_cycle_raw_kmers = 10 * 30_000_000_000i64 / 16;
+        assert!(sorted_counter_plan(max_ten_cycle_raw_kmers as usize, 1, 21, 32).is_err());
+    }
+
+    #[test]
     fn test_sorted_counter_basic() {
         let reads = make_test_reads();
         let kmers = count_kmers_sorted(&reads, 21, 2, true, 32);
@@ -391,11 +492,14 @@ mod tests {
         crate::kmer_output::write_histogram(&mut output, &bins).unwrap();
         let rust_hist = String::from_utf8(output).unwrap();
 
-        let expected_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/expected_hist.txt");
+        let expected_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/expected_hist.txt");
         let expected_hist = std::fs::read_to_string(&expected_path).unwrap();
 
-        assert_eq!(rust_hist, expected_hist, "Sorted counter histogram does not match golden");
+        assert_eq!(
+            rust_hist, expected_hist,
+            "Sorted counter histogram does not match golden"
+        );
     }
 
     #[test]
@@ -414,6 +518,9 @@ mod tests {
                 break;
             }
         }
-        assert!(has_branches, "Expected some k-mers to have branch information");
+        assert!(
+            has_branches,
+            "Expected some k-mers to have branch information"
+        );
     }
 }

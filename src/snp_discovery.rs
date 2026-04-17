@@ -1,6 +1,6 @@
 /// SNP discovery at fork points during graph traversal.
 ///
-/// Port of SKESA's DiscoverSNPCluster from graphdigger.hpp.
+/// Partial Rust implementation of SKESA's DiscoverSNPCluster behavior from graphdigger.hpp.
 ///
 /// When the graph traversal hits a fork (multiple successors), this module
 /// checks if the branches converge back to a single path within a few steps.
@@ -78,10 +78,8 @@ pub fn discover_snp(
 
         if all_same {
             // All branches converge — this is a SNP!
-            let variants: Vec<Variation> = branch_paths
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect();
+            let variants: Vec<Variation> =
+                branch_paths.iter().map(|(path, _)| path.clone()).collect();
 
             return Some(SnpResult {
                 variants,
@@ -123,10 +121,8 @@ pub fn discover_snp(
 
         if all_share_suffix && min_suffix >= kmer_len / 2 {
             // Indel convergence: branches converge with offset
-            let variants: Vec<Variation> = branch_paths
-                .iter()
-                .map(|(path, _)| path.clone())
-                .collect();
+            let variants: Vec<Variation> =
+                branch_paths.iter().map(|(path, _)| path.clone()).collect();
 
             return Some(SnpResult {
                 variants,
@@ -142,6 +138,87 @@ pub fn discover_snp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn push_canonical_count(kmers: &mut KmerCount, sequence: &str) {
+        let kmer = Kmer::from_kmer_str(sequence);
+        let rkmer = kmer.revcomp(sequence.len());
+        let canonical = if kmer < rkmer { kmer } else { rkmer };
+        kmers.push_back(&canonical, 1);
+    }
+
+    #[test]
+    fn test_discover_snp_simple_convergence() {
+        let mut kmers = KmerCount::new(3);
+        push_canonical_count(&mut kmers, "ACT");
+        kmers.sort_and_uniq(0);
+
+        let successors = [
+            (Kmer::from_kmer_str("CAC"), 3, 'C'),
+            (Kmer::from_kmer_str("GAC"), 2, 'G'),
+        ];
+        let result = discover_snp(&kmers, &successors, 3, 1).expect("expected SNP convergence");
+        assert_eq!(result.convergence_kmer.unwrap().to_kmer_string(3), "ACT");
+        assert_eq!(result.variants, vec![vec!['C', 'T'], vec!['G', 'T']]);
+    }
+
+    #[test]
+    fn test_discover_snp_respects_max_extent() {
+        let mut kmers = KmerCount::new(3);
+        push_canonical_count(&mut kmers, "ACT");
+        kmers.sort_and_uniq(0);
+
+        let successors = [
+            (Kmer::from_kmer_str("CAC"), 3, 'C'),
+            (Kmer::from_kmer_str("GAC"), 2, 'G'),
+        ];
+        assert!(discover_snp(&kmers, &successors, 3, 0).is_none());
+    }
+
+    #[test]
+    fn test_discover_snp_rejects_nonconverging_fork() {
+        let mut kmers = KmerCount::new(3);
+        push_canonical_count(&mut kmers, "ACC");
+        push_canonical_count(&mut kmers, "AGT");
+        kmers.sort_and_uniq(0);
+
+        let successors = [
+            (Kmer::from_kmer_str("CAC"), 3, 'C'),
+            (Kmer::from_kmer_str("GAG"), 2, 'G'),
+        ];
+        assert!(discover_snp(&kmers, &successors, 3, 2).is_none());
+    }
+
+    #[test]
+    fn test_discover_snp_reports_suffix_converged_indel_shift() {
+        let mut kmers = KmerCount::new(4);
+        push_canonical_count(&mut kmers, "AACC");
+        push_canonical_count(&mut kmers, "TACC");
+        kmers.sort_and_uniq(0);
+
+        let successors = [
+            (Kmer::from_kmer_str("AAAC"), 3, 'A'),
+            (Kmer::from_kmer_str("ATAC"), 2, 'A'),
+        ];
+        let result =
+            discover_snp(&kmers, &successors, 4, 1).expect("expected indel suffix convergence");
+        assert_eq!(result.convergence_kmer.unwrap().to_kmer_string(4), "AACC");
+        assert_eq!(result.shift, 1);
+        assert_eq!(result.variants, vec![vec!['A', 'C'], vec!['A', 'C']]);
+    }
+
+    #[test]
+    fn test_discover_snp_rejects_weak_suffix_indel_candidate() {
+        let mut kmers = KmerCount::new(4);
+        push_canonical_count(&mut kmers, "AACC");
+        push_canonical_count(&mut kmers, "AAGT");
+        kmers.sort_and_uniq(0);
+
+        let successors = [
+            (Kmer::from_kmer_str("AAAC"), 3, 'A'),
+            (Kmer::from_kmer_str("AAAG"), 2, 'A'),
+        ];
+        assert!(discover_snp(&kmers, &successors, 4, 1).is_none());
+    }
 
     #[test]
     fn test_discover_snp_no_successors() {

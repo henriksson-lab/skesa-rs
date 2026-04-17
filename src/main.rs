@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -9,6 +9,51 @@ use skesa_rs::contig_output;
 use skesa_rs::kmer_counter;
 use skesa_rs::kmer_output;
 use skesa_rs::reads_getter::ReadsGetter;
+
+fn hardware_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+}
+
+fn resolve_cores(cores: i32) -> usize {
+    let hardware = hardware_threads();
+    if cores == 0 {
+        hardware
+    } else {
+        (cores as usize).min(hardware)
+    }
+}
+
+fn warn_if_cores_reduced(cores: i32) {
+    let hardware = hardware_threads();
+    if cores > hardware as i32 {
+        eprintln!(
+            "WARNING: number of cores was reduced to the hardware limit of {} cores",
+            hardware
+        );
+    }
+}
+
+fn flush_file_or_report<W: Write>(writer: &mut W, path: &str) -> bool {
+    match writer.flush() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("Can't write to file {}: {}", path, e);
+            false
+        }
+    }
+}
+
+fn flush_stdout_or_report<W: Write>(writer: &mut W) -> bool {
+    match writer.flush() {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("Write failed: {}", e);
+            false
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "skesa-rs", version = env!("CARGO_PKG_VERSION"), about = "Rust port of NCBI's SKESA genome assembler\n\nOriginal: SKESA 2.5.1 by Souvorov et al., Genome Biology 2018")]
@@ -23,11 +68,11 @@ enum Commands {
     Skesa(SkesaArgs),
     /// Count k-mers in a read set
     Kmercounter(KmercounterArgs),
-    /// Target-enriched de-novo assembler (stub — use C++ backend)
+    /// Target-enriched de-novo assembler (unsupported; use C++ backend)
     Saute(SauteArgs),
-    /// Protein-guided target-enriched assembler (stub — use C++ backend)
+    /// Protein-guided target-enriched assembler (unsupported; use C++ backend)
     SauteProt(SauteProtArgs),
-    /// Connect contigs using reads and output GFA graph (stub — use C++ backend)
+    /// Connect contigs using reads and output GFA graph (unsupported; use C++ backend)
     GfaConnector(GfaConnectorArgs),
     /// Compute assembly statistics from a FASTA file
     Stats(StatsArgs),
@@ -36,15 +81,31 @@ enum Commands {
 #[derive(Parser)]
 struct SkesaArgs {
     /// Input fasta/fastq file(s) (can be specified multiple times, can be gzipped)
-    #[arg(long, required = true)]
+    #[arg(long)]
     reads: Vec<String>,
 
-    /// Indicates that single fasta/fastq files contain paired reads
+    /// C++ SKESA compatibility spelling for FASTA input files
+    #[arg(long)]
+    fasta: Vec<String>,
+
+    /// C++ SKESA compatibility spelling for FASTQ input files
+    #[arg(long)]
+    fastq: Vec<String>,
+
+    /// C++ SKESA compatibility flag. Rust auto-detects gzip per input file.
     #[arg(long, default_value_t = false)]
+    gz: bool,
+
+    /// SRA run accession input is not supported by this Rust port
+    #[arg(long, alias = "sra_run")]
+    sra_run: Vec<String>,
+
+    /// Indicates that single fasta/fastq files contain paired reads
+    #[arg(long, alias = "use_paired_ends", default_value_t = false)]
     use_paired_ends: bool,
 
     /// Output file for contigs (stdout if not specified)
-    #[arg(long)]
+    #[arg(long, alias = "contigs_out")]
     contigs_out: Option<String>,
 
     /// Number of cores to use (0 = all)
@@ -56,15 +117,15 @@ struct SkesaArgs {
     memory: i32,
 
     /// Use hash counter instead of sorted counter
-    #[arg(long, default_value_t = false)]
+    #[arg(long, alias = "hash_count", default_value_t = false)]
     hash_count: bool,
 
     /// Estimated number of distinct k-mers for bloom filter (millions, only for hash counter)
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, alias = "estimated_kmers", default_value_t = 100)]
     estimated_kmers: i32,
 
     /// Skip bloom filter; use estimated_kmers as hash table size
-    #[arg(long, default_value_t = false)]
+    #[arg(long, alias = "skip_bloom_filter", default_value_t = false)]
     skip_bloom_filter: bool,
 
     /// Minimal k-mer length for assembly
@@ -72,7 +133,7 @@ struct SkesaArgs {
     kmer: i32,
 
     /// Maximal k-mer length for assembly (0 = auto)
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, alias = "max_kmer", default_value_t = 0)]
     max_kmer: i32,
 
     /// Number of assembly iterations from minimal to maximal k-mer length
@@ -80,19 +141,19 @@ struct SkesaArgs {
     steps: i32,
 
     /// Minimal count for k-mers retained for comparing alternate choices
-    #[arg(long)]
+    #[arg(long, alias = "min_count")]
     min_count: Option<i32>,
 
     /// Minimum acceptable average count for estimating maximal k-mer length
-    #[arg(long)]
+    #[arg(long, alias = "max_kmer_count")]
     max_kmer_count: Option<i32>,
 
     /// Percentage of reads containing 19-mer for adapter detection (1.0 disables)
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, alias = "vector_percent", default_value_t = 0.05)]
     vector_percent: f64,
 
     /// Expected insert size for paired reads (0 = auto)
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, alias = "insert_size", default_value_t = 0)]
     insert_size: i32,
 
     /// Maximum noise to signal ratio acceptable for extension
@@ -100,19 +161,19 @@ struct SkesaArgs {
     fraction: f64,
 
     /// Maximal SNP length
-    #[arg(long, default_value_t = 150)]
+    #[arg(long, alias = "max_snp_len", default_value_t = 150)]
     max_snp_len: i32,
 
     /// Minimal contig length reported in output
-    #[arg(long, default_value_t = 200)]
+    #[arg(long, alias = "min_contig", default_value_t = 200)]
     min_contig: i32,
 
     /// Allow additional step for SNP discovery
-    #[arg(long, default_value_t = false)]
+    #[arg(long, alias = "allow_snps", default_value_t = false)]
     allow_snps: bool,
 
     /// Don't use paired-end information
-    #[arg(long, default_value_t = false)]
+    #[arg(long, alias = "force_single_ends", default_value_t = false)]
     force_single_ends: bool,
 
     /// Input file with seeds
@@ -124,7 +185,7 @@ struct SkesaArgs {
     all: Option<String>,
 
     /// Output k-mer file (binary)
-    #[arg(long)]
+    #[arg(long, alias = "dbg_out")]
     dbg_out: Option<String>,
 
     /// File for histogram
@@ -132,51 +193,54 @@ struct SkesaArgs {
     hist: Option<String>,
 
     /// File for connected paired reads
-    #[arg(long)]
+    #[arg(long, alias = "connected_reads")]
     connected_reads: Option<String>,
 
     /// Output assembly in GFA format
-    #[arg(long)]
+    #[arg(long, alias = "gfa_out")]
     gfa_out: Option<String>,
-
 }
 
 #[derive(Parser)]
 struct KmercounterArgs {
     /// Input fasta/fastq file(s) (can be specified multiple times)
-    #[arg(long, required = true)]
+    #[arg(long)]
     reads: Vec<String>,
+
+    /// SRA run accession input is not supported by this Rust port
+    #[arg(long, alias = "sra_run")]
+    sra_run: Vec<String>,
 
     /// K-mer length
     #[arg(long, default_value_t = 21)]
     kmer: i32,
 
     /// Minimal count for k-mers retained
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, alias = "min_count", default_value_t = 2)]
     min_count: i32,
 
     /// Percentage of reads containing 19-mer for adapter detection (1.0 disables)
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, alias = "vector_percent", default_value_t = 0.05)]
     vector_percent: f64,
 
     /// Disable directional filtering in graph
-    #[arg(long, default_value_t = false)]
+    #[arg(long, alias = "no_strand_info", default_value_t = false)]
     no_strand_info: bool,
 
     /// Estimated number of distinct k-mers for bloom filter (millions)
-    #[arg(long, default_value_t = 100)]
+    #[arg(long, alias = "estimated_kmers", default_value_t = 100)]
     estimated_kmers: i32,
 
     /// Skip bloom filter; use estimated_kmers as hash table size
-    #[arg(long, default_value_t = false)]
+    #[arg(long, alias = "skip_bloom_filter", default_value_t = false)]
     skip_bloom_filter: bool,
 
     /// De Bruijn graph binary output file
-    #[arg(long)]
+    #[arg(long, alias = "dbg_out")]
     dbg_out: Option<String>,
 
     /// Text k-mer output file
-    #[arg(long)]
+    #[arg(long, alias = "text_out")]
     text_out: Option<String>,
 
     /// Histogram output file
@@ -186,7 +250,6 @@ struct KmercounterArgs {
     /// Number of cores to use (0 = all)
     #[arg(long, default_value_t = 0)]
     cores: i32,
-
 }
 
 #[derive(Parser)]
@@ -208,7 +271,7 @@ struct SauteArgs {
     kmer: Option<i32>,
 
     /// Minimal count for k-mers
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, alias = "min_count", default_value_t = 2)]
     min_count: i32,
 
     /// Number of cores (0 = all)
@@ -216,19 +279,19 @@ struct SauteArgs {
     cores: i32,
 
     /// Percentage for adapter detection (1.0 disables)
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, alias = "vector_percent", default_value_t = 0.05)]
     vector_percent: f64,
 
     /// Estimated distinct k-mers (millions)
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, alias = "estimated_kmers", default_value_t = 1000)]
     estimated_kmers: i32,
 
     /// Indicates paired reads
-    #[arg(long, default_value_t = false)]
+    #[arg(long, alias = "use_paired_ends", default_value_t = false)]
     use_paired_ends: bool,
 
     /// Extend graph ends using de-novo assembly
-    #[arg(long, default_value_t = false)]
+    #[arg(long, alias = "extend_ends", default_value_t = false)]
     extend_ends: bool,
 }
 
@@ -247,7 +310,7 @@ struct SauteProtArgs {
     gfa: Option<String>,
 
     /// NCBI genetic code number (default: 1 = Standard)
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, alias = "genetic_code", default_value_t = 1)]
     genetic_code: u32,
 
     /// K-mer length (default: automatic)
@@ -255,7 +318,7 @@ struct SauteProtArgs {
     kmer: Option<i32>,
 
     /// Minimal count for k-mers
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, alias = "min_count", default_value_t = 2)]
     min_count: i32,
 
     /// Number of cores (0 = all)
@@ -263,11 +326,11 @@ struct SauteProtArgs {
     cores: i32,
 
     /// Percentage for adapter detection (1.0 disables)
-    #[arg(long, default_value_t = 0.05)]
+    #[arg(long, alias = "vector_percent", default_value_t = 0.05)]
     vector_percent: f64,
 
     /// Estimated distinct k-mers (millions)
-    #[arg(long, default_value_t = 1000)]
+    #[arg(long, alias = "estimated_kmers", default_value_t = 1000)]
     estimated_kmers: i32,
 }
 
@@ -290,7 +353,7 @@ struct GfaConnectorArgs {
     kmer: Option<i32>,
 
     /// Minimal count for k-mers
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, alias = "min_count", default_value_t = 2)]
     min_count: i32,
 
     /// Number of cores (0 = all)
@@ -298,7 +361,7 @@ struct GfaConnectorArgs {
     cores: i32,
 
     /// Maximum extension length
-    #[arg(long, default_value_t = 2000)]
+    #[arg(long, alias = "ext_len", default_value_t = 2000)]
     ext_len: i32,
 
     /// Noise-to-signal ratio threshold
@@ -313,7 +376,7 @@ struct StatsArgs {
     fasta: String,
 
     /// Minimum contig length to include
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, alias = "min_length", default_value_t = 0)]
     min_length: usize,
 }
 
@@ -334,278 +397,136 @@ fn run_stats(args: &StatsArgs) -> i32 {
     }
 }
 
-fn run_gfa_connector(args: &GfaConnectorArgs) -> i32 {
-    // Load reads
-    let rg = match ReadsGetter::new(&args.reads, false) {
-        Ok(rg) => rg,
-        Err(e) => {
-            eprintln!("{}", e);
-            return 1;
-        }
-    };
-
-    // Load contigs from file
-    let contig_lengths = match skesa_rs::assembly_stats::fasta_lengths(&args.contigs) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("{}", e);
-            return 1;
-        }
-    };
-    eprintln!("Loaded {} contigs from {}", contig_lengths.len(), args.contigs);
-
-    // Determine kmer length
-    let kmer_len = args.kmer.unwrap_or(21) as usize;
-
-    // Count k-mers from reads
-    let mut kmers = skesa_rs::sorted_counter::count_kmers_sorted(
-        rg.reads(), kmer_len, args.min_count as usize, true, 32,
-    );
-    skesa_rs::sorted_counter::get_branches(&mut kmers, kmer_len);
-
-    // Read contigs as ContigSequences
-    let content = std::fs::read_to_string(&args.contigs).unwrap_or_default();
-    let mut contigs: Vec<skesa_rs::contig::ContigSequence> = Vec::new();
-    let mut current_seq = String::new();
-    for line in content.lines() {
-        if line.starts_with('>') {
-            if !current_seq.is_empty() {
-                let mut c = skesa_rs::contig::ContigSequence::new();
-                c.insert_new_chunk_with(current_seq.chars().collect());
-                contigs.push(c);
-                current_seq.clear();
-            }
-        } else {
-            current_seq.push_str(line.trim());
-        }
-    }
-    if !current_seq.is_empty() {
-        let mut c = skesa_rs::contig::ContigSequence::new();
-        c.insert_new_chunk_with(current_seq.chars().collect());
-        contigs.push(c);
-    }
-
-    // Try to connect contigs through the graph
-    skesa_rs::graph_digger::connect_contigs_through_graph(&mut contigs, &kmers, kmer_len);
-
-    // Find spider connections between contigs
-    let contig_seqs: Vec<String> = contigs.iter().map(|c| c.primary_sequence()).collect();
-    let spider_conns = skesa_rs::spider_graph::find_contig_connections(
-        &contig_seqs, &kmers, kmer_len, kmer_len * 2,
-    );
-    if !spider_conns.is_empty() {
-        eprintln!("Spider: found {} connections between {} contigs", spider_conns.len(), contigs.len());
-        let has_cycle = skesa_rs::spider_graph::has_cycle(&spider_conns, contigs.len());
-        if has_cycle {
-            eprintln!("  Warning: connection graph contains cycles");
-        }
-    }
-
-    // Output GFA
-    if let Some(ref path) = args.gfa {
-        let file = match std::fs::File::create(path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Can't open {}: {}", path, e);
-                return 1;
-            }
-        };
-        let mut writer = std::io::BufWriter::new(file);
-        if let Err(e) = skesa_rs::gfa::write_gfa(&mut writer, &contigs, 0) {
-            eprintln!("Can't write GFA: {}", e);
-            return 1;
-        }
-    } else {
-        let stdout = std::io::stdout();
-        let mut writer = std::io::BufWriter::new(stdout.lock());
-        if let Err(e) = skesa_rs::gfa::write_gfa(&mut writer, &contigs, 0) {
-            eprintln!("Write failed: {}", e);
-            return 1;
-        }
-    }
-
-    eprintln!("DONE");
-    0
+fn run_gfa_connector(_args: &GfaConnectorArgs) -> i32 {
+    eprintln!("gfa_connector is not yet parity-supported in skesa-rs; use the bundled C++ gfa_connector for now");
+    1
 }
 
-fn run_saute_prot(args: &SauteProtArgs) -> i32 {
-    // Load genetic code
-    let gc = match skesa_rs::genetic_code::GeneticCode::new(args.genetic_code) {
-        Ok(gc) => gc,
-        Err(e) => { eprintln!("{}", e); return 1; }
-    };
-    eprintln!("Using genetic code: {} ({})", args.genetic_code, gc.name());
-
-    // Load protein targets
-    let targets = match skesa_rs::guided_assembly::load_targets(&args.targets) {
-        Ok(t) => t,
-        Err(e) => { eprintln!("{}", e); return 1; }
-    };
-    eprintln!("Loaded {} protein target sequences", targets.len());
-
-    // Load reads
-    let rg = match ReadsGetter::new(&args.reads, false) {
-        Ok(rg) => rg,
-        Err(e) => { eprintln!("{}", e); return 1; }
-    };
-
-    let kmer_len = args.kmer.unwrap_or(21) as usize;
-
-    // Count k-mers from reads
-    let mut kmers = skesa_rs::sorted_counter::count_kmers_sorted(
-        rg.reads(), kmer_len, args.min_count as usize, true, 32,
-    );
-    skesa_rs::sorted_counter::get_branches(&mut kmers, kmer_len);
-    let bins = skesa_rs::sorted_counter::get_bins(&kmers);
-
-    // Assemble contigs
-    kmers.build_hash_index();
-    let params = skesa_rs::graph_digger::DiggerParams {
-        fraction: 0.1,
-        jump: 150,
-        low_count: args.min_count as usize,
-    };
-    let contigs = skesa_rs::graph_digger::assemble_contigs(&mut kmers, &bins, kmer_len, true, &params);
-
-    // Score contigs against protein targets using 6-frame translation + alignment
-    eprintln!("Assembled {} contigs, scoring against {} protein targets", contigs.len(), targets.len());
-    let mut scored_contigs: Vec<(usize, String, i32, String)> = Vec::new(); // (contig_idx, protein, score, target_name)
-    for (i, contig) in contigs.iter().enumerate() {
-        let seq = contig.primary_sequence();
-        let translations = skesa_rs::nuc_prot_align::six_frame_translation(&seq, &gc);
-        for (prot, _frame, _is_rc) in &translations {
-            if prot.len() < 10 { continue; }
-            let prot_bytes = prot.as_bytes();
-            for target in &targets {
-                // Simple scoring: count matching amino acids in alignment
-                let target_bytes = target.sequence.as_bytes();
-                if let Some((_cigar, _frame)) = skesa_rs::nuc_prot_align::nuc_prot_align(
-                    seq.as_bytes(), target_bytes, &gc, 5, 2,
-                ) {
-                    scored_contigs.push((i, prot.clone(), prot_bytes.len() as i32, target.name.clone()));
-                }
-            }
-        }
-    }
-    scored_contigs.sort_by(|a, b| b.2.cmp(&a.2));
-    for (ci, _prot, score, tname) in scored_contigs.iter().take(10) {
-        eprintln!("  Contig {} matches target {}: score {}", ci + 1, tname, score);
-    }
-
-    // Output GFA
-    if let Some(ref path) = args.gfa {
-        let file = match std::fs::File::create(path) {
-            Ok(f) => f,
-            Err(e) => { eprintln!("Can't open {}: {}", path, e); return 1; }
-        };
-        let mut writer = std::io::BufWriter::new(file);
-        if let Err(e) = skesa_rs::gfa::write_gfa(&mut writer, &contigs, 0) {
-            eprintln!("Can't write GFA: {}", e); return 1;
-        }
-    }
-
-    eprintln!("DONE");
-    0
+fn run_saute_prot(_args: &SauteProtArgs) -> i32 {
+    eprintln!("saute_prot is not yet parity-supported in skesa-rs; use the bundled C++ saute_prot for now");
+    1
 }
 
-fn run_saute(args: &SauteArgs) -> i32 {
-    // Load targets
-    let targets = match skesa_rs::guided_assembly::load_targets(&args.targets) {
-        Ok(t) => t,
-        Err(e) => { eprintln!("{}", e); return 1; }
-    };
-    eprintln!("Loaded {} target sequences", targets.len());
+fn run_saute(_args: &SauteArgs) -> i32 {
+    eprintln!("saute is not yet parity-supported in skesa-rs; use the bundled C++ saute for now");
+    1
+}
 
-    // Load reads
-    let rg = match ReadsGetter::new(&args.reads, args.use_paired_ends) {
-        Ok(rg) => rg,
-        Err(e) => { eprintln!("{}", e); return 1; }
-    };
-
-    // Determine kmer length (auto: use read_len/3 or 21)
-    let kmer_len = args.kmer.unwrap_or(21) as usize;
-
-    // Index target k-mers
-    let target_index = skesa_rs::guided_assembly::TargetKmerIndex::new(&targets, kmer_len);
-    eprintln!("Indexed {} k-mers from targets", target_index.size());
-
-    // Count k-mers from reads
-    let mut kmers = skesa_rs::sorted_counter::count_kmers_sorted(
-        rg.reads(), kmer_len, args.min_count as usize, true, 32,
-    );
-    skesa_rs::sorted_counter::get_branches(&mut kmers, kmer_len);
-    let bins = skesa_rs::sorted_counter::get_bins(&kmers);
-
-    // Assemble contigs — use target-guided extension for each target
-    kmers.build_hash_index();
-    let guided_params = skesa_rs::guided_path::GuidedParams {
-        low_count: args.min_count as usize,
-        ..Default::default()
-    };
-
-    let mut contigs = Vec::new();
-    let mut guided_count = 0;
-    for target in &targets {
-        if let Some(seq) = skesa_rs::guided_path::assemble_guided_contig(
-            &target.sequence, &kmers, kmer_len, &guided_params,
-        ) {
-            let mut contig = skesa_rs::contig::ContigSequence::new();
-            contig.insert_new_chunk_with(seq.chars().collect());
-            contigs.push(contig);
-            guided_count += 1;
-        }
+fn skesa_input_files(args: &SkesaArgs) -> Vec<String> {
+    let _gzip_compat_flag = args.gz;
+    let mut files = Vec::new();
+    files.extend(args.reads.iter().cloned());
+    files.extend(args.fasta.iter().cloned());
+    files.extend(args.fastq.iter().cloned());
+    files.sort();
+    let original_len = files.len();
+    files.dedup();
+    if files.len() != original_len {
+        eprintln!("WARNING: duplicate input entries were removed from file list");
     }
-    eprintln!("Guided assembly: {} / {} targets produced contigs", guided_count, targets.len());
-
-    // Also do generic assembly for any uncovered regions
-    let generic_params = skesa_rs::graph_digger::DiggerParams {
-        fraction: 0.1,
-        jump: 150,
-        low_count: args.min_count as usize,
-    };
-    let generic_contigs = skesa_rs::graph_digger::assemble_contigs(&mut kmers, &bins, kmer_len, true, &generic_params);
-    // Add generic contigs that don't overlap guided contigs
-    for gc in generic_contigs {
-        let gc_seq = gc.primary_sequence();
-        let is_new = !contigs.iter().any(|c: &skesa_rs::contig::ContigSequence| {
-            let cs = c.primary_sequence();
-            cs.contains(&gc_seq) || gc_seq.contains(&cs)
-        });
-        if is_new && gc_seq.len() >= kmer_len {
-            contigs.push(gc);
-        }
-    }
-    contigs.sort();
-
-    // Output GFA
-    if let Some(ref path) = args.gfa {
-        let file = match std::fs::File::create(path) {
-            Ok(f) => f,
-            Err(e) => { eprintln!("Can't open {}: {}", path, e); return 1; }
-        };
-        let mut writer = std::io::BufWriter::new(file);
-        if let Err(e) = skesa_rs::gfa::write_gfa(&mut writer, &contigs, 0) {
-            eprintln!("Can't write GFA: {}", e); return 1;
-        }
-        eprintln!("Wrote {} segments to {}", contigs.len(), path);
-    }
-
-    // Also output FASTA to stdout
-    let stdout = std::io::stdout();
-    let mut writer = std::io::BufWriter::new(stdout.lock());
-    if let Err(e) = skesa_rs::contig_output::write_contigs_with_abundance(
-        &mut writer, &contigs, &kmers, kmer_len, 200,
-    ) {
-        eprintln!("Write failed: {}", e); return 1;
-    }
-
-    eprintln!("DONE");
-    0
+    files
 }
 
 fn run_skesa(args: &SkesaArgs) -> i32 {
+    let input_files = skesa_input_files(args);
+
+    if !args.sra_run.is_empty() {
+        eprintln!("SRA input is not supported; use --reads with local FASTA/FASTQ files");
+        return 1;
+    }
+    if args.hash_count {
+        eprintln!(
+            "--hash_count assembly mode is not yet parity-supported in skesa-rs; use the bundled C++ skesa for this mode"
+        );
+        return 1;
+    }
+    if input_files.is_empty() {
+        eprintln!("Provide some input reads");
+        return 1;
+    }
+    if args.cores < 0 {
+        eprintln!("Value of --cores must be >= 0");
+        return 1;
+    }
+    if args.steps <= 0 {
+        eprintln!("Value of --steps must be > 0");
+        return 1;
+    }
+    if args.fraction >= 1.0 {
+        eprintln!("Value of --fraction must be < 1 (more than 0.25 is not recommended)");
+        return 1;
+    }
+    if args.fraction < 0.0 {
+        eprintln!("Value of --fraction must be >= 0");
+        return 1;
+    }
+    if args.max_snp_len < 0 {
+        eprintln!("Value of --max_snp_len must be >= 0");
+        return 1;
+    }
+    if args.kmer <= 0 {
+        eprintln!("Value of --kmer must be > 0");
+        return 1;
+    }
+    if args.kmer < 21 || args.kmer % 2 == 0 {
+        eprintln!("Kmer must be an odd number >= 21");
+        return 1;
+    }
+    if args.max_kmer < 0 {
+        eprintln!("Value of --max_kmer must be > 0");
+        return 1;
+    }
+    if let Some(min_count) = args.min_count {
+        if min_count <= 0 {
+            eprintln!("Value of --min_count must be > 0");
+            return 1;
+        }
+    }
+    if let Some(max_kmer_count) = args.max_kmer_count {
+        if max_kmer_count <= 0 {
+            eprintln!("Value of --max_kmer_count must be > 0");
+            return 1;
+        }
+    }
+    if args.kmer as usize > skesa_rs::kmer::MAX_KMER {
+        eprintln!("Not supported kmer length");
+        return 1;
+    }
+    if args.max_kmer > 0 && args.max_kmer as usize > skesa_rs::kmer::MAX_KMER {
+        eprintln!("Not supported kmer length");
+        return 1;
+    }
+    if args.insert_size < 0 {
+        eprintln!("Value of --insert_size must be >= 0");
+        return 1;
+    }
+    if args.vector_percent > 1.0 {
+        eprintln!("Value of --vector_percent  must be <= 1");
+        return 1;
+    }
+    if args.vector_percent <= 0.0 {
+        eprintln!("Value of --vector_percent  must be > 0");
+        return 1;
+    }
+    if args.estimated_kmers <= 0 {
+        eprintln!("Value of --estimated_kmers must be > 0");
+        return 1;
+    }
+    if args.memory <= 0 {
+        eprintln!("Value of --memory must be > 0");
+        return 1;
+    }
+    if args.memory <= 2 {
+        eprintln!("Memory provided is insufficient to do runs in 10 cycles for the read coverage. We find that 16 Gb for 20x coverage of a 5 Mb genome is usually sufficient");
+        return 1;
+    }
+    if args.min_contig <= 0 {
+        eprintln!("Value of --min_contig must be > 0");
+        return 1;
+    }
+
     // Load reads
-    let rg = match ReadsGetter::new(&args.reads, args.use_paired_ends) {
+    let rg = match ReadsGetter::new(&input_files, args.use_paired_ends) {
         Ok(rg) => rg,
         Err(e) => {
             eprintln!("{}", e);
@@ -618,7 +539,7 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
     let reads_ref = if args.vector_percent < 1.0 {
         clipped = {
             let mut v = rg.reads().to_vec();
-            skesa_rs::reads_getter::clip_adapters(&mut v, args.vector_percent);
+            skesa_rs::reads_getter::clip_adapters(&mut v, args.vector_percent, 100);
             v
         };
         &clipped[..]
@@ -626,6 +547,22 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
         eprintln!("Adapters clip is disabled");
         rg.reads()
     };
+
+    let raw_kmer_num: usize = reads_ref
+        .iter()
+        .map(|read_pair| {
+            read_pair[0].kmer_num(args.kmer as usize) + read_pair[1].kmer_num(args.kmer as usize)
+        })
+        .sum();
+    if let Err(e) = skesa_rs::sorted_counter::sorted_counter_plan(
+        raw_kmer_num,
+        reads_ref.len(),
+        args.kmer as usize,
+        args.memory as usize,
+    ) {
+        eprintln!("{}", e);
+        return 1;
+    }
 
     let min_count = args.min_count.unwrap_or(2) as usize;
     let max_kmer_count = args.max_kmer_count.unwrap_or(10) as usize;
@@ -643,11 +580,19 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
         force_single_reads: args.force_single_ends,
         insert_size: args.insert_size as usize,
         allow_snps: args.allow_snps,
-        ncores: args.cores.max(1) as usize,
+        ncores: resolve_cores(args.cores),
         memory_gb: args.memory as usize,
     };
 
-    let result = assembler::run_assembly(reads_ref, &params, &[]);
+    let seeds = match load_seed_fasta(args.seeds.as_deref()) {
+        Ok(seeds) => seeds,
+        Err(e) => {
+            eprintln!("{}", e);
+            return 1;
+        }
+    };
+
+    let result = assembler::run_assembly(reads_ref, &params, &seeds);
 
     // Output contigs
     let min_contig = args.min_contig as usize;
@@ -664,13 +609,22 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
         let mut writer = BufWriter::new(file);
         if let Some((kmer_len, ref kmers)) = first_graph {
             if let Err(e) = contig_output::write_contigs_with_abundance(
-                &mut writer, &result.contigs, kmers, *kmer_len, min_contig,
+                &mut writer,
+                &result.contigs,
+                kmers,
+                *kmer_len,
+                min_contig,
             ) {
                 eprintln!("Can't write to file {}: {}", path, e);
                 return 1;
             }
-        } else if let Err(e) = contig_output::write_contigs(&mut writer, &result.contigs, min_contig) {
+        } else if let Err(e) =
+            contig_output::write_contigs(&mut writer, &result.contigs, min_contig)
+        {
             eprintln!("Can't write to file {}: {}", path, e);
+            return 1;
+        }
+        if !flush_file_or_report(&mut writer, path) {
             return 1;
         }
     } else {
@@ -678,13 +632,22 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
         let mut writer = BufWriter::new(stdout.lock());
         if let Some((kmer_len, ref kmers)) = first_graph {
             if let Err(e) = contig_output::write_contigs_with_abundance(
-                &mut writer, &result.contigs, kmers, *kmer_len, min_contig,
+                &mut writer,
+                &result.contigs,
+                kmers,
+                *kmer_len,
+                min_contig,
             ) {
                 eprintln!("Write failed: {}", e);
                 return 1;
             }
-        } else if let Err(e) = contig_output::write_contigs(&mut writer, &result.contigs, min_contig) {
+        } else if let Err(e) =
+            contig_output::write_contigs(&mut writer, &result.contigs, min_contig)
+        {
             eprintln!("Write failed: {}", e);
+            return 1;
+        }
+        if !flush_stdout_or_report(&mut writer) {
             return 1;
         }
     }
@@ -703,13 +666,177 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
             eprintln!("Can't write GFA to {}: {}", path, e);
             return 1;
         }
+        if !flush_file_or_report(&mut writer, path) {
+            return 1;
+        }
+    }
+
+    if let Some(ref path) = args.all {
+        let file = match File::create(path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Can't open file {}: {}", path, e);
+                return 1;
+            }
+        };
+        let mut writer = BufWriter::new(file);
+        if let Err(e) = contig_output::write_all_iterations(
+            &mut writer,
+            &result,
+            args.allow_snps,
+            !seeds.is_empty(),
+        ) {
+            eprintln!("Can't write to file {}: {}", path, e);
+            return 1;
+        }
+        if !flush_file_or_report(&mut writer, path) {
+            return 1;
+        }
+    }
+
+    if let Some(ref path) = args.hist {
+        let file = match File::create(path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Can't open file {}: {}", path, e);
+                return 1;
+            }
+        };
+        let mut writer = BufWriter::new(file);
+        for (kmer_len, kmers) in &result.graphs {
+            let bins = skesa_rs::sorted_counter::get_bins(kmers);
+            for (count, freq) in bins {
+                if let Err(e) = writeln!(writer, "{}\t{}\t{}", kmer_len, count, freq) {
+                    eprintln!("Can't write to file {}: {}", path, e);
+                    return 1;
+                }
+            }
+        }
+        if !flush_file_or_report(&mut writer, path) {
+            return 1;
+        }
+    }
+
+    if let Some(ref path) = args.connected_reads {
+        let file = match File::create(path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Can't open file {}: {}", path, e);
+                return 1;
+            }
+        };
+        let mut writer = BufWriter::new(file);
+        let mut num = 0usize;
+        let mut read_iter = result.connected_reads.string_iter();
+        while !read_iter.at_end() {
+            num += 1;
+            if let Err(e) = writeln!(writer, ">ConnectedRead_{}\n{}", num, read_iter.get()) {
+                eprintln!("Can't write to file {}: {}", path, e);
+                return 1;
+            }
+            read_iter.advance();
+        }
+        if !flush_file_or_report(&mut writer, path) {
+            return 1;
+        }
+    }
+
+    // DBG output: SKESA's assembler writes sorted graph records.
+    if let Some(ref path) = args.dbg_out {
+        let file = match File::create(path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("Can't open file {}: {}", path, e);
+                return 1;
+            }
+        };
+        let mut writer = BufWriter::new(file);
+        for (_, kmers) in &result.graphs {
+            if let Err(e) = skesa_rs::graph_io::write_sorted_graph(&mut writer, kmers, true) {
+                eprintln!("Can't write to file {}: {}", path, e);
+                return 1;
+            }
+        }
+        if !flush_file_or_report(&mut writer, path) {
+            return 1;
+        }
     }
 
     eprintln!("DONE");
     0
 }
 
+fn load_seed_fasta(path: Option<&str>) -> Result<Vec<String>, String> {
+    let Some(path) = path else {
+        return Ok(Vec::new());
+    };
+
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("Can't open file {}: {}", path, e))?;
+    if text.is_empty() {
+        eprintln!("Empty fasta file for seeds");
+        return Ok(Vec::new());
+    }
+    if !text.starts_with('>') {
+        return Err(format!("Invalid fasta file format in {}", path));
+    }
+
+    let mut seeds = Vec::new();
+    for record in text[1..].split('>') {
+        let Some(first_ret) = record.find('\n') else {
+            return Err(format!("Invalid fasta file format in {}", path));
+        };
+        let mut sequence = record[first_ret + 1..].replace('\n', "");
+        if sequence.ends_with('\r') {
+            sequence.pop();
+        }
+        if sequence.chars().any(|c| !"ACGTYRWSKMDVHBN".contains(c)) {
+            return Err(format!("Invalid fasta file format in {}", path));
+        }
+        seeds.push(sequence);
+    }
+
+    Ok(seeds)
+}
+
 fn run_kmercounter(args: &KmercounterArgs) -> i32 {
+    if !args.sra_run.is_empty() {
+        eprintln!("SRA input is not supported; use --reads with local FASTA/FASTQ files");
+        return 1;
+    }
+    if args.reads.is_empty() {
+        eprintln!("Provide some input reads");
+        return 1;
+    }
+    if args.cores < 0 {
+        eprintln!("Value of --cores must be >= 0");
+        return 1;
+    }
+    if args.kmer <= 0 {
+        eprintln!("Value of --kmer must be > 0");
+        return 1;
+    }
+    if args.kmer as usize > skesa_rs::kmer::MAX_KMER {
+        eprintln!("Not supported kmer length");
+        return 1;
+    }
+    if args.min_count <= 0 {
+        eprintln!("Value of --min_count must be > 0");
+        return 1;
+    }
+    if args.vector_percent > 1.0 {
+        eprintln!("Value of --vector_percent  must be <= 1");
+        return 1;
+    }
+    if args.vector_percent <= 0.0 {
+        eprintln!("Value of --vector_percent  must be > 0");
+        return 1;
+    }
+    if args.estimated_kmers <= 0 {
+        eprintln!("Value of --estimated_kmers must be > 0");
+        return 1;
+    }
+
     // Load reads
     let rg = match ReadsGetter::new(&args.reads, false) {
         Ok(rg) => rg,
@@ -724,7 +851,7 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
     let reads_ref = if args.vector_percent < 1.0 {
         clipped = {
             let mut v = rg.reads().to_vec();
-            skesa_rs::reads_getter::clip_adapters(&mut v, args.vector_percent);
+            skesa_rs::reads_getter::clip_adapters(&mut v, args.vector_percent, 15);
             v
         };
         &clipped[..]
@@ -754,8 +881,12 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
             }
         };
         let mut writer = BufWriter::new(file);
-        if let Err(e) = kmer_output::write_text_output(&mut writer, &hash_table, args.kmer as usize) {
+        if let Err(e) = kmer_output::write_text_output(&mut writer, &hash_table, args.kmer as usize)
+        {
             eprintln!("Can't write to file {}: {}", path, e);
+            return 1;
+        }
+        if !flush_file_or_report(&mut writer, path) {
             return 1;
         }
     }
@@ -775,16 +906,21 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
             eprintln!("Can't write to file {}: {}", path, e);
             return 1;
         }
+        if !flush_file_or_report(&mut writer, path) {
+            return 1;
+        }
     }
 
-    // DBG output — write sorted graph format using sorted counter
+    // DBG output: write SKESA's hash graph file format.
     if let Some(ref path) = args.dbg_out {
-        // Count k-mers using sorted counter for deterministic output
         let mut sorted_kmers = skesa_rs::sorted_counter::count_kmers_sorted(
-            reads_ref, args.kmer as usize, args.min_count as usize, true, 32,
+            reads_ref,
+            args.kmer as usize,
+            args.min_count as usize,
+            true,
+            32,
         );
         skesa_rs::sorted_counter::get_branches(&mut sorted_kmers, args.kmer as usize);
-        let bins = skesa_rs::sorted_counter::get_bins(&sorted_kmers);
 
         let file = match File::create(path) {
             Ok(f) => f,
@@ -795,34 +931,17 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
         };
         let mut writer = BufWriter::new(file);
 
-        // Write "Sorted Graph" header
-        use std::io::Write;
-        if let Err(e) = writeln!(writer, "Sorted Graph") {
+        if let Err(e) = skesa_rs::hash_graph_output::write_hash_graph(
+            &mut writer,
+            reads_ref,
+            &sorted_kmers,
+            args.kmer as usize,
+            !args.no_strand_info,
+        ) {
             eprintln!("Can't write to file {}: {}", path, e);
             return 1;
         }
-        if let Err(e) = sorted_kmers.save(&mut writer) {
-            eprintln!("Can't write to file {}: {}", path, e);
-            return 1;
-        }
-        // Write bins
-        let bin_num = bins.len() as i32;
-        if let Err(e) = writer.write_all(&bin_num.to_ne_bytes()) {
-            eprintln!("Can't write to file {}: {}", path, e);
-            return 1;
-        }
-        for (count, freq) in &bins {
-            if let Err(e) = writer.write_all(&count.to_ne_bytes())
-                .and_then(|_| writer.write_all(&freq.to_ne_bytes()))
-            {
-                eprintln!("Can't write to file {}: {}", path, e);
-                return 1;
-            }
-        }
-        // Write is_stranded
-        let is_stranded: bool = !args.no_strand_info;
-        if let Err(e) = writer.write_all(&[is_stranded as u8]) {
-            eprintln!("Can't write to file {}: {}", path, e);
+        if !flush_file_or_report(&mut writer, path) {
             return 1;
         }
     }
@@ -830,7 +949,6 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
     eprintln!("DONE");
     0
 }
-
 
 fn main() {
     let cli = Cli::parse();
@@ -844,9 +962,10 @@ fn main() {
         Commands::GfaConnector(args) => args.cores,
         Commands::Stats(_) => 0,
     };
-    if cores > 0 {
+    if cores >= 0 {
+        warn_if_cores_reduced(cores);
         rayon::ThreadPoolBuilder::new()
-            .num_threads(cores as usize)
+            .num_threads(resolve_cores(cores))
             .build_global()
             .ok(); // ignore if already initialized
     }

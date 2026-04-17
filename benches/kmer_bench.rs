@@ -18,9 +18,7 @@ fn bench_kmer_revcomp(c: &mut Criterion) {
 
 fn bench_kmer_oahash(c: &mut Criterion) {
     let kmer = Kmer::from_kmer_str("ACGTACGTACGTACGTACGTA");
-    c.bench_function("kmer_oahash_21", |b| {
-        b.iter(|| black_box(&kmer).oahash())
-    });
+    c.bench_function("kmer_oahash_21", |b| b.iter(|| black_box(&kmer).oahash()));
 }
 
 fn bench_large_int_revcomp(c: &mut Criterion) {
@@ -63,23 +61,13 @@ fn bench_kmer_extraction(c: &mut Criterion) {
 fn bench_sorted_counter(c: &mut Criterion) {
     let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
     let fasta = data_dir.join("small_test.fasta");
-    let rg = skesa_rs::reads_getter::ReadsGetter::new(
-        &[fasta.to_str().unwrap().to_string()],
-        false,
-    )
-    .unwrap();
+    let rg =
+        skesa_rs::reads_getter::ReadsGetter::new(&[fasta.to_str().unwrap().to_string()], false)
+            .unwrap();
     let reads = rg.reads().to_vec();
 
     c.bench_function("sorted_counter_200reads_k21", |b| {
-        b.iter(|| {
-            skesa_rs::sorted_counter::count_kmers_sorted(
-                black_box(&reads),
-                21,
-                2,
-                true,
-                32,
-            )
-        })
+        b.iter(|| skesa_rs::sorted_counter::count_kmers_sorted(black_box(&reads), 21, 2, true, 32))
     });
 }
 

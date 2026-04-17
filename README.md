@@ -4,7 +4,7 @@ Pure Rust port of NCBI's [SKESA](https://github.com/ncbi/SKESA) (Strategic K-mer
 
 **Based on SKESA v2.4.0 / SAUTE v1.3.0** (commit [`27caba2`](https://github.com/ncbi/SKESA/commit/27caba2ed075c7f44dd5bd4a24332c23b5b2bdaa), 2024-10-11)
 
-**further testing is pending**
+**this crate is not yet ready for production!!!**
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code!
 
@@ -31,13 +31,52 @@ But:
 
 ## Features
 
-- Pure Rust — no C/C++ dependencies, no Boost required
-- Library API for embedding assembly in other tools
-- CLI with all 5 SKESA tools: `skesa`, `kmercounter`, `saute`, `saute-prot`, `gfa-connector`
-- K-mer counting output byte-identical to C++
-- Assembly quality matches C++ (N50=242 on test data)
+- Pure Rust, with no Boost or C++ runtime dependency for normal Rust execution
+- Library API for embedding assembly and k-mer counting in other tools
+- CLI entry points for `skesa`, `kmercounter`, `saute`, `saute-prot`, and `gfa-connector`
+- Verified `skesa` and `kmercounter` parity on the small bundled fixtures listed in `TODO.md`
 - FASTA, FASTQ, and gzip input (via noodles + flate2)
 - Multi-threaded k-mer counting and sorting (via rayon)
+
+## Parity Status
+
+This repository is still a parity work in progress. The detailed, current checklist
+lives in `TODO.md`; treat that file as the source of truth. Assembly algorithm
+line-level notes are kept in `ASSEMBLY_AUDIT.md`.
+
+Verified today:
+
+- `skesa` default, `--min_contig 1`, `--allow_snps --min_contig 1`, `--hist`, `--all`, `--connected_reads`, and `--dbg_out` match the bundled C++ implementation on the small fixture.
+- `kmercounter --hist`, `--min_count 1 --hist`, `--skip_bloom_filter --hist`, `--text_out` row sets, and `--dbg_out` graph structure match the bundled C++ implementation on focused fixtures.
+- FASTA, FASTQ, gzipped FASTA, ambiguous-base, adapter-clipping, precision > 1 k-mer, SRA rejection, branch-bit, plus-fraction, and packed-counter overflow behavior have focused tests.
+
+Not yet proven equivalent:
+
+- Multi-iteration assembly where later k-mer graphs alter earlier contigs.
+- Real paired-end graph connection behavior and insert-size estimation.
+- SNP/indel convergence behavior beyond the current small fixture.
+- `--hash_count` assembly mode is intentionally rejected until the C++ hash-count assembly path is ported and fixture-tested.
+- `saute`, `saute-prot`, and `gfa-connector` full C++ parity. These commands are intentionally rejected until C++ fixtures are added.
+- True C++ `BandAlign` / `VariBandAlign`; the current Rust code deliberately documents those paths as approximations that delegate to local alignment.
+
+Known intentional or unresolved divergences:
+
+- C++ `Hash Graph` files contain process-local raw pointer/padding bytes. Rust graph tests compare structural content rather than byte-for-byte files for those fields.
+- `kmercounter --text_out` is currently emitted in deterministic lexicographic order. C++ emits hash-table iteration order, so tests compare row sets unless a fixture explicitly checks order.
+- Help and version text are intentionally Rust/Clap subcommand output, not byte-for-byte C++ command-line help.
+- SRA input is not supported in the Rust port; `--sra_run` / `--sra-run` are rejected with a clear error.
+
+## Regenerating Golden Outputs
+
+Golden files in `tests/data` should be regenerated from the bundled C++ sources in
+`SKESA/` and committed with the exact command, input checksum, output checksum,
+platform, and date recorded in the test or fixture-generation notes. Prefer using
+`/husky/henriksson/for_claude/skesa` for large temporary inputs and outputs.
+
+For graph outputs, do not require whole-file byte equality for C++ hash graphs.
+Use the Rust structural parsers or the ignored C++ loader integration tests to
+compare graph magic, k-mer length, live k-mer count, bins, stranded flag, raw
+packed count fields, and loader behavior.
 
 ## Building
 
@@ -73,23 +112,11 @@ skesa-rs skesa --reads input.fasta --cores 4 --kmer 21 --min-contig 200 --contig
 skesa-rs skesa --reads input.fasta --contigs-out contigs.fasta --gfa-out graph.gfa
 ```
 
-### SAUTE (target-enriched assembly)
+### Advanced SKESA Tools
 
-```bash
-skesa-rs saute --reads input.fasta --targets references.fasta --gfa graph.gfa
-```
-
-### SAUTE-PROT (protein-guided assembly)
-
-```bash
-skesa-rs saute-prot --reads input.fasta --targets proteins.fasta --genetic-code 1 --gfa graph.gfa
-```
-
-### GFA Connector
-
-```bash
-skesa-rs gfa-connector --reads input.fasta --contigs contigs.fasta --gfa graph.gfa
-```
+`saute`, `saute-prot`, and `gfa-connector` are intentionally rejected for now
+because full C++ parity has not been proven. Use the bundled C++ tools for those
+commands until focused parity fixtures are added.
 
 ### Library usage
 
@@ -121,11 +148,60 @@ for contig in &contigs {
 ## Testing
 
 ```bash
-cargo test                          # Run all 168 tests
+cargo test                          # Run unit and integration tests
 cargo test kmer                     # Run k-mer related tests
 cargo test assembler                # Run assembler tests
 cargo bench --bench kmer_bench      # Run criterion benchmarks
 ```
+
+## Benchmarking
+
+Use `tools/benchmark_command.py` for parity/performance measurements so Rust and
+bundled C++ commands record the same metadata. Put large temporary inputs,
+outputs, and JSON results under `/husky/henriksson/for_claude/skesa` when that
+path is writable in the current environment.
+
+```bash
+python3 tools/benchmark_command.py \
+  --output /husky/henriksson/for_claude/skesa/rust-small.json \
+  --label rust-small --repeat 3 -- \
+  target/release/skesa-rs skesa --reads tests/data/small_test.fasta --contigs-out /tmp/rust-contigs.fasta
+
+python3 tools/benchmark_command.py \
+  --output /husky/henriksson/for_claude/skesa/cpp-small.json \
+  --label cpp-small --repeat 3 -- \
+  SKESA/skesa --reads tests/data/small_test.fasta --contigs_out /tmp/cpp-contigs.fasta
+```
+
+Record the command, platform, wall time, CPU time, max RSS, return code, and
+stderr tail with the correctness fixture notes. Do not treat benchmark numbers as
+parity evidence unless the corresponding outputs have already been compared. See
+`BENCHMARKS.md` for recorded local snapshots.
+
+For a deterministic local smoke input, generate synthetic reads with
+`tools/generate_synthetic_medium_reads.py`. The default `medium` profile has a
+recorded Rust/C++ parity benchmark. The `high-error` and `high-repeat` profiles
+currently expose assembly-output divergences and should be used as correctness
+probes, not performance benchmarks.
+
+
+## Tracehash Fixture Localization
+
+Use `tools/tracehash_skesa_fixture.py` when a C++/Rust fixture diff is too broad
+and you need a stable surface-level trace before adding narrower instrumentation.
+The script writes persistent tracehash-compatible rows under `/tmp` by default
+and compares them with `/home/mahogny/github/claude/newhmmer/tracehash`.
+
+```bash
+tools/tracehash_skesa_fixture.py \
+  --reads tests/data/snp_bubble_reads.fasta -- \
+  --kmer 21 --max_kmer 21 --steps 1 --min_count 2 \
+  --vector_percent 1.0 --estimated_kmers 1000 --cores 1 \
+  --min_contig 1 --allow_snps
+```
+
+A matching `skesa_hist` row with mismatching `skesa_contigs`/`skesa_all` rows
+means graph construction still matches while assembly/recovery output diverges.
 
 ## Architecture
 

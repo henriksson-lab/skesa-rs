@@ -1,6 +1,8 @@
-/// K-mer output formatting matching SKESA's text and histogram formats.
+/// K-mer output formatting for SKESA-compatible text and histogram modes.
 ///
-/// These functions produce output identical to kmercounter's text_out and hist modes.
+/// Histogram output is byte-for-byte compatible on tested fixtures. Text output
+/// uses the same row format, but Rust emits deterministic lexicographic order
+/// while C++ emits hash-table iteration order.
 use crate::concurrent_hash::KmerHashCount;
 use crate::histogram::Bins;
 use crate::kmer::Kmer;
@@ -8,7 +10,7 @@ use crate::kmer::Kmer;
 use std::io::Write;
 
 /// Write k-mer text output (kmer\tcount\tplus_strand_count format).
-/// Matches the C++ output format from kmercounter.cpp lines 171-175.
+/// Uses the C++ row format from kmercounter.cpp lines 171-175.
 pub fn write_text_output<W: Write>(
     out: &mut W,
     hash_table: &KmerHashCount,
@@ -23,9 +25,8 @@ pub fn write_text_output<W: Write>(
         entries.push((kmer_str, count, plus_count));
     });
 
-    // Note: C++ iterates in hash table order (non-deterministic).
-    // For comparison, we need to match the C++ order, which depends on
-    // the hash table layout. For now we sort alphabetically.
+    // C++ iterates in hash table order. Rust sorts to keep output deterministic;
+    // parity tests compare row sets for this mode.
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     for (kmer_str, count, plus_count) in &entries {
@@ -67,8 +68,8 @@ mod tests {
         write_histogram(&mut output, &bins).unwrap();
         let rust_hist = String::from_utf8(output).unwrap();
 
-        let expected_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/expected_hist.txt");
+        let expected_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/expected_hist.txt");
         let expected_hist = std::fs::read_to_string(&expected_path).unwrap();
 
         assert_eq!(
@@ -78,13 +79,27 @@ mod tests {
     }
 
     #[test]
+    fn test_text_output_is_lexicographically_sorted() {
+        let reads = make_test_reads();
+        let hash_table = count_kmers(&reads, 21, 2, 100_000_000, true, false);
+
+        let mut output = Vec::new();
+        write_text_output(&mut output, &hash_table, 21).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        let rows: Vec<&str> = text.lines().collect();
+        let mut sorted = rows.clone();
+        sorted.sort_by_key(|row| row.split('\t').next().unwrap());
+        assert_eq!(rows, sorted);
+    }
+
+    #[test]
     fn test_text_output_kmer_count_matches() {
         let reads = make_test_reads();
         let hash_table = count_kmers(&reads, 21, 2, 100_000_000, true, false);
 
         // Compare sorted k-mer lists between Rust and C++
-        let expected_path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data/expected_text.txt");
+        let expected_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/expected_text.txt");
         let expected = std::fs::read_to_string(&expected_path).unwrap();
 
         // Parse C++ output into sorted set of (kmer, count)
@@ -118,10 +133,7 @@ mod tests {
 
         // Same k-mers and counts
         for (r, c) in rust_kmers.iter().zip(cpp_kmers.iter()) {
-            assert_eq!(
-                r.0, c.0,
-                "K-mer mismatch at position"
-            );
+            assert_eq!(r.0, c.0, "K-mer mismatch at position");
             assert_eq!(
                 r.1, c.1,
                 "Count mismatch for kmer {}: Rust={}, C++={}",

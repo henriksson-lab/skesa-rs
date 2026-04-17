@@ -60,7 +60,12 @@ impl ConcurrentBlockedBloomFilter {
     /// assert_eq!(bf.insert(hashp, hashm), InsertResult::NewKmer);
     /// assert_eq!(bf.insert(hashp, hashm), InsertResult::AboveThreshold);
     /// ```
-    pub fn new(table_size: usize, counter_bit_size: usize, hash_num: usize, min_count: usize) -> Self {
+    pub fn new(
+        table_size: usize,
+        counter_bit_size: usize,
+        hash_num: usize,
+        min_count: usize,
+    ) -> Self {
         let max_element = (1u64 << counter_bit_size) - 1;
         let block_bytes = BLOOM_BLOCK_WORDS * 8; // 128 bytes
         let elements_in_block = 8 * block_bytes / counter_bit_size;
@@ -94,7 +99,8 @@ impl ConcurrentBlockedBloomFilter {
 
         for _ in 0..self.hash_num {
             hashp = hashp.wrapping_add(hashm);
-            let position = ((hashp as usize) & (self.elements_in_block - 1)) * self.counter_bit_size;
+            let position =
+                ((hashp as usize) & (self.elements_in_block - 1)) * self.counter_bit_size;
             let cell_idx = position >> BITS_IN_CELL_LOG;
             let bit_offset = position & (BITS_IN_CELL - 1);
             let mask = self.max_element << bit_offset;
@@ -138,7 +144,8 @@ impl ConcurrentBlockedBloomFilter {
 
         for _ in 0..self.hash_num {
             hashp = hashp.wrapping_add(hashm);
-            let position = ((hashp as usize) & (self.elements_in_block - 1)) * self.counter_bit_size;
+            let position =
+                ((hashp as usize) & (self.elements_in_block - 1)) * self.counter_bit_size;
             let cell_idx = position >> BITS_IN_CELL_LOG;
             let bit_offset = position & (BITS_IN_CELL - 1);
 

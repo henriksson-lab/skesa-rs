@@ -1,6 +1,6 @@
 /// Guided graph for SAUTE target-enriched assembly.
 ///
-/// Port of SKESA's CGuidedGraph from guidedgraph.hpp.
+/// Partial Rust implementation of SKESA's CGuidedGraph concepts from guidedgraph.hpp.
 ///
 /// The guided graph is a segment-based graph where each segment is a DNA
 /// sequence with alignment metadata. Segments are connected via left/right
@@ -99,19 +99,31 @@ impl GuidedGraph {
     }
 
     /// Start a new assembly from an initial k-mer
-    pub fn start_new_assembly(&mut self, init_kmer: &str, not_aligned_left: i32, not_aligned_right: i32) {
+    pub fn start_new_assembly(
+        &mut self,
+        init_kmer: &str,
+        not_aligned_left: i32,
+        not_aligned_right: i32,
+    ) {
         self.last_segments.clear();
         self.not_aligned.clear();
 
         let seq: Vec<PathBase> = init_kmer.chars().map(|c| PathBase { base: c }).collect();
         let seg_id = self.add_segment(seq, not_aligned_left, not_aligned_right);
-        self.last_segments.push((seg_id, init_kmer.len(), init_kmer.len()));
+        self.last_segments
+            .push((seg_id, init_kmer.len(), init_kmer.len()));
     }
 
     /// Add a new segment to the graph
-    fn add_segment(&mut self, seq: Vec<PathBase>, not_aligned_left: i32, not_aligned_right: i32) -> usize {
+    fn add_segment(
+        &mut self,
+        seq: Vec<PathBase>,
+        not_aligned_left: i32,
+        not_aligned_right: i32,
+    ) -> usize {
         let id = self.segments.len();
-        self.segments.push(SeqSegment::new(seq, not_aligned_left, not_aligned_right));
+        self.segments
+            .push(SeqSegment::new(seq, not_aligned_left, not_aligned_right));
         id
     }
 
@@ -138,7 +150,8 @@ impl GuidedGraph {
                 .or_default()
                 .push((last_id, last_pos));
 
-            self.last_segments.push((new_id, bases.len(), cumul + bases.len()));
+            self.last_segments
+                .push((new_id, bases.len(), cumul + bases.len()));
         }
     }
 
@@ -175,26 +188,50 @@ impl GuidedGraph {
     }
 
     /// Register a left anchor at a known target position
-    pub fn add_left_anchor(&mut self, kmer_key: Vec<u64>, target_pos: i32, seg_id: usize, seg_pos: i32) {
-        let anchor = Anchor { kmer_key, target_pos };
+    pub fn add_left_anchor(
+        &mut self,
+        kmer_key: Vec<u64>,
+        target_pos: i32,
+        seg_id: usize,
+        seg_pos: i32,
+    ) {
+        let anchor = Anchor {
+            kmer_key,
+            target_pos,
+        };
         self.left_anchors.insert(anchor, (seg_id, seg_pos));
     }
 
     /// Register a right anchor
-    pub fn add_right_anchor(&mut self, kmer_key: Vec<u64>, target_pos: i32, seg_id: usize, seg_pos: i32) {
-        let anchor = Anchor { kmer_key, target_pos };
+    pub fn add_right_anchor(
+        &mut self,
+        kmer_key: Vec<u64>,
+        target_pos: i32,
+        seg_id: usize,
+        seg_pos: i32,
+    ) {
+        let anchor = Anchor {
+            kmer_key,
+            target_pos,
+        };
         self.right_anchors.insert(anchor, (seg_id, seg_pos));
     }
 
     /// Check if a left anchor exists at a given k-mer and position
     pub fn known_left_anchor(&self, kmer_key: &[u64], target_pos: i32) -> Option<&(usize, i32)> {
-        let anchor = Anchor { kmer_key: kmer_key.to_vec(), target_pos };
+        let anchor = Anchor {
+            kmer_key: kmer_key.to_vec(),
+            target_pos,
+        };
         self.left_anchors.get(&anchor)
     }
 
     /// Check if a right anchor exists
     pub fn known_right_anchor(&self, kmer_key: &[u64], target_pos: i32) -> Option<&(usize, i32)> {
-        let anchor = Anchor { kmer_key: kmer_key.to_vec(), target_pos };
+        let anchor = Anchor {
+            kmer_key: kmer_key.to_vec(),
+            target_pos,
+        };
         self.right_anchors.get(&anchor)
     }
 
@@ -218,16 +255,22 @@ impl GuidedGraph {
         for &seg_id in &to_remove_right {
             // Remove left connections pointing to this segment
             let left_conns: Vec<(i32, Vec<(usize, i32)>)> = self.segments[seg_id]
-                .left_connections.iter()
+                .left_connections
+                .iter()
                 .map(|(&k, v)| (k, v.clone()))
                 .collect();
 
             for (ipos, partners) in left_conns {
                 for (partner_id, partner_pos) in partners {
-                    if let Some(conns) = self.segments[partner_id].right_connections.get_mut(&partner_pos) {
+                    if let Some(conns) = self.segments[partner_id]
+                        .right_connections
+                        .get_mut(&partner_pos)
+                    {
                         conns.retain(|&(id, pos)| id != seg_id || pos != ipos);
                         if conns.is_empty() {
-                            self.segments[partner_id].right_connections.remove(&partner_pos);
+                            self.segments[partner_id]
+                                .right_connections
+                                .remove(&partner_pos);
                         }
                     }
                 }
@@ -249,16 +292,22 @@ impl GuidedGraph {
 
         for &seg_id in &to_remove_left {
             let right_conns: Vec<(i32, Vec<(usize, i32)>)> = self.segments[seg_id]
-                .right_connections.iter()
+                .right_connections
+                .iter()
                 .map(|(&k, v)| (k, v.clone()))
                 .collect();
 
             for (ipos, partners) in right_conns {
                 for (partner_id, partner_pos) in partners {
-                    if let Some(conns) = self.segments[partner_id].left_connections.get_mut(&partner_pos) {
+                    if let Some(conns) = self.segments[partner_id]
+                        .left_connections
+                        .get_mut(&partner_pos)
+                    {
                         conns.retain(|&(id, pos)| id != seg_id || pos != ipos);
                         if conns.is_empty() {
-                            self.segments[partner_id].left_connections.remove(&partner_pos);
+                            self.segments[partner_id]
+                                .left_connections
+                                .remove(&partner_pos);
                         }
                     }
                 }
@@ -270,7 +319,8 @@ impl GuidedGraph {
 
     /// Get all non-empty segments as sequences
     pub fn get_segments(&self) -> Vec<String> {
-        self.segments.iter()
+        self.segments
+            .iter()
             .filter(|s| !s.is_empty())
             .map(|s| s.sequence_string())
             .collect()
@@ -314,7 +364,10 @@ pub fn trim_groups(graph: &mut GuidedGraph, uniformity: f64, min_len: usize) {
     graph.remove_not_aligned_segments(uniformity);
 
     // Remove segments shorter than min_len that have no connections
-    let to_remove: Vec<usize> = graph.segments.iter().enumerate()
+    let to_remove: Vec<usize> = graph
+        .segments
+        .iter()
+        .enumerate()
         .filter(|(_, s)| {
             s.len() < min_len
                 && s.left_connections.is_empty()
@@ -374,7 +427,10 @@ mod tests {
         let mut graph = GuidedGraph::new(21);
 
         // Add a well-aligned segment
-        let seq1: Vec<PathBase> = "ACGTACGTACGTACGTACGTA".chars().map(|c| PathBase { base: c }).collect();
+        let seq1: Vec<PathBase> = "ACGTACGTACGTACGTACGTA"
+            .chars()
+            .map(|c| PathBase { base: c })
+            .collect();
         graph.segments.push(SeqSegment::new(seq1, 0, 0));
 
         // Add a poorly-aligned segment (not_aligned_right >> len)
@@ -383,7 +439,11 @@ mod tests {
 
         assert_eq!(graph.segment_count(), 2);
         graph.remove_not_aligned_segments(1.0);
-        assert_eq!(graph.segment_count(), 1, "Poorly aligned segment should be removed");
+        assert_eq!(
+            graph.segment_count(),
+            1,
+            "Poorly aligned segment should be removed"
+        );
     }
 
     #[test]

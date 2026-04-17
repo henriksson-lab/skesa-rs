@@ -1,5 +1,5 @@
 //! Sequence alignment and distance utilities.
-//! Port of SKESA's glb_align.hpp and glb_align.cpp.
+//! Partial Rust implementation of SKESA's glb_align.hpp/glb_align.cpp behavior.
 
 /// Levenshtein edit distance between two sequences.
 ///
@@ -123,6 +123,7 @@ impl Cigar {
         }
     }
 
+    // Retained for the C++ banded-alignment port, which builds CIGARs in forward order.
     #[allow(dead_code)]
     fn push_back(&mut self, el: CigarElement) {
         match el.op {
@@ -141,12 +142,121 @@ impl Cigar {
         }
     }
 
-    /// CIGAR string representation
+    /// CIGAR string representation without soft clipping.
     pub fn cigar_string(&self) -> String {
         self.elements
             .iter()
             .map(|e| format!("{}{}", e.len, e.op))
             .collect()
+    }
+
+    /// C++ `CCigarBase::CigarString(qstart, qlen)` equivalent, including soft clips.
+    pub fn cigar_string_with_soft_clip(&self, qstart: i32, qlen: usize) -> String {
+        let mut cigar = self.cigar_string();
+        let missing_start = qstart + self.qfrom;
+        if missing_start > 0 {
+            cigar = format!("{}S{}", missing_start, cigar);
+        }
+        let missing_end = qlen as i32 - 1 - self.qto - qstart;
+        if missing_end > 0 {
+            cigar.push_str(&format!("{}S", missing_end));
+        }
+        cigar
+    }
+
+    /// C++ `CCigar::DetailedCigarString` equivalent.
+    pub fn detailed_cigar_string(
+        &self,
+        qstart: i32,
+        q_len: usize,
+        query: &[u8],
+        subject: &[u8],
+        include_soft_clip: bool,
+    ) -> String {
+        let mut cigar = String::new();
+        let mut qi = self.qfrom.max(0) as usize;
+        let mut si = self.sfrom.max(0) as usize;
+
+        for el in &self.elements {
+            match el.op {
+                'M' => {
+                    if el.len == 0 {
+                        continue;
+                    }
+                    let mut is_match = query[qi] == subject[si];
+                    let mut len = 0usize;
+                    for _ in 0..el.len {
+                        let current_match = query[qi] == subject[si];
+                        if current_match == is_match {
+                            len += 1;
+                        } else {
+                            cigar.push_str(&format!("{}{}", len, if is_match { '=' } else { 'X' }));
+                            is_match = current_match;
+                            len = 1;
+                        }
+                        qi += 1;
+                        si += 1;
+                    }
+                    cigar.push_str(&format!("{}{}", len, if is_match { '=' } else { 'X' }));
+                }
+                'D' => {
+                    cigar.push_str(&format!("{}D", el.len));
+                    si += el.len;
+                }
+                'I' => {
+                    cigar.push_str(&format!("{}I", el.len));
+                    qi += el.len;
+                }
+                _ => {}
+            }
+        }
+
+        if include_soft_clip {
+            let missing_start = qstart + self.qfrom;
+            if missing_start > 0 {
+                cigar = format!("{}S{}", missing_start, cigar);
+            }
+            let missing_end = q_len as i32 - 1 - self.qto - qstart;
+            if missing_end > 0 {
+                cigar.push_str(&format!("{}S", missing_end));
+            }
+        }
+        cigar
+    }
+
+    /// C++ `CCigar::Score` equivalent.
+    pub fn score(
+        &self,
+        query: &[u8],
+        subject: &[u8],
+        gopen: i32,
+        gapextend: i32,
+        delta: &[[i8; 256]; 256],
+    ) -> i32 {
+        let mut score = 0;
+        let mut qi = self.qfrom.max(0) as usize;
+        let mut si = self.sfrom.max(0) as usize;
+        for el in &self.elements {
+            match el.op {
+                'M' => {
+                    for _ in 0..el.len {
+                        score += delta[query[qi] as usize][subject[si] as usize] as i32;
+                        qi += 1;
+                        si += 1;
+                    }
+                }
+                'D' => {
+                    si += el.len;
+                    score -= gopen + gapextend * el.len as i32;
+                }
+                'I' => {
+                    qi += el.len;
+                    score -= gopen + gapextend * el.len as i32;
+                }
+                _ => {}
+            }
+        }
+        score
     }
 
     /// Query range
@@ -227,6 +337,14 @@ impl Score {
     }
     fn big_negative() -> Self {
         Score::new(i32::MIN / 2, 0)
+    }
+
+    fn primary(self) -> i32 {
+        (self.0 >> 32) as i32
+    }
+
+    fn primary_is_non_positive(self) -> bool {
+        self.primary() <= 0
     }
 }
 
@@ -474,7 +592,7 @@ pub fn lcl_align(
                 mtrx[m_idx] |= BGAP;
             }
             // Local alignment: reset to zero if score goes negative
-            if s[sp_idx] <= Score::zero() {
+            if s[sp_idx].primary_is_non_positive() {
                 s[sp_idx] = Score::zero();
                 mtrx[m_idx] |= ZERO;
             }
@@ -487,20 +605,140 @@ pub fn lcl_align(
     backtrack(ia, ib, &mtrx, nb)
 }
 
-/// Banded Smith-Waterman alignment.
-/// Restricts the alignment to a diagonal band of width `band`, reducing memory and time.
-/// Falls back to lcl_align for correctness (full banded implementation is a future optimization).
+fn constrained_lcl_align(
+    query: &[u8],
+    subject: &[u8],
+    gopen: i32,
+    gapextend: i32,
+    delta: &[[i8; 256]; 256],
+    row_limits: &[(usize, usize)],
+) -> Cigar {
+    let na = query.len();
+    let nb = subject.len();
+
+    let rsa = Score::new(-gopen - gapextend, 0);
+    let rsb = Score::new(-gopen - gapextend, 1);
+    let sigma_score = Score::new(-gapextend, 0);
+    let sigma_score_b = Score::new(-gapextend, 1);
+
+    let mut s = vec![Score::zero(); nb + 1];
+    let mut sm = vec![Score::zero(); nb + 1];
+    let mut gapb = vec![Score::zero(); nb + 1];
+    let mut mtrx = vec![ZERO; (na + 1) * (nb + 1)];
+
+    let mut max_score = Score::zero();
+    let mut max_pos = 0usize;
+
+    for i in 0..na {
+        s.fill(Score::zero());
+        let (mut left, mut right) = row_limits.get(i).copied().unwrap_or((1, 0));
+        if nb == 0 || left > right {
+            std::mem::swap(&mut sm, &mut s);
+            continue;
+        }
+        right = right.min(nb - 1);
+        left = left.min(nb);
+        if left > right {
+            std::mem::swap(&mut sm, &mut s);
+            continue;
+        }
+
+        let mut gapa = Score::zero();
+        let ai = query[i] as usize;
+
+        for j in 0..nb {
+            let m_idx = (i + 1) * (nb + 1) + (j + 1);
+            if j < left || j > right {
+                mtrx[m_idx] = ZERO;
+                s[j + 1] = Score::zero();
+                gapb[j + 1] = Score::zero();
+                if j < left {
+                    gapa = Score::zero();
+                }
+                continue;
+            }
+
+            mtrx[m_idx] = 0;
+            let ss = sm[j] + Score::new(delta[ai][subject[j] as usize] as i32, 1);
+
+            gapa += sigma_score;
+            if s[j] + rsa > gapa {
+                gapa = s[j] + rsa;
+                mtrx[m_idx] |= ASTART;
+            }
+
+            let gapbj = &mut gapb[j + 1];
+            *gapbj += sigma_score_b;
+            if sm[j + 1] + rsb > *gapbj {
+                *gapbj = sm[j + 1] + rsb;
+                mtrx[m_idx] |= BSTART;
+            }
+
+            if gapa > *gapbj {
+                if ss >= gapa {
+                    s[j + 1] = ss;
+                    if ss > max_score {
+                        max_score = ss;
+                        max_pos = m_idx;
+                    }
+                } else {
+                    s[j + 1] = gapa;
+                    mtrx[m_idx] |= AGAP;
+                }
+            } else if ss >= *gapbj {
+                s[j + 1] = ss;
+                if ss > max_score {
+                    max_score = ss;
+                    max_pos = m_idx;
+                }
+            } else {
+                s[j + 1] = *gapbj;
+                mtrx[m_idx] |= BGAP;
+            }
+
+            if s[j + 1].primary_is_non_positive() {
+                s[j + 1] = Score::zero();
+                mtrx[m_idx] |= ZERO;
+            }
+        }
+        std::mem::swap(&mut sm, &mut s);
+    }
+
+    let ia = (max_pos / (nb + 1)) as i32 - 1;
+    let ib = (max_pos % (nb + 1)) as i32 - 1;
+    backtrack(ia, ib, &mtrx, nb)
+}
+
+/// Banded Smith-Waterman alignment using SKESA-compatible row pruning.
 pub fn band_align(
     query: &[u8],
     subject: &[u8],
     gopen: i32,
     gapextend: i32,
     delta: &[[i8; 256]; 256],
-    _band: usize,
+    band: usize,
 ) -> Cigar {
-    // TODO: implement true banded alignment for performance
-    // For now, fall back to full local alignment for correctness
-    lcl_align(query, subject, gopen, gapextend, delta)
+    let half_band = (2 * (band / 2) + 1) / 2;
+    let limits: Vec<(usize, usize)> = (0..query.len())
+        .map(|i| {
+            let left = i.saturating_sub(half_band);
+            let right = i.saturating_add(half_band);
+            (left, right)
+        })
+        .collect();
+    constrained_lcl_align(query, subject, gopen, gapextend, delta, &limits)
+}
+
+/// Variable-band Smith-Waterman alignment with per-query-row subject limits.
+pub fn vari_band_align(
+    query: &[u8],
+    subject: &[u8],
+    gopen: i32,
+    gapextend: i32,
+    delta: &[[i8; 256]; 256],
+    subject_limits: &[(usize, usize)],
+) -> Cigar {
+    constrained_lcl_align(query, subject, gopen, gapextend, delta, subject_limits)
 }
 
 /// DNA scoring matrix
@@ -603,6 +841,363 @@ mod tests {
         let m = SMatrix::new_dna(1, -1);
         assert_eq!(m.matrix[b'A' as usize][b'A' as usize], 1);
         assert_eq!(m.matrix[b'A' as usize][b'C' as usize], -1);
+    }
+
+    fn assert_cpp_alignment_fixture(
+        cigar: &Cigar,
+        query: &[u8],
+        subject: &[u8],
+        gopen: i32,
+        gapextend: i32,
+        matrix: &[[i8; 256]; 256],
+        expected: (&str, &str, usize, usize, i32),
+    ) {
+        assert_eq!(
+            cigar.cigar_string_with_soft_clip(0, query.len()),
+            expected.0
+        );
+        assert_eq!(
+            cigar.detailed_cigar_string(0, query.len(), query, subject, true),
+            expected.1
+        );
+        assert_eq!(cigar.matches(query, subject), expected.2);
+        assert_eq!(cigar.distance(query, subject), expected.3);
+        assert_eq!(
+            cigar.score(query, subject, gopen, gapextend, matrix),
+            expected.4
+        );
+    }
+
+    #[test]
+    fn test_alignment_matches_cpp_probe_cases() {
+        let dna13 = SMatrix::new_dna(1, -3);
+        let dna23 = SMatrix::new_dna(2, -3);
+
+        let q = b"ACGT";
+        let s = b"ACGT";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 5, 2, &dna13.matrix),
+            q,
+            s,
+            5,
+            2,
+            &dna13.matrix,
+            ("4M", "4=", 4, 0, 4),
+        );
+
+        let q = b"ACGT";
+        let s = b"ACGA";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 5, 2, &dna13.matrix),
+            q,
+            s,
+            5,
+            2,
+            &dna13.matrix,
+            ("4M", "3=1X", 3, 1, 0),
+        );
+
+        let q = b"ACGT";
+        let s = b"ACT";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 3, 1, &dna23.matrix),
+            q,
+            s,
+            3,
+            1,
+            &dna23.matrix,
+            ("2M1I1M", "2=1I1=", 3, 1, 2),
+        );
+
+        let q = b"ACT";
+        let s = b"ACGT";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 3, 1, &dna23.matrix),
+            q,
+            s,
+            3,
+            1,
+            &dna23.matrix,
+            ("2M1D1M", "2=1D1=", 3, 1, 2),
+        );
+
+        let q = b"ACGTTTGT";
+        let s = b"ACGT";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 3, 1, &dna23.matrix),
+            q,
+            s,
+            3,
+            1,
+            &dna23.matrix,
+            ("2M4I2M", "2=4I2=", 4, 4, 1),
+        );
+
+        let q = b"ACGT";
+        let s = b"ACGTTTGT";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 3, 1, &dna23.matrix),
+            q,
+            s,
+            3,
+            1,
+            &dna23.matrix,
+            ("2M4D2M", "2=4D2=", 4, 4, 1),
+        );
+
+        let q = b"TTACGT";
+        let s = b"ACGT";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 3, 1, &dna23.matrix),
+            q,
+            s,
+            3,
+            1,
+            &dna23.matrix,
+            ("2I4M", "2I4=", 4, 2, 3),
+        );
+
+        let q = b"ACGT";
+        let s = b"TTACGT";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 3, 1, &dna23.matrix),
+            q,
+            s,
+            3,
+            1,
+            &dna23.matrix,
+            ("2D4M", "2D4=", 4, 2, 3),
+        );
+
+        let q = b"AC";
+        let s = b"AG";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 2, 1, &dna13.matrix),
+            q,
+            s,
+            2,
+            1,
+            &dna13.matrix,
+            ("2M", "1=1X", 1, 1, -2),
+        );
+
+        let q = b"AAAC";
+        let s = b"AAC";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 2, 1, &dna13.matrix),
+            q,
+            s,
+            2,
+            1,
+            &dna13.matrix,
+            ("1I3M", "1I3=", 3, 1, 0),
+        );
+
+        let q = b"AAC";
+        let s = b"AAAC";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 2, 1, &dna13.matrix),
+            q,
+            s,
+            2,
+            1,
+            &dna13.matrix,
+            ("1D3M", "1D3=", 3, 1, 0),
+        );
+
+        let q = b"GAC";
+        let s = b"AGC";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 2, 1, &dna13.matrix),
+            q,
+            s,
+            2,
+            1,
+            &dna13.matrix,
+            ("1D1M1I1M", "1D1=1I1=", 2, 2, -4),
+        );
+
+        let q = b"XXXXACGTXXXX";
+        let s = b"ACGT";
+        assert_cpp_alignment_fixture(
+            &lcl_align(q, s, 5, 2, &dna23.matrix),
+            q,
+            s,
+            5,
+            2,
+            &dna23.matrix,
+            ("4S4M4S", "4S4=4S", 4, 0, 8),
+        );
+
+        let q = b"ACGT";
+        let s = b"XXXACGTXXX";
+        assert_cpp_alignment_fixture(
+            &lcl_align(q, s, 5, 2, &dna23.matrix),
+            q,
+            s,
+            5,
+            2,
+            &dna23.matrix,
+            ("4M", "4=", 4, 0, 8),
+        );
+
+        let q = b"AAAA";
+        let s = b"TTTT";
+        assert_cpp_alignment_fixture(
+            &lcl_align(q, s, 5, 2, &dna13.matrix),
+            q,
+            s,
+            5,
+            2,
+            &dna13.matrix,
+            ("4S", "4S", 0, 0, 0),
+        );
+
+        let q = b"ACGTTTGT";
+        let s = b"ACGT";
+        assert_cpp_alignment_fixture(
+            &lcl_align(q, s, 3, 1, &dna23.matrix),
+            q,
+            s,
+            3,
+            1,
+            &dna23.matrix,
+            ("4M4S", "4=4S", 4, 0, 8),
+        );
+
+        let q = b"ACGTAC";
+        let s = b"TACGTA";
+        assert_cpp_alignment_fixture(
+            &lcl_align(q, s, 5, 2, &dna23.matrix),
+            q,
+            s,
+            5,
+            2,
+            &dna23.matrix,
+            ("5M1S", "5=1S", 5, 0, 10),
+        );
+
+        let blosum62 = SMatrix::new_blosum62();
+
+        let q = b"ARND";
+        let s = b"ARND";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 11, 1, &blosum62.matrix),
+            q,
+            s,
+            11,
+            1,
+            &blosum62.matrix,
+            ("4M", "4=", 4, 0, 21),
+        );
+
+        let q = b"ARND";
+        let s = b"ARNE";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 11, 1, &blosum62.matrix),
+            q,
+            s,
+            11,
+            1,
+            &blosum62.matrix,
+            ("4M", "3=1X", 3, 1, 17),
+        );
+
+        let q = b"ARND";
+        let s = b"AND";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 11, 1, &blosum62.matrix),
+            q,
+            s,
+            11,
+            1,
+            &blosum62.matrix,
+            ("1M1I2M", "1=1I2=", 3, 1, 4),
+        );
+
+        let q = b"ARNDC";
+        let s = b"ADC";
+        assert_cpp_alignment_fixture(
+            &glb_align(q, s, 11, 1, &blosum62.matrix),
+            q,
+            s,
+            11,
+            1,
+            &blosum62.matrix,
+            ("1M2I2M", "1=2I2=", 3, 2, 6),
+        );
+
+        let q = b"AAR";
+        let s = b"N";
+        assert_cpp_alignment_fixture(
+            &lcl_align(q, s, 11, 1, &blosum62.matrix),
+            q,
+            s,
+            11,
+            1,
+            &blosum62.matrix,
+            ("3S", "3S", 0, 0, 0),
+        );
+
+        let q = b"ACGT";
+        let s = b"ACGT";
+        assert_cpp_alignment_fixture(
+            &band_align(q, s, 5, 2, &dna23.matrix, 5),
+            q,
+            s,
+            5,
+            2,
+            &dna23.matrix,
+            ("4M", "4=", 4, 0, 8),
+        );
+
+        let q = b"ACGT";
+        let s = b"XXXACGTXXX";
+        assert_cpp_alignment_fixture(
+            &band_align(q, s, 5, 2, &dna23.matrix, 9),
+            q,
+            s,
+            5,
+            2,
+            &dna23.matrix,
+            ("4M", "4=", 4, 0, 8),
+        );
+
+        let q = b"ACGT";
+        let s = b"XXXACGTXXX";
+        assert_cpp_alignment_fixture(
+            &band_align(q, s, 5, 2, &dna23.matrix, 1),
+            q,
+            s,
+            5,
+            2,
+            &dna23.matrix,
+            ("4S", "4S", 0, 0, 0),
+        );
+
+        let q = b"ACGT";
+        let s = b"ACGT";
+        assert_cpp_alignment_fixture(
+            &vari_band_align(q, s, 5, 2, &dna23.matrix, &[(0, 3); 4]),
+            q,
+            s,
+            5,
+            2,
+            &dna23.matrix,
+            ("4M", "4=", 4, 0, 8),
+        );
+
+        let q = b"ACGT";
+        let s = b"TCGA";
+        assert_cpp_alignment_fixture(
+            &vari_band_align(q, s, 5, 2, &dna23.matrix, &[(0, 0), (1, 1), (2, 2), (3, 3)]),
+            q,
+            s,
+            5,
+            2,
+            &dna23.matrix,
+            ("1S2M1S", "1S2=1S", 2, 0, 4),
+        );
     }
 
     #[test]

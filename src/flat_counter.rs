@@ -148,7 +148,7 @@ impl FlatKmerCount {
 
     /// Memory footprint in bytes
     pub fn memory_footprint(&self) -> usize {
-        self.entries.capacity() * 16  // 16 bytes per (u64, u64)
+        self.entries.capacity() * 16 // 16 bytes per (u64, u64)
     }
 
     /// Iterate over all entries

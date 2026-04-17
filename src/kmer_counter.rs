@@ -29,7 +29,8 @@ pub fn count_kmers(
 
     // Phase 1: Bloom filter pass (optional) — also populates the bloom filter for phase 2
     let bloom = if !skip_bloom {
-        let (bf, est_above, est_uniq) = bloom_filter_pass(reads, kmer_len, min_count, estimated_kmer_num);
+        let (bf, est_above, est_uniq) =
+            bloom_filter_pass(reads, kmer_len, min_count, estimated_kmer_num);
         eprintln!(
             "Estimated kmers above threshold: {} Estimated uniq kmers: {}",
             est_above, est_uniq
@@ -137,15 +138,23 @@ fn build_bloom_filter(
         / 2.0f64.ln()) as usize;
     let hash_num = (-false_positive_rate.ln() / 2.0f64.ln()).ceil() as usize;
 
+    let bloom =
+        ConcurrentBlockedBloomFilter::new(bloom_table_size, counter_bit_size, hash_num, min_count);
+    let block_bytes = 128usize;
+    let elements_in_block = 8 * block_bytes / counter_bit_size;
+    let blocks = bloom.table_size() / elements_in_block;
+    let table_footprint = (block_bytes + 1) * blocks;
+    let footprint_mb = 0.1 * (table_footprint / 100000) as f64;
+
     eprintln!(
         "\nBloom table size: {}({}MB) Counter bit size: {} Hash num: {}",
-        bloom_table_size,
-        bloom_table_size * counter_bit_size / 8 / 1000000,
+        bloom.table_size(),
+        footprint_mb,
         counter_bit_size,
         hash_num
     );
 
-    ConcurrentBlockedBloomFilter::new(bloom_table_size, counter_bit_size, hash_num, min_count)
+    bloom
 }
 
 /// Get canonical k-mer info: (is_plus, hashp, hashm)
@@ -176,7 +185,11 @@ fn count_kmers_in_holder(
         let is_plus = kmer < rkmer;
         let canonical = if is_plus { &kmer } else { &rkmer };
         let hashp = canonical.oahash();
-        let hashm = if is_plus { rkmer.oahash() } else { kmer.oahash() };
+        let hashm = if is_plus {
+            rkmer.oahash()
+        } else {
+            kmer.oahash()
+        };
 
         // Check bloom filter gate
         if let Some(bf) = bloom {
@@ -209,11 +222,9 @@ mod tests {
     fn make_test_reads() -> Vec<ReadPair> {
         let data_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data");
         let fasta = data_dir.join("small_test.fasta");
-        let rg = crate::reads_getter::ReadsGetter::new(
-            &[fasta.to_str().unwrap().to_string()],
-            false,
-        )
-        .unwrap();
+        let rg =
+            crate::reads_getter::ReadsGetter::new(&[fasta.to_str().unwrap().to_string()], false)
+                .unwrap();
         rg.reads().to_vec()
     }
 

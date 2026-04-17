@@ -29,10 +29,8 @@ pub fn nuc_prot_align(
             continue;
         }
         let nuc_slice = &nuc[frame..];
-        let translated = genetic_code.translate(
-            std::str::from_utf8(nuc_slice).unwrap_or(""),
-            false,
-        );
+        let translated =
+            genetic_code.translate(std::str::from_utf8(nuc_slice).unwrap_or(""), false);
         let prot_bytes = translated.as_bytes();
 
         if prot_bytes.is_empty() {
@@ -52,10 +50,7 @@ pub fn nuc_prot_align(
 }
 
 /// Translate a nucleotide sequence to protein in all 6 frames (3 forward + 3 reverse).
-pub fn six_frame_translation(
-    nuc: &str,
-    genetic_code: &GeneticCode,
-) -> Vec<(String, usize, bool)> {
+pub fn six_frame_translation(nuc: &str, genetic_code: &GeneticCode) -> Vec<(String, usize, bool)> {
     // (protein, frame, is_reverse)
     let mut results = Vec::new();
 

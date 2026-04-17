@@ -62,6 +62,15 @@ macro_rules! define_kmer_enum {
                 }
             }
 
+            /// Create a Kmer from ASCII nucleotide bytes.
+            pub fn from_ascii_bytes(kmer: &[u8]) -> Self {
+                let p = precision_for_kmer(kmer.len());
+                match p {
+                    $($n => Kmer::$variant(LargeInt::from_ascii_bytes(kmer)),)+
+                    _ => panic!("unsupported kmer precision {}", p),
+                }
+            }
+
             /// Create from iterator of nucleotide chars, with known k-mer length
             pub fn from_chars(kmer_len: usize, iter: impl Iterator<Item = char>) -> Self {
                 let p = precision_for_kmer(kmer_len);
@@ -449,15 +458,15 @@ mod tests {
     fn test_resize() {
         let k = Kmer::from_kmer_str("ACGTACGTACGTACGTACGTA"); // 21-mer, precision 1
         let k2 = k.resize(65); // needs precision 3
-        // The 21 rightmost bases should be preserved
+                               // The 21 rightmost bases should be preserved
         assert_eq!(k2.to_kmer_string(21), "ACGTACGTACGTACGTACGTA");
     }
 
     #[test]
     #[should_panic(expected = "precision mismatch")]
     fn test_mismatched_precision_panics() {
-        let a = Kmer::from_u64(21, 1);  // precision 1
-        let b = Kmer::from_u64(65, 1);  // precision 3
+        let a = Kmer::from_u64(21, 1); // precision 1
+        let b = Kmer::from_u64(65, 1); // precision 3
         let _ = a + b; // should panic
     }
 }

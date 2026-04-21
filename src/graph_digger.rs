@@ -14,6 +14,23 @@ use crate::contig::{ContigSequence, ContigSequenceList};
 use crate::counter::KmerCount;
 use crate::histogram::Bins;
 use crate::kmer::Kmer;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static DEBUG_EXTENSION_TRACE_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+fn debug_extension_trace_limit() -> Option<usize> {
+    std::env::var("SKESA_DEBUG_EXTENSION_TRACE")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+}
+
+fn debug_extension_trace_enabled(trace_id: usize) -> bool {
+    debug_extension_trace_limit().is_some_and(|limit| trace_id < limit)
+}
+
+fn debug_seed_trace_enabled() -> bool {
+    std::env::var_os("SKESA_DEBUG_SEED_TRACE").is_some()
+}
 
 /// Parameters for the graph traversal algorithm
 pub struct DiggerParams {
@@ -100,6 +117,15 @@ pub fn assemble_contigs_with_visited(
             continue;
         }
 
+        if debug_seed_trace_enabled() {
+            eprintln!(
+                "SEED_TRACE consider idx={} seed={} count={}",
+                seed_idx,
+                seed_kmer.to_kmer_string(kmer_len),
+                total_count
+            );
+        }
+
         visited[seed_idx] = true;
 
         // Extend right with endpoint tracking
@@ -128,6 +154,32 @@ pub fn assemble_contigs_with_visited(
         full_seq.extend(seed_str.chars());
         full_seq.extend(&right_ext.sequence);
 
+        if debug_seed_trace_enabled() {
+            let left_endpoint = left_ext
+                .last_kmer
+                .map(|k| k.to_kmer_string(kmer_len))
+                .unwrap_or_else(|| "-".to_string());
+            let right_endpoint = right_ext
+                .last_kmer
+                .map(|k| k.to_kmer_string(kmer_len))
+                .unwrap_or_else(|| "-".to_string());
+            let full_seq_str: String = full_seq.iter().collect();
+            let prefix_len = full_seq_str.len().min(30);
+            let suffix_start = full_seq_str.len().saturating_sub(30);
+            eprintln!(
+                "SEED_TRACE assembled idx={} seed={} left_len={} right_len={} total_len={} left_denied={} right_denied={} prefix={} suffix={}",
+                seed_idx,
+                seed_str,
+                left_ext.sequence.len(),
+                right_ext.sequence.len(),
+                full_seq_str.len(),
+                left_endpoint,
+                right_endpoint,
+                &full_seq_str[..prefix_len],
+                &full_seq_str[suffix_start..]
+            );
+        }
+
         if full_seq.len() >= kmer_len {
             mark_contig_kmers(&full_seq, kmers, kmer_len, &mut visited);
 
@@ -143,7 +195,6 @@ pub fn assemble_contigs_with_visited(
                     left_ext.sequence.len() + seed_str.len(),
                 )
             };
-
             // Record endpoint k-mers (denied nodes) for contig connection
             let precision = kmer_len.div_ceil(32);
             contig.right_endpoint = right_ext.last_kmer.map(|k| {
@@ -159,26 +210,27 @@ pub fn assemble_contigs_with_visited(
             });
 
             contigs.push(contig);
+        } else if debug_seed_trace_enabled() {
+            eprintln!(
+                "SEED_TRACE reject_short idx={} seed={} total_len={}",
+                seed_idx,
+                seed_str,
+                full_seq.len()
+            );
         }
     }
 
     // Sort contigs by length descending
     contigs.sort();
-
-    // Remove contigs shorter than kmer_len
     contigs.retain(|c| c.len_min() >= kmer_len);
 
-    // Connect contigs that met at the same denied node (fork point)
     connect_at_denied_nodes(&mut contigs, kmer_len);
-
-    // Join contigs that share k-1 overlap at their ends
     join_overlapping_contigs(&mut contigs, kmer_len);
-
-    // Connect contigs through graph paths (BFS-based)
-    connect_contigs_through_graph(&mut contigs, kmers, kmer_len);
-
-    // Remove contigs that are contained within longer contigs
-
+    // Note: BFS-based connect_contigs_through_graph is NOT called here in
+    // initial seed assembly. C++ ConnectOverlappingContigs (graphdigger.hpp:
+    // 2649) only joins contigs with direct k-mer-level sequence overlap;
+    // BFS-finding-paths between endpoints over-extends through graph paths
+    // C++ would not bridge. The overlap join above is the C++ equivalent.
     deduplicate_contigs(contigs)
 }
 
@@ -291,14 +343,157 @@ fn find_all_successors(
     find_successors_from_branches(kmers, current, kmer_len, max_kmer, low_count)
 }
 
-/// Filter successors by abundance (noise-to-signal ratio).
+/// Filter successors by abundance (noise-to-signal ratio). Mirrors the
+/// low-abundance branch of C++ `FilterLowAbundanceNeighbors`
+/// (graphdigger.hpp:1770): stable-sort by abundance descending with
+/// nucleotide as the secondary key, then drop successors at or below
+/// `fraction × total` abundance.
 fn filter_by_abundance(successors: &mut Vec<SuccessorCandidate>, fraction: f64) {
     if successors.len() > 1 {
-        successors.sort_by(|a, b| b.abundance.cmp(&a.abundance));
+        successors.sort_by(|a, b| {
+            b.abundance
+                .cmp(&a.abundance)
+                .then_with(|| a.nt.cmp(&b.nt))
+        });
         let total_abundance: u32 = successors.iter().map(|s| s.abundance).sum();
         let threshold = (fraction * total_abundance as f64) as u32;
         successors.retain(|s| s.abundance > threshold);
     }
+}
+
+/// Illumina GGT→GG[ACG] strand-bias filter (graphdigger.hpp:1794-1816).
+/// When the graph is stranded and >1 successors exist, any successor whose
+/// oriented k-mer ends in "GGT" is the likely-true target. Other successors
+/// whose **minus-strand** count is below `factor × fraction × target_minus`
+/// are dropped as reverse-strand artifacts. No-op when no GGT target exists
+/// or when the target is low abundance.
+fn filter_illumina_ggt(
+    successors: &mut Vec<SuccessorCandidate>,
+    kmers: &KmerCount,
+    kmer_len: usize,
+    fraction: f64,
+) {
+    if successors.len() < 2 {
+        return;
+    }
+    let minus_count = |s: &SuccessorCandidate| -> f64 {
+        let count = kmers.get_count(s.index);
+        let plus_frac = ((count >> 48) as u16) as f64 / u16::MAX as f64;
+        s.abundance as f64 * (1.0 - plus_frac)
+    };
+    let target_idx = successors.iter().position(|s| {
+        let seq = s.kmer.to_kmer_string(kmer_len);
+        seq.len() >= 3 && &seq[seq.len() - 3..] == "GGT"
+    });
+    let Some(target_idx) = target_idx else { return };
+    if successors[target_idx].abundance <= 5 {
+        return;
+    }
+    let factor = 0.1;
+    let am = minus_count(&successors[target_idx]);
+    let threshold = factor * fraction * am;
+    successors.retain(|s| minus_count(s) >= threshold);
+}
+
+/// Illumina ACC-based strand-noise filter (graphdigger.hpp:1838-1860).
+/// Complement of the GGT filter, on the forward strand: when the most-likely
+/// 3-base extension from a successor is "ACC", compare its plus-strand count
+/// against other successors and drop plus-strand-depleted ones. Only runs
+/// when `check_extension` is false OR the top successor is weak (≤ 5). Walks
+/// 2 more steps via `find_all_successors` to form the 3-base probe.
+fn filter_illumina_acc(
+    successors: &mut Vec<SuccessorCandidate>,
+    kmers: &KmerCount,
+    kmer_len: usize,
+    max_kmer: &Kmer,
+    fraction: f64,
+    low_count: usize,
+    check_extension: bool,
+) {
+    if successors.len() < 2 {
+        return;
+    }
+    if check_extension && successors[0].abundance > 5 {
+        return;
+    }
+    const BIN2NT: [char; 4] = ['A', 'C', 'T', 'G'];
+    let plus_count = |s: &SuccessorCandidate| -> f64 {
+        let count = kmers.get_count(s.index);
+        let plus_frac = ((count >> 48) as u16) as f64 / u16::MAX as f64;
+        s.abundance as f64 * plus_frac
+    };
+    // `MostLikelySeq(suc, 3)` = `suc.nt + MostLikelyExtension(suc.node, 2)`.
+    // We walk 2 more highest-abundance steps from the successor's kmer.
+    let most_likely_3 = |s: &SuccessorCandidate| -> String {
+        let mut out = String::with_capacity(3);
+        out.push(BIN2NT[s.nt as usize]);
+        let mut cur = s.kmer;
+        for _ in 0..2 {
+            let mut nexts = find_all_successors(kmers, &cur, kmer_len, max_kmer, low_count);
+            if nexts.is_empty() {
+                break;
+            }
+            nexts.sort_by(|a, b| {
+                b.abundance.cmp(&a.abundance).then_with(|| a.nt.cmp(&b.nt))
+            });
+            out.push(BIN2NT[nexts[0].nt as usize]);
+            cur = nexts[0].kmer;
+        }
+        out
+    };
+    let target_idx = successors.iter().position(|s| most_likely_3(s) == "ACC");
+    let Some(target_idx) = target_idx else { return };
+    if successors[target_idx].abundance <= 5 {
+        return;
+    }
+    let factor = 0.1;
+    let ap = plus_count(&successors[target_idx]);
+    let threshold = factor * fraction * ap;
+    successors.retain(|s| plus_count(s) >= threshold);
+}
+
+/// Strand-balance filter for stranded graphs. Removes successors with very
+/// imbalanced plus/minus strand counts, matching C++ FilterNeighbors at
+/// graphdigger.hpp:1862-1885.
+///
+/// Triggers only when at least one well-supported successor (abundance >=
+/// low_count) has both strands represented (min(plus, minus) > 0.25).
+/// Successors with abundance > 1 and minor-strand fraction below
+/// 0.1 * fraction × major-strand fraction are dropped as Illumina
+/// strand-bias artifacts. No-op on unstranded graphs because plus_fraction
+/// is 0.5 throughout.
+fn filter_by_strand_balance(
+    successors: &mut Vec<SuccessorCandidate>,
+    kmers: &KmerCount,
+    fraction: f64,
+    low_count: usize,
+) {
+    if successors.len() < 2 {
+        return;
+    }
+    let plus_frac = |s: &SuccessorCandidate| -> f64 {
+        let count = kmers.get_count(s.index);
+        ((count >> 48) as u16) as f64 / u16::MAX as f64
+    };
+    let has_both = successors.iter().any(|s| {
+        if s.abundance < low_count as u32 {
+            return false;
+        }
+        let p = plus_frac(s);
+        p.min(1.0 - p) > 0.25
+    });
+    if !has_both {
+        return;
+    }
+    let strand_fraction = 0.1 * fraction;
+    successors.retain(|s| {
+        if s.abundance <= 1 {
+            return true;
+        }
+        let p = plus_frac(s);
+        let m = 1.0 - p;
+        p.min(m) >= strand_fraction * p.max(m)
+    });
 }
 
 /// Check if a successor can extend for at least `min_len` steps.
@@ -362,16 +557,24 @@ fn find_and_filter_successors(
     // Filter by abundance ratio (keep all regardless of visited status)
     filter_by_abundance(&mut successors, fraction);
 
+    // Illumina GGT→GG[ACG] strand-noise filter (graphdigger.hpp:1794-1816).
+    filter_illumina_ggt(&mut successors, kmers, kmer_len, fraction);
+
+    // Illumina ACC-based strand-noise filter (graphdigger.hpp:1838-1860).
+    filter_illumina_acc(&mut successors, kmers, kmer_len, max_kmer, fraction, low_count, true);
+
+    // Strand-balance filter for stranded graphs (matches C++ FilterNeighbors
+    // at graphdigger.hpp:1862-1885) — removes Illumina strand-bias artifacts.
+    filter_by_strand_balance(&mut successors, kmers, fraction, low_count);
+
     // Dead-end trimming: remove successors that are dead-end branches.
-    // A successor is considered a dead end if it can't extend for kmer_len steps.
-    // This is the core of SKESA's ExtendableSuccessor heuristic.
+    // C++ ExtendableSuccessor (graphdigger.hpp:1657) descends
+    // `max(100, kmer_len)` steps; Rust mirrors that depth here.
     if successors.len() > 1 && jump > 0 && successors[0].abundance > 5 {
-        let check_len = kmer_len;
-        // Check each successor except the strongest one
-        let mut i = successors.len();
-        while i > 1 {
-            i -= 1;
-            if !is_extendable(
+        let check_len = kmer_len.max(100);
+        let mut i = 0;
+        while i < successors.len() {
+            if is_extendable(
                 kmers,
                 &successors[i].kmer,
                 kmer_len,
@@ -380,6 +583,8 @@ fn find_and_filter_successors(
                 fraction,
                 low_count,
             ) {
+                i += 1;
+            } else {
                 successors.remove(i);
             }
         }
@@ -402,6 +607,20 @@ fn has_backward_reachability(
     let rc = node.revcomp(kmer_len);
     let mut predecessors = find_all_successors(kmers, &rc, kmer_len, max_kmer, low_count);
     filter_by_abundance(&mut predecessors, fraction);
+    filter_illumina_ggt(&mut predecessors, kmers, kmer_len, fraction);
+    filter_illumina_acc(&mut predecessors, kmers, kmer_len, max_kmer, fraction, low_count, true);
+    // Match C++ FilterNeighbors(predecessors, true) which applies both the
+    // ExtendableSuccessor dead-end trim and the strand-balance filter on the
+    // predecessor lookup.
+    if predecessors.len() > 1
+        && predecessors[0].abundance > 5
+    {
+        let check_len = kmer_len.max(100);
+        predecessors.retain(|p| {
+            is_extendable(kmers, &p.kmer, kmer_len, max_kmer, check_len, fraction, low_count)
+        });
+    }
+    filter_by_strand_balance(&mut predecessors, kmers, fraction, low_count);
 
     if predecessors.len() != 1 {
         return false;
@@ -532,10 +751,20 @@ fn extend_right_with_endpoint(
     visited: &mut [bool],
     params: &DiggerParams,
 ) -> ExtensionResult {
+    let trace_id = DEBUG_EXTENSION_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let trace_enabled = debug_extension_trace_enabled(trace_id);
     let mut extension = Vec::new();
     let mut forks = Vec::new();
     let mut current = *start_kmer;
     let bin2nt = ['A', 'C', 'T', 'G'];
+
+    if trace_enabled {
+        eprintln!(
+            "EXT_TRACE start id={} start={}",
+            trace_id,
+            start_kmer.to_kmer_string(kmer_len)
+        );
+    }
 
     loop {
         let successors = find_and_filter_successors(
@@ -550,6 +779,14 @@ fn extend_right_with_endpoint(
         );
 
         if successors.is_empty() {
+            if trace_enabled {
+                eprintln!(
+                    "EXT_TRACE stop id={} reason=dead_end current={} ext_len={}",
+                    trace_id,
+                    current.to_kmer_string(kmer_len),
+                    extension.len()
+                );
+            }
             return ExtensionResult {
                 sequence: extension,
                 last_kmer: None,
@@ -558,9 +795,30 @@ fn extend_right_with_endpoint(
         }
 
         let suc = &successors[0];
+        if trace_enabled {
+            let succ_desc = successors
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}:{}:{}:{}",
+                        bin2nt[s.nt as usize],
+                        s.abundance,
+                        s.index,
+                        s.kmer.to_kmer_string(kmer_len)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "EXT_TRACE step id={} current={} successors=[{}]",
+                trace_id,
+                current.to_kmer_string(kmer_len),
+                succ_desc
+            );
+        }
 
         if successors.len() == 1 {
-            if !has_backward_reachability(
+            let backward_ok = has_backward_reachability(
                 kmers,
                 &suc.kmer,
                 &current,
@@ -568,7 +826,24 @@ fn extend_right_with_endpoint(
                 max_kmer,
                 params.fraction,
                 params.low_count,
-            ) {
+            );
+            if trace_enabled {
+                eprintln!(
+                    "EXT_TRACE check id={} kind=backward succ={} ok={}",
+                    trace_id,
+                    suc.kmer.to_kmer_string(kmer_len),
+                    backward_ok
+                );
+            }
+            if !backward_ok {
+                if trace_enabled {
+                    eprintln!(
+                        "EXT_TRACE stop id={} reason=backward_mismatch denied={} ext_len={}",
+                        trace_id,
+                        suc.kmer.to_kmer_string(kmer_len),
+                        extension.len()
+                    );
+                }
                 return ExtensionResult {
                     sequence: extension,
                     last_kmer: Some(suc.kmer),
@@ -576,6 +851,15 @@ fn extend_right_with_endpoint(
                 };
             }
         } else if !params.allow_snps {
+            if trace_enabled {
+                eprintln!(
+                    "EXT_TRACE stop id={} reason=fork_no_snps denied={} fork_size={} ext_len={}",
+                    trace_id,
+                    suc.kmer.to_kmer_string(kmer_len),
+                    successors.len(),
+                    extension.len()
+                );
+            }
             return ExtensionResult {
                 sequence: extension,
                 last_kmer: Some(suc.kmer),
@@ -616,6 +900,14 @@ fn extend_right_with_endpoint(
                     };
 
                     if backward_ok {
+                        if trace_enabled {
+                            eprintln!(
+                                "EXT_TRACE snp_accept id={} convergence={} ext_len={}",
+                                trace_id,
+                                conv.to_kmer_string(kmer_len),
+                                extension.len()
+                            );
+                        }
                         // SNP validated! Record and skip through
                         forks.push(ForkInfo {
                             position: extension.len(),
@@ -650,6 +942,15 @@ fn extend_right_with_endpoint(
         }
 
         if visited[suc.index] {
+            if trace_enabled {
+                eprintln!(
+                    "EXT_TRACE stop id={} reason=visited denied={} index={} ext_len={}",
+                    trace_id,
+                    suc.kmer.to_kmer_string(kmer_len),
+                    suc.index,
+                    extension.len()
+                );
+            }
             return ExtensionResult {
                 sequence: extension,
                 last_kmer: Some(suc.kmer),
@@ -660,6 +961,15 @@ fn extend_right_with_endpoint(
         visited[suc.index] = true;
         extension.push(bin2nt[suc.nt as usize]);
         current = suc.kmer;
+        if trace_enabled {
+            eprintln!(
+                "EXT_TRACE advance id={} nt={} next={} ext_len={}",
+                trace_id,
+                bin2nt[suc.nt as usize],
+                current.to_kmer_string(kmer_len),
+                extension.len()
+            );
+        }
     }
 }
 
@@ -863,6 +1173,14 @@ fn find_unique_path(
 
 /// Connect contigs by finding paths from each contig's endpoint to another contig's start.
 /// Uses a single BFS from each endpoint that checks against ALL target contigs simultaneously.
+///
+/// Currently NOT called from the production assembly pipeline — C++
+/// ConnectOverlappingContigs (graphdigger.hpp:2649) only joins contigs with
+/// direct k-mer-level sequence overlap, which `join_overlapping_contigs` /
+/// `merge_overlapping_contigs` already cover. BFS-based path finding here
+/// over-extends through graph paths C++ would not bridge. Retained for
+/// future fixtures that may need it explicitly.
+#[allow(dead_code)]
 pub fn connect_contigs_through_graph(
     contigs: &mut ContigSequenceList,
     kmers: &KmerCount,
@@ -879,28 +1197,156 @@ pub fn connect_contigs_through_graph(
     let max_steps = kmer_len; // Connect within kmer_len steps
     let bin2nt = ['A', 'C', 'T', 'G'];
 
+    let seqs: Vec<String> = contigs.iter().map(|c| c.primary_sequence()).collect();
+    let mut first_kmer_map: HashMap<Vec<u64>, usize> = HashMap::new();
+    for (i, seq) in seqs.iter().enumerate() {
+        if seq.len() >= kmer_len {
+            let first_kmer = Kmer::from_kmer_str(&seq[..kmer_len]);
+            let rkmer = first_kmer.revcomp(kmer_len);
+            let canonical = if first_kmer < rkmer { first_kmer } else { rkmer };
+            let key = canonical.to_words()[..precision].to_vec();
+            first_kmer_map.entry(key).or_insert(i);
+        }
+    }
+
+    // Find the right-neighbor (if any) for each contig via BFS from its last
+    // k-mer. A right-neighbor is determined by a single reachable first_kmer
+    // among all contigs within max_steps.
+    let find_neighbor = |i: usize, seqs: &[String]| -> Option<(usize, Vec<char>)> {
+        if seqs[i].len() < kmer_len {
+            return None;
+        }
+        let last_kmer = Kmer::from_kmer_str(&seqs[i][seqs[i].len() - kmer_len..]);
+        let mut frontier: Vec<(Kmer, Vec<char>)> = Vec::new();
+        let mut merge_info: Option<(usize, Vec<char>)> = None;
+
+        let succs = find_all_successors(kmers, &last_kmer, kmer_len, &max_kmer, 2);
+        for suc in &succs {
+            let canonical = {
+                let r = suc.kmer.revcomp(kmer_len);
+                if suc.kmer < r { suc.kmer } else { r }
+            };
+            let key = canonical.to_words()[..precision].to_vec();
+            if let Some(&right_idx) = first_kmer_map.get(&key) {
+                if right_idx != i {
+                    return Some((right_idx, vec![bin2nt[suc.nt as usize]]));
+                }
+            }
+            frontier.push((suc.kmer, vec![bin2nt[suc.nt as usize]]));
+        }
+
+        for _step in 1..max_steps {
+            if frontier.is_empty() || frontier.len() > 50 {
+                break;
+            }
+            let mut next_frontier = Vec::new();
+            let mut found = false;
+            for (node, path) in &frontier {
+                let succs = find_all_successors(kmers, node, kmer_len, &max_kmer, 2);
+                for suc in &succs {
+                    let canonical = {
+                        let r = suc.kmer.revcomp(kmer_len);
+                        if suc.kmer < r { suc.kmer } else { r }
+                    };
+                    let key = canonical.to_words()[..precision].to_vec();
+                    if let Some(&right_idx) = first_kmer_map.get(&key) {
+                        if right_idx != i {
+                            let mut p = path.clone();
+                            p.push(bin2nt[suc.nt as usize]);
+                            if merge_info.is_some() {
+                                // Ambiguous — give up on this contig.
+                                return None;
+                            }
+                            merge_info = Some((right_idx, p));
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        let mut p = path.clone();
+                        p.push(bin2nt[suc.nt as usize]);
+                        next_frontier.push((suc.kmer, p));
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+            if found || merge_info.is_some() {
+                break;
+            }
+            frontier = next_frontier;
+        }
+
+        merge_info
+    };
+
+    // Compute each contig's right-neighbor-if-unique once, then chain-walk.
+    let neighbors: Vec<Option<(usize, Vec<char>)>> =
+        (0..contigs.len()).map(|i| find_neighbor(i, &seqs)).collect();
+
+    let mut consumed = vec![false; contigs.len()];
+    let mut new_contigs: ContigSequenceList = Vec::with_capacity(contigs.len());
+
+    for start in 0..contigs.len() {
+        if consumed[start] {
+            continue;
+        }
+        let mut chain: Vec<(usize, Option<Vec<char>>)> = vec![(start, None)];
+        consumed[start] = true;
+        let mut cur = start;
+        while let Some((next, path)) = neighbors[cur].as_ref() {
+            if consumed[*next] || *next == cur {
+                break;
+            }
+            chain.push((*next, Some(path.clone())));
+            consumed[*next] = true;
+            cur = *next;
+        }
+
+        if chain.len() == 1 {
+            new_contigs.push(std::mem::replace(
+                &mut contigs[start],
+                ContigSequence::new(),
+            ));
+            continue;
+        }
+
+        let mut merged: Vec<char> = seqs[chain[0].0].chars().collect();
+        for (idx, path_opt) in &chain[1..] {
+            if let Some(p) = path_opt {
+                merged.extend(p.iter().copied());
+            }
+            let s = &seqs[*idx];
+            if s.len() > kmer_len - 1 {
+                merged.extend(s[kmer_len - 1..].chars());
+            }
+        }
+        let mut nc = ContigSequence::new();
+        nc.insert_new_chunk_with(merged);
+        new_contigs.push(nc);
+    }
+
+    *contigs = new_contigs;
+    contigs.sort();
+    return;
+
+    // Legacy loop-based body — superseded by the single-pass chain walk above.
+    #[allow(unreachable_code)]
     loop {
         let mut merged_any = false;
-
-        // Build map: first k-mer (canonical) -> contig index
         let seqs: Vec<String> = contigs.iter().map(|c| c.primary_sequence()).collect();
         let mut first_kmer_map: HashMap<Vec<u64>, usize> = HashMap::new();
         for (i, seq) in seqs.iter().enumerate() {
             if seq.len() >= kmer_len {
                 let first_kmer = Kmer::from_kmer_str(&seq[..kmer_len]);
                 let rkmer = first_kmer.revcomp(kmer_len);
-                let canonical = if first_kmer < rkmer {
-                    first_kmer
-                } else {
-                    rkmer
-                };
+                let canonical = if first_kmer < rkmer { first_kmer } else { rkmer };
                 let key = canonical.to_words()[..precision].to_vec();
                 first_kmer_map.entry(key).or_insert(i);
             }
         }
 
         let mut merge_info = None;
-
         // For each contig, do a single BFS from its last k-mer
         for (i, seq) in seqs.iter().enumerate() {
             if seq.len() < kmer_len {
@@ -1023,45 +1469,115 @@ pub fn connect_contigs_through_graph(
 /// Remove contigs that are substrings of longer contigs or share significant overlap.
 /// Assumes contigs are sorted by length descending.
 fn deduplicate_contigs(contigs: ContigSequenceList) -> ContigSequenceList {
+    use std::collections::HashMap;
+
     if contigs.len() <= 1 {
         return contigs;
     }
 
-    let mut kept = Vec::new();
+    // Index kept contigs by 21-mer probes (canonical form) so that containment
+    // checks against shorter probes can short-circuit without scanning every
+    // prior sequence. Without the index this step is O(N²) substring search
+    // and becomes the dominant cost on real data (40k+ raw contigs).
+    const PROBE_K: usize = 21;
+    const PROBE_STRIDE: usize = 21; // non-overlapping probes — one every 21 bp
+    let mut kept: ContigSequenceList = Vec::new();
     let mut kept_seqs: Vec<String> = Vec::new();
+    let mut kept_rc: Vec<String> = Vec::new();
+    // Probe k-mer (canonical 42-bit packed) → Vec<kept index>
+    let mut probe_idx: HashMap<u64, Vec<u32>> = HashMap::new();
+
+    // Convert k-mer string (ACGT only) to packed u64 using SKESA encoding.
+    // Returns None if any non-ACGT byte is present.
+    fn pack_kmer(bytes: &[u8]) -> Option<u64> {
+        let mut v: u64 = 0;
+        for &b in bytes {
+            let bits = match b {
+                b'A' | b'a' => 0u64,
+                b'C' | b'c' => 1,
+                b'T' | b't' => 2,
+                b'G' | b'g' => 3,
+                _ => return None,
+            };
+            v = (v << 2) | bits;
+        }
+        Some(v)
+    }
+    fn canonical(k: u64, klen: usize) -> u64 {
+        // Reverse-complement: reverse 2-bit nucleotide order, XOR to complement
+        // (A↔T, C↔G via 0↔2 and 1↔3).
+        let mut rc = k;
+        rc = ((rc >> 2) & 0x3333_3333_3333_3333) | ((rc & 0x3333_3333_3333_3333) << 2);
+        rc = ((rc >> 4) & 0x0F0F_0F0F_0F0F_0F0F) | ((rc & 0x0F0F_0F0F_0F0F_0F0F) << 4);
+        rc = ((rc >> 8) & 0x00FF_00FF_00FF_00FF) | ((rc & 0x00FF_00FF_00FF_00FF) << 8);
+        rc = ((rc >> 16) & 0x0000_FFFF_0000_FFFF) | ((rc & 0x0000_FFFF_0000_FFFF) << 16);
+        rc = (rc >> 32) | (rc << 32);
+        rc ^= 0xAAAA_AAAA_AAAA_AAAA;
+        rc >>= 2 * (32 - klen);
+        if k < rc { k } else { rc }
+    }
 
     for contig in contigs {
         let seq = contig.primary_sequence();
+        if seq.len() < PROBE_K {
+            // Too short to probe — fall back to the simple O(kept) scan.
+            let rc_seq: String = seq.chars().rev().map(crate::model::complement).collect();
+            let is_contained = kept_seqs
+                .iter()
+                .any(|e| e.contains(&seq) || e.contains(&rc_seq));
+            if !is_contained {
+                kept_seqs.push(seq.clone());
+                kept_rc.push(rc_seq);
+                kept.push(contig);
+            }
+            continue;
+        }
+
+        let bytes = seq.as_bytes();
         let rc_seq: String = seq.chars().rev().map(crate::model::complement).collect();
+        let rc_bytes = rc_seq.as_bytes();
 
-        // Check if this contig is contained in any longer contig
-        let is_contained = kept_seqs
-            .iter()
-            .any(|existing| existing.contains(&seq) || existing.contains(&rc_seq));
-
-        // Check if most of this contig can be found in a longer one
-        // (either as a substring, suffix/prefix overlap, or multiple chunks)
-        let is_mostly_covered = if !is_contained && seq.len() > 100 {
-            // Check: does a longer contig contain a significant chunk from the middle of this one?
-            let chunk_size = seq.len() / 2; // Check if half the contig is in a longer one
-            kept_seqs.iter().any(|existing| {
-                if existing.len() <= seq.len() {
-                    return false;
+        // Gather candidate kept indices: any that share at least one probe
+        // k-mer with the current sequence (forward or rc).
+        let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for probe_start in (0..=bytes.len() - PROBE_K).step_by(PROBE_STRIDE) {
+            if let Some(k) = pack_kmer(&bytes[probe_start..probe_start + PROBE_K]) {
+                let c = canonical(k, PROBE_K);
+                if let Some(ixs) = probe_idx.get(&c) {
+                    candidates.extend(ixs.iter().copied());
                 }
-                // Check middle portion
-                let mid_start = seq.len() / 4;
-                let mid_chunk = &seq[mid_start..mid_start + chunk_size.min(seq.len() - mid_start)];
-                let mid_chunk_rc =
-                    &rc_seq[rc_seq.len() - mid_start - chunk_size.min(seq.len() - mid_start)
-                        ..rc_seq.len() - mid_start];
-                existing.contains(mid_chunk) || existing.contains(mid_chunk_rc)
-            })
-        } else {
-            false
-        };
+            }
+        }
+        for probe_start in (0..=rc_bytes.len() - PROBE_K).step_by(PROBE_STRIDE) {
+            if let Some(k) = pack_kmer(&rc_bytes[probe_start..probe_start + PROBE_K]) {
+                let c = canonical(k, PROBE_K);
+                if let Some(ixs) = probe_idx.get(&c) {
+                    candidates.extend(ixs.iter().copied());
+                }
+            }
+        }
 
-        if !is_contained && !is_mostly_covered {
+        let is_contained = candidates
+            .iter()
+            .any(|&i| kept_seqs[i as usize].contains(&seq) || kept_seqs[i as usize].contains(&rc_seq));
+
+        // The previous "is_mostly_covered" middle-chunk heuristic was a
+        // Rust-only addition; C++ CheckRepeats (graphdigger.hpp:2487) doesn't
+        // do this — it trims `m_left_repeat`/`m_right_repeat` based on graph
+        // ambiguity instead. Keeping only strict containment matches the
+        // observed C++ behavior more closely.
+
+        if !is_contained {
+            let new_idx = kept.len() as u32;
+            // Index all probe k-mers (canonical, non-overlapping) of this new contig.
+            for probe_start in (0..=bytes.len() - PROBE_K).step_by(PROBE_STRIDE) {
+                if let Some(k) = pack_kmer(&bytes[probe_start..probe_start + PROBE_K]) {
+                    let c = canonical(k, PROBE_K);
+                    probe_idx.entry(c).or_default().push(new_idx);
+                }
+            }
             kept_seqs.push(seq);
+            kept_rc.push(rc_seq);
             kept.push(contig);
         }
     }
@@ -1096,7 +1612,9 @@ fn has_significant_overlap(a: &str, b: &str, min_overlap: usize) -> bool {
 
 /// Connect contigs that share the same denied node (fork endpoint).
 /// When contig A's right_endpoint matches contig B's left_endpoint,
-/// they stopped at the same fork and can be merged.
+/// they stopped at the same fork and can be merged. Walks chains in a single
+/// pass with one pre-built endpoint map (was O(N² log N) per loop+sort+remove
+/// pair; now O(N) total).
 fn connect_at_denied_nodes(contigs: &mut ContigSequenceList, kmer_len: usize) {
     use std::collections::HashMap;
 
@@ -1106,129 +1624,143 @@ fn connect_at_denied_nodes(contigs: &mut ContigSequenceList, kmer_len: usize) {
 
     let overlap = kmer_len - 1;
 
-    loop {
-        let mut merged = false;
-
-        // Build map: left_endpoint -> contig index
-        let mut left_ep_map: HashMap<Vec<u64>, usize> = HashMap::new();
-        for (i, contig) in contigs.iter().enumerate() {
-            if let Some(ref ep) = contig.left_endpoint {
-                left_ep_map.entry(ep.clone()).or_insert(i);
-            }
-        }
-
-        // Find a match: some contig's right_endpoint matches another's left_endpoint
-        let mut merge_pair = None;
-        for (i, contig) in contigs.iter().enumerate() {
-            if let Some(ref rep) = contig.right_endpoint {
-                if let Some(&right_idx) = left_ep_map.get(rep) {
-                    if right_idx != i {
-                        merge_pair = Some((i, right_idx));
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some((left_idx, right_idx)) = merge_pair {
-            let left_seq = contigs[left_idx].primary_sequence();
-            let right_seq = contigs[right_idx].primary_sequence();
-
-            // Merge with k-1 overlap (the denied node k-mer connects them)
-            let mut merged_seq: Vec<char> = left_seq.chars().collect();
-            if right_seq.len() > overlap {
-                merged_seq.extend(right_seq[overlap..].chars());
-            }
-
-            let mut new_contig = ContigSequence::new();
-            new_contig.insert_new_chunk_with(merged_seq);
-            // Preserve outer endpoints
-            new_contig.left_endpoint = contigs[left_idx].left_endpoint.clone();
-            new_contig.right_endpoint = contigs[right_idx].right_endpoint.clone();
-
-            let (rem_first, rem_second) = if left_idx > right_idx {
-                (left_idx, right_idx)
-            } else {
-                (right_idx, left_idx)
-            };
-            contigs.remove(rem_first);
-            contigs.remove(rem_second);
-            contigs.push(new_contig);
-            contigs.sort();
-            merged = true;
-        }
-
-        if !merged {
-            break;
+    // Build left_endpoint → contig index once. Match the original first-wins
+    // semantics for duplicate endpoints.
+    let mut left_ep_map: HashMap<Vec<u64>, usize> = HashMap::new();
+    for (i, contig) in contigs.iter().enumerate() {
+        if let Some(ref ep) = contig.left_endpoint {
+            left_ep_map.entry(ep.clone()).or_insert(i);
         }
     }
+
+    let mut consumed = vec![false; contigs.len()];
+    let mut new_contigs: ContigSequenceList = Vec::with_capacity(contigs.len());
+
+    for start in 0..contigs.len() {
+        if consumed[start] {
+            continue;
+        }
+
+        // Walk chain forward from `start` via right_endpoint → left_endpoint match.
+        let mut chain = vec![start];
+        consumed[start] = true;
+        let mut cur = start;
+        loop {
+            let next_idx = match contigs[cur].right_endpoint.as_ref() {
+                Some(rep) => left_ep_map.get(rep).copied(),
+                None => None,
+            };
+            match next_idx {
+                Some(j) if j != cur && !consumed[j] => {
+                    chain.push(j);
+                    consumed[j] = true;
+                    cur = j;
+                }
+                _ => break,
+            }
+        }
+
+        if chain.len() == 1 {
+            // Untouched contig — keep as-is. Move out via swap to avoid a clone.
+            new_contigs.push(std::mem::replace(
+                &mut contigs[start],
+                ContigSequence::new(),
+            ));
+            continue;
+        }
+
+        // Merge chain with k-1 overlap stitching.
+        let mut merged_seq: Vec<char> = contigs[chain[0]].primary_sequence().chars().collect();
+        for &j in &chain[1..] {
+            let s = contigs[j].primary_sequence();
+            if s.len() > overlap {
+                merged_seq.extend(s[overlap..].chars());
+            }
+        }
+
+        let mut new_contig = ContigSequence::new();
+        new_contig.insert_new_chunk_with(merged_seq);
+        new_contig.left_endpoint = contigs[chain[0]].left_endpoint.clone();
+        new_contig.right_endpoint = contigs[*chain.last().unwrap()].right_endpoint.clone();
+        new_contigs.push(new_contig);
+    }
+
+    *contigs = new_contigs;
+    contigs.sort();
 }
 
-/// Join contigs that share suffix/prefix overlaps.
-/// Iteratively merges contigs until no more merges are possible.
+/// Join contigs that share k-1 suffix/prefix overlaps. Walks chains in a
+/// single pass with pre-built prefix/suffix maps (was O(N² log N) per
+/// loop+sort+remove pair; now O(N) total).
 pub fn join_overlapping_contigs(contigs: &mut ContigSequenceList, kmer_len: usize) {
     use std::collections::HashMap;
 
     if contigs.len() < 2 || kmer_len < 2 {
         return;
     }
-
     let min_overlap = kmer_len - 1;
 
-    loop {
-        let mut merged_any = false;
+    let seqs: Vec<String> = contigs.iter().map(|c| c.primary_sequence()).collect();
 
-        // Build suffix map: last min_overlap chars -> index
-        let seqs: Vec<String> = contigs.iter().map(|c| c.primary_sequence()).collect();
-        let mut suffix_map: HashMap<&str, usize> = HashMap::new();
-        for (i, seq) in seqs.iter().enumerate() {
-            if seq.len() >= min_overlap {
-                suffix_map.insert(&seq[seq.len() - min_overlap..], i);
-            }
-        }
-
-        // Find one merge pair
-        let mut merge_pair = None;
-        for (i, seq) in seqs.iter().enumerate() {
-            if seq.len() >= min_overlap {
-                let prefix = &seq[..min_overlap];
-                if let Some(&left_idx) = suffix_map.get(prefix) {
-                    if left_idx != i {
-                        merge_pair = Some((left_idx, i));
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Some((left, right)) = merge_pair {
-            // Merge
-            let left_seq = &seqs[left];
-            let right_seq = &seqs[right];
-            let mut merged: Vec<char> = left_seq.chars().collect();
-            merged.extend(right_seq[min_overlap..].chars());
-
-            let mut new_contig = ContigSequence::new();
-            new_contig.insert_new_chunk_with(merged);
-
-            // Replace: remove both, add merged
-            // Remove higher index first to preserve lower index
-            let (rem_first, rem_second) = if left > right {
-                (left, right)
-            } else {
-                (right, left)
-            };
-            contigs.remove(rem_first);
-            contigs.remove(rem_second);
-            contigs.push(new_contig);
-            contigs.sort();
-            merged_any = true;
-        }
-
-        if !merged_any {
-            break;
+    // prefix(first k-1 chars) → first contig with that prefix.
+    // The original loop's match condition is `prefix(i) == suffix(left_idx)`,
+    // i.e. "find some left whose suffix matches my prefix". Equivalently:
+    // for each contig with a given suffix, the right-neighbor is whichever
+    // contig has that suffix as its prefix.
+    let mut prefix_map: HashMap<&str, usize> = HashMap::new();
+    for (i, seq) in seqs.iter().enumerate() {
+        if seq.len() >= min_overlap {
+            prefix_map.entry(&seq[..min_overlap]).or_insert(i);
         }
     }
+
+    let mut consumed = vec![false; contigs.len()];
+    let mut new_contigs: ContigSequenceList = Vec::with_capacity(contigs.len());
+
+    for start in 0..contigs.len() {
+        if consumed[start] {
+            continue;
+        }
+
+        // Walk chain forward from `start`: while my suffix == some unconsumed
+        // contig's prefix, append that contig and follow.
+        let mut chain = vec![start];
+        consumed[start] = true;
+        let mut cur = start;
+        loop {
+            if seqs[cur].len() < min_overlap {
+                break;
+            }
+            let suffix = &seqs[cur][seqs[cur].len() - min_overlap..];
+            match prefix_map.get(suffix) {
+                Some(&j) if j != cur && !consumed[j] => {
+                    chain.push(j);
+                    consumed[j] = true;
+                    cur = j;
+                }
+                _ => break,
+            }
+        }
+
+        if chain.len() == 1 {
+            new_contigs.push(std::mem::replace(
+                &mut contigs[start],
+                ContigSequence::new(),
+            ));
+            continue;
+        }
+
+        let mut merged: Vec<char> = seqs[chain[0]].chars().collect();
+        for &j in &chain[1..] {
+            merged.extend(seqs[j][min_overlap..].chars());
+        }
+        let mut nc = ContigSequence::new();
+        nc.insert_new_chunk_with(merged);
+        new_contigs.push(nc);
+    }
+
+    *contigs = new_contigs;
+    contigs.sort();
 }
 
 #[cfg(test)]

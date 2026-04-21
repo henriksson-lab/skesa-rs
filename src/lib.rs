@@ -75,3 +75,8 @@ pub mod assembler;
 pub mod graph_digger;
 pub mod kmer_counter;
 pub mod sorted_counter;
+
+// Panic-stub skeletons for C++ functions not yet ported.
+// Generated from analysis/skesa_cpp.json + ccc_mapping.toml. Find targets with
+// `grep -rn "yet to be translated" src/untranslated.rs`.
+pub mod untranslated;

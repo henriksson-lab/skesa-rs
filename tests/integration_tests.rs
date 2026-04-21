@@ -2593,6 +2593,59 @@ fn cpp_skesa_positive_paired_initial_contig_documents_output() {
 }
 
 #[test]
+fn skesa_positive_paired_initial_contig_matches_cpp_golden() {
+    let bin = cargo_bin();
+    let data = test_data_dir();
+    let input = data.join("paired_positive_connection_reads.fasta");
+    let expected_contigs = data.join("expected_paired_positive_initial_contigs.fasta");
+    let tmp_contigs = unique_temp_path("skesa_paired_positive_initial_contigs", "fasta");
+
+    let output = Command::new(&bin)
+        .args([
+            "skesa",
+            "--reads",
+            input.to_str().unwrap(),
+            "--kmer",
+            "21",
+            "--max_kmer",
+            "21",
+            "--steps",
+            "1",
+            "--min_count",
+            "2",
+            "--vector_percent",
+            "1.0",
+            "--estimated_kmers",
+            "2000",
+            "--cores",
+            "1",
+            "--min_contig",
+            "1",
+            "--contigs_out",
+            tmp_contigs.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run skesa initial positive paired fixture");
+
+    assert!(
+        output.status.success(),
+        "skesa failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Contigs out: 1 Genome: 528"),
+        "missing initial 528 bp contig line: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tmp_contigs).expect("failed to read contigs"),
+        std::fs::read_to_string(&expected_contigs).expect("failed to read expected contigs")
+    );
+
+    let _ = std::fs::remove_file(&tmp_contigs);
+}
+
+#[test]
 #[ignore = "requires bundled C++ SKESA/skesa binary"]
 fn cpp_skesa_positive_paired_connection_fixture_documents_output() {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -2753,6 +2806,92 @@ fn skesa_interleaved_paired_fixture_matches_cpp_golden() {
 }
 
 #[test]
+fn skesa_positive_paired_connection_fixture_matches_cpp_golden() {
+    let bin = cargo_bin();
+    let data = test_data_dir();
+    let input = data.join("paired_positive_connection_reads.fasta");
+    let expected_contigs = data.join("expected_paired_positive_connection_contigs.fasta");
+    let expected_hist = data.join("expected_paired_positive_connection_hist.txt");
+    let expected_connected = data.join("expected_paired_positive_connection_connected.fasta");
+
+    let tmp_contigs = unique_temp_path("skesa_paired_positive_contigs", "fasta");
+    let tmp_hist = unique_temp_path("skesa_paired_positive_hist", "txt");
+    let tmp_connected = unique_temp_path("skesa_paired_positive_connected", "fasta");
+
+    let output = Command::new(&bin)
+        .args([
+            "skesa",
+            "--reads",
+            input.to_str().unwrap(),
+            "--use_paired_ends",
+            "--kmer",
+            "21",
+            "--max_kmer",
+            "35",
+            "--steps",
+            "2",
+            "--min_count",
+            "2",
+            "--vector_percent",
+            "1.0",
+            "--estimated_kmers",
+            "2000",
+            "--cores",
+            "1",
+            "--min_contig",
+            "1",
+            "--contigs_out",
+            tmp_contigs.to_str().unwrap(),
+            "--hist",
+            tmp_hist.to_str().unwrap(),
+            "--connected_reads",
+            tmp_connected.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run skesa positive paired fixture");
+
+    assert!(
+        output.status.success(),
+        "skesa failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("N50 for inserts: 170"),
+        "missing insert N50 line: {stderr}"
+    );
+    assert!(
+        stderr.contains("Connected: 18 ambiguously connected: 0 from 18 mate pairs"),
+        "missing positive iterative connection line: {stderr}"
+    );
+    assert!(
+        stderr.contains("Totally connected: 18"),
+        "missing total connection line: {stderr}"
+    );
+    assert!(
+        stderr.contains("Added notconnected: 0"),
+        "missing or mismatched Added notconnected line: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tmp_contigs).expect("failed to read contigs"),
+        std::fs::read_to_string(&expected_contigs).expect("failed to read expected contigs")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tmp_hist).expect("failed to read hist"),
+        std::fs::read_to_string(&expected_hist).expect("failed to read expected hist")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tmp_connected).expect("failed to read connected reads"),
+        std::fs::read_to_string(&expected_connected)
+            .expect("failed to read expected connected reads")
+    );
+
+    let _ = std::fs::remove_file(&tmp_contigs);
+    let _ = std::fs::remove_file(&tmp_hist);
+    let _ = std::fs::remove_file(&tmp_connected);
+}
+
+#[test]
 fn skesa_seeded_contigs_match_golden() {
     let bin = cargo_bin();
     let data = test_data_dir();
@@ -2847,6 +2986,65 @@ fn skesa_indel_non_converged_fixture_matches_cpp_final_outputs() {
 
     let tmp_contigs = unique_temp_path("rust_indel_bubble_contigs", "fasta");
     let tmp_hist = unique_temp_path("rust_indel_bubble_hist", "txt");
+
+    let output = Command::new(&bin)
+        .args([
+            "skesa",
+            "--reads",
+            input.to_str().unwrap(),
+            "--kmer",
+            "21",
+            "--max-kmer",
+            "21",
+            "--steps",
+            "1",
+            "--min-count",
+            "2",
+            "--vector-percent",
+            "1.0",
+            "--estimated-kmers",
+            "1000",
+            "--cores",
+            "1",
+            "--min-contig",
+            "1",
+            "--allow-snps",
+            "--contigs-out",
+            tmp_contigs.to_str().unwrap(),
+            "--hist",
+            tmp_hist.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run skesa");
+
+    assert!(
+        output.status.success(),
+        "skesa failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tmp_contigs).expect("failed to read contigs"),
+        std::fs::read_to_string(&expected_contigs).expect("failed to read expected contigs")
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tmp_hist).expect("failed to read hist"),
+        std::fs::read_to_string(&expected_hist).expect("failed to read expected hist")
+    );
+
+    let _ = std::fs::remove_file(&tmp_contigs);
+    let _ = std::fs::remove_file(&tmp_hist);
+}
+
+#[test]
+fn skesa_repeat_adjacent_snp_fixture_matches_cpp_final_outputs() {
+    let bin = cargo_bin();
+    let data = test_data_dir();
+    let input = data.join("repeat_adjacent_snp_reads.fasta");
+    let expected_contigs = data.join("expected_repeat_adjacent_snp_allow_snps_contigs.fasta");
+    let expected_hist = data.join("expected_repeat_adjacent_snp_allow_snps_hist.txt");
+
+    let tmp_contigs = unique_temp_path("rust_repeat_adjacent_snp_contigs", "fasta");
+    let tmp_hist = unique_temp_path("rust_repeat_adjacent_snp_hist", "txt");
 
     let output = Command::new(&bin)
         .args([

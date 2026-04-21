@@ -40,6 +40,13 @@ pub struct ContigSequence {
     pub left_endpoint: Option<Vec<u64>>,
     /// Canonical k-mer key of the denied node at the right end
     pub right_endpoint: Option<Vec<u64>>,
+    /// Number of newly assembled bases on the left end that could be clipped.
+    /// Mirrors C++ `SContig::m_left_extend` (graphdigger.hpp:54). Initialised
+    /// to the contig length on creation; ConnectAndExtendContigs / iteration
+    /// boundaries should clip these counts to bound trustless extensions.
+    pub left_extend: i32,
+    /// Same as `left_extend` but for the right end (`SContig::m_right_extend`).
+    pub right_extend: i32,
 }
 
 impl ContigSequence {
@@ -51,6 +58,8 @@ impl ContigSequence {
             circular: false,
             left_endpoint: None,
             right_endpoint: None,
+            left_extend: 0,
+            right_extend: 0,
         }
     }
 

@@ -119,6 +119,14 @@ impl<const N: usize> LargeInt<N> {
         self.value[0]
     }
 
+    /// Identifier string for this precision, matching C++ `LargeInt<N>::getName`
+    /// (LargeInt.hpp:124). C++ caches the formatted name in a static buffer;
+    /// Rust returns a fresh `String` since `N` is a const generic known at
+    /// monomorphisation.
+    pub fn type_name() -> String {
+        format!("LargeInt<{N}>")
+    }
+
     /// Size in bits
     pub fn get_size() -> usize {
         64 * N

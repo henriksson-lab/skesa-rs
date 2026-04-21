@@ -2,11 +2,11 @@
 //! Port of SKESA's genetic_code.hpp.
 
 /// A genetic code table entry: (amino_acids, starts_stops, code_number, name)
-struct TableInfo {
-    amino_acids: &'static str,  // 64 characters: amino acid for each codon
-    starts_stops: &'static str, // 64 characters: M for start, * for stop
-    code_number: u32,
-    name: &'static str,
+pub struct TableInfo {
+    pub amino_acids: &'static str,  // 64 characters: amino acid for each codon
+    pub starts_stops: &'static str, // 64 characters: M for start, * for stop
+    pub code_number: u32,
+    pub name: &'static str,
 }
 
 /// Standard codon order: T=0, C=1, A=2, G=3
@@ -141,6 +141,21 @@ impl GeneticCode {
     /// Get the code name
     pub fn name(&self) -> &'static str {
         all_tables()[self.table_idx].name
+    }
+
+    /// All recognised start codons for this genetic code. Port of
+    /// `GeneticCode::Starts` (genetic_code.hpp:115). C++ returns a
+    /// `list<string>`; Rust returns a slice into the pre-computed vector.
+    pub fn starts(&self) -> &[String] {
+        &self.starts
+    }
+
+    /// The full table of all 25 NCBI genetic code definitions. Port of
+    /// `GeneticCode::AllInfo` (genetic_code.hpp:128). C++ exposes the
+    /// internal `array<TableInfo, 25>`; Rust returns a slice of the
+    /// equivalent `TableInfo` entries.
+    pub fn all_info(&self) -> &'static [TableInfo] {
+        all_tables()
     }
 }
 

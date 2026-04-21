@@ -126,6 +126,45 @@ pub trait DBGraph {
 
     /// Average k-mer count
     fn average_count(&self) -> f64;
+
+    /// Fraction of observations of this k-mer on the plus strand. Port of
+    /// `CDBGraph::PlusFraction` / `CDBHashGraph::PlusFraction`
+    /// (DBGraph.hpp:185/437). Return 0.5 for unstranded graphs — that matches
+    /// the C++ behavior where `PlusFraction + MinusFraction = 1` and neither
+    /// strand dominates. Concrete graph impls should override this to read
+    /// the packed plus-count bits from their count slot.
+    fn plus_fraction(&self, _node: &Self::Node) -> f64 {
+        0.5
+    }
+
+    /// Fraction of observations on the minus strand: symmetrised version of
+    /// `plus_fraction` matching C++'s `CDBGraph::MinusFraction`
+    /// (DBGraph.hpp:181/433). Always returns the smaller of `plus_fraction`
+    /// and `1 - plus_fraction`, so callers can use this as a "minority
+    /// strand fraction" regardless of orientation.
+    fn minus_fraction(&self, node: &Self::Node) -> f64 {
+        let p = self.plus_fraction(node);
+        p.min(1.0 - p)
+    }
+
+    /// Minimum count present in the stored histogram, or 0 if the histogram
+    /// has no distinguishable valley. Port of `CDBGraph::HistogramMinimum`
+    /// and `CDBHashGraph::HistogramMinimum` from `DBGraph.hpp:281/526`.
+    fn histogram_minimum(&self) -> i32 {
+        let bins = self.get_bins();
+        let (first, _) = crate::histogram::histogram_range(bins);
+        if first < 0 {
+            0
+        } else {
+            bins[first as usize].0
+        }
+    }
+
+    /// Heuristic genome size estimate from the k-mer histogram. Port of
+    /// `CDBGraph::GenomeSize` / `CDBHashGraph::GenomeSize`.
+    fn genome_size(&self) -> usize {
+        crate::histogram::calculate_genome_size(self.get_bins())
+    }
 }
 
 #[cfg(test)]

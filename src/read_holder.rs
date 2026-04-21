@@ -482,6 +482,87 @@ impl<'a> StringIterator<'a> {
         }
     }
 
+    /// Extract the read's 2-bit-packed binary encoding into `destination`,
+    /// optionally skipping `shift` nucleotides from the start. The bits are
+    /// returned in the holder's internal reversed order — same convention as
+    /// storage. `destination` must be pre-zeroed with at least
+    /// `(2*(read_len - shift) + 63) / 64` words.
+    ///
+    /// Port of `CReadHolder::string_iterator::BSeq` (common_util.hpp:303).
+    pub fn b_seq(&self, shift: usize, destination: &mut [u64]) {
+        let position = self.position + 2 * shift;
+        let len = 2 * (self.read_len() - shift);
+        let dest_size = len.div_ceil(64);
+        self.holder
+            .copy_bits(position, position + len, destination, 0, dest_size);
+    }
+
+    /// Extract the read's binary encoding in the original (un-reversed) order
+    /// with optional reverse-complement. `left_clip`/`right_clip` drop
+    /// nucleotides from the original-sequence left/right ends (the holder
+    /// stores reversed, so right_clip corresponds to the stored-front side).
+    /// `destination` must be pre-zeroed with at least
+    /// `(2*(read_len - left_clip - right_clip) + 63) / 64` words.
+    ///
+    /// Port of `CReadHolder::string_iterator::TrueBSeq` (common_util.hpp:311).
+    pub fn true_b_seq(
+        &self,
+        left_clip: usize,
+        right_clip: usize,
+        reverse_complement: bool,
+        destination: &mut [u64],
+    ) {
+        // Bit-reverse a single 64-bit word in 2-bit-nucleotide order.
+        // Swaps adjacent 2-bit pairs, then nibbles, then bytes, etc.
+        fn reverse_word(w: &mut u64) {
+            *w = ((*w & 0x3333_3333_3333_3333) << 2) | ((*w >> 2) & 0x3333_3333_3333_3333);
+            *w = ((*w & 0x0F0F_0F0F_0F0F_0F0F) << 4) | ((*w >> 4) & 0x0F0F_0F0F_0F0F_0F0F);
+            *w = ((*w & 0x00FF_00FF_00FF_00FF) << 8) | ((*w >> 8) & 0x00FF_00FF_00FF_00FF);
+            *w = ((*w & 0x0000_FFFF_0000_FFFF) << 16) | ((*w >> 16) & 0x0000_FFFF_0000_FFFF);
+            *w = ((*w & 0x0000_0000_FFFF_FFFF) << 32) | ((*w >> 32) & 0x0000_0000_FFFF_FFFF);
+        }
+
+        // Sequences are stored reversed, so the "right_clip" of the original
+        // sequence sits at the stored-front end.
+        let position = self.position + 2 * right_clip;
+        let len = 2 * (self.read_len() - right_clip - left_clip);
+        let destination_size = len.div_ceil(64);
+
+        if reverse_complement {
+            // Reversed already via storage; complement by flipping the high
+            // bit of each 2-bit nucleotide (A↔T, C↔G in SKESA's encoding).
+            self.holder
+                .copy_bits(position, position + len, destination, 0, destination_size);
+            for p in 0..destination_size {
+                destination[p] ^= 0xAAAA_AAAA_AAAA_AAAA;
+            }
+            let partial_bits = len % 64;
+            if partial_bits > 0 {
+                destination[destination_size - 1] &= (1u64 << partial_bits) - 1;
+            }
+        } else {
+            // Shift bits so the sequence's original-left end lands at the high
+            // bits, then reverse words and bit-pairs within each word.
+            let shift_to_right_end = 64 * destination_size - len;
+            self.holder.copy_bits(
+                position,
+                position + len,
+                destination,
+                shift_to_right_end,
+                destination_size,
+            );
+            let half = destination_size / 2;
+            for p in 0..half {
+                destination.swap(p, destination_size - 1 - p);
+                reverse_word(&mut destination[p]);
+                reverse_word(&mut destination[destination_size - 1 - p]);
+            }
+            if destination_size % 2 == 1 {
+                reverse_word(&mut destination[destination_size / 2]);
+            }
+        }
+    }
+
     /// Get a k-mer iterator for this read
     pub fn kmers_for_read(&self, kmer_len: usize) -> KmerIterator<'a> {
         if kmer_len <= self.holder.read_length[self.read] as usize {
@@ -504,6 +585,27 @@ impl<'a> PartialEq for StringIterator<'a> {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.holder, other.holder) && self.read == other.read
     }
+}
+
+/// Count matching 2-bit-packed nucleotides from the start of two word streams.
+///
+/// Port of `CReadHolder::string_iterator::CommomSeqLen` (common_util.hpp:345).
+/// `word_len` is the number of `u64` words to compare in both inputs. The
+/// result can exceed the actual sequence length when the sequence doesn't
+/// fill a whole trailing word — callers clamp with `min(rlen, ...)` as C++
+/// does at the single call site in gfa.hpp.
+pub fn common_seq_len(seq1: &[u64], seq2: &[u64], word_len: usize) -> usize {
+    let n = word_len.min(seq1.len()).min(seq2.len());
+    for i in 0..n {
+        let a = seq1[i];
+        let b = seq2[i];
+        if a != b {
+            // C++: (ffsll(a ^ b) - 1) / 2 → 0-based position of first differing
+            // bit, divided by 2 because each nucleotide is 2 bits.
+            return 32 * i + (a ^ b).trailing_zeros() as usize / 2;
+        }
+    }
+    32 * n
 }
 
 #[cfg(test)]
@@ -693,5 +795,83 @@ mod tests {
         rh.clear();
         assert_eq!(rh.read_num(), 0);
         assert_eq!(rh.total_seq(), 0);
+    }
+
+    #[test]
+    fn test_common_seq_len_all_match() {
+        let a: [u64; 2] = [0xAAAA_BBBB_CCCC_DDDD, 0x1122_3344_5566_7788];
+        // All 64 nts of the first word match; differ at the first bit of word 1.
+        assert_eq!(common_seq_len(&a, &a, 2), 64);
+    }
+
+    #[test]
+    fn test_common_seq_len_mismatch_within_first_word() {
+        // Two identical words except nucleotide index 2 (bits 4..5 = 0b11 vs 0b00).
+        let a: u64 = 0b0011_0000;
+        let b: u64 = 0b0000_0000;
+        assert_eq!(common_seq_len(&[a], &[b], 1), 2);
+    }
+
+    #[test]
+    fn test_common_seq_len_mismatch_in_second_word() {
+        // First word identical (32 nts match); differ at nt 0 of second word.
+        let a = [0u64, 1u64];
+        let b = [0u64, 0u64];
+        assert_eq!(common_seq_len(&a, &b, 2), 32);
+    }
+
+    #[test]
+    fn test_common_seq_len_respects_word_len() {
+        // Word_len caps the comparison even when inputs are identical beyond.
+        let a = [0u64, 0u64, 0u64];
+        let b = [0u64, 0u64, 0u64];
+        assert_eq!(common_seq_len(&a, &b, 1), 32);
+    }
+
+    #[test]
+    fn test_b_seq_returns_stored_reversed_bits() {
+        // "AAAC" → stored as C,A,A,A (SKESA encoding A=0, C=1) → low byte 0x01.
+        let mut rh = ReadHolder::new(false);
+        rh.push_back_str("AAAC");
+        let si = rh.string_iter();
+        let mut dest = [0u64; 1];
+        si.b_seq(0, &mut dest);
+        assert_eq!(dest[0], 0x01);
+    }
+
+    #[test]
+    fn test_true_b_seq_forward_order_restores_read() {
+        // rev_comp=false should un-reverse storage back to original A,A,A,C.
+        // Slot layout (LSB-first): A(0), A(0), A(0), C(1) → 0x40.
+        let mut rh = ReadHolder::new(false);
+        rh.push_back_str("AAAC");
+        let si = rh.string_iter();
+        let mut dest = [0u64; 1];
+        si.true_b_seq(0, 0, false, &mut dest);
+        assert_eq!(dest[0], 0x40);
+    }
+
+    #[test]
+    fn test_true_b_seq_reverse_complement() {
+        // rc("AAAC") = "GTTT" → slots G(3),T(2),T(2),T(2) → 0xAB.
+        let mut rh = ReadHolder::new(false);
+        rh.push_back_str("AAAC");
+        let si = rh.string_iter();
+        let mut dest = [0u64; 1];
+        si.true_b_seq(0, 0, true, &mut dest);
+        assert_eq!(dest[0], 0xAB);
+    }
+
+    #[test]
+    fn test_b_seq_respects_shift() {
+        // "AAAC" with shift=1 skips the leftmost 'A' in original; stored is
+        // reversed so the shift is applied at the stored-front. After shift=1
+        // we extract 3 nucleotides starting at stored-slot 1: A,A,A → 0.
+        let mut rh = ReadHolder::new(false);
+        rh.push_back_str("AAAC");
+        let si = rh.string_iter();
+        let mut dest = [0u64; 1];
+        si.b_seq(1, &mut dest);
+        assert_eq!(dest[0], 0x00);
     }
 }

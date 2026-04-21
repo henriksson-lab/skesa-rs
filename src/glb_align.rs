@@ -72,7 +72,7 @@ pub fn entropy_str(seq: &str) -> f64 {
 // --- CIGAR and Alignment ---
 
 /// A CIGAR element: length + type (M=match, D=deletion, I=insertion)
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CigarElement {
     pub len: usize,
     pub op: char, // 'M', 'D', 'I'
@@ -120,6 +120,16 @@ impl Cigar {
             self.elements[0].len += el.len;
         } else {
             self.elements.insert(0, el);
+        }
+    }
+
+    /// Prepend every element of another CIGAR onto this one in source order.
+    /// Port of `CCigarBase::PushFront(const CCigarBase&)` (glb_align.cpp:52).
+    /// C++ iterates `other.m_elements` in reverse and calls the single-element
+    /// PushFront, so the final order matches `other` followed by `self`.
+    pub fn push_front_cigar(&mut self, other: &Cigar) {
+        for el in other.elements.iter().rev().copied() {
+            self.push_front(el);
         }
     }
 
@@ -257,6 +267,117 @@ impl Cigar {
             }
         }
         score
+    }
+
+    /// BTOP (Blast TraceBack OPerations) representation over the aligned
+    /// portion of `query`/`subject`. Port of `CCigar::BtopString`
+    /// (glb_align.cpp:129). Runs of matches collapse to a decimal count;
+    /// mismatches/gaps appear as pairs of characters (`-` denotes a gap).
+    pub fn btop_string(&self, query: &[u8], subject: &[u8]) -> String {
+        let mut btop = String::new();
+        let mut qi = self.qfrom as usize;
+        let mut si = self.sfrom as usize;
+        for el in &self.elements {
+            match el.op {
+                'M' => {
+                    let mut match_len = 0u32;
+                    for _ in 0..el.len {
+                        if query[qi] == subject[si] {
+                            match_len += 1;
+                        } else {
+                            if match_len > 0 {
+                                btop.push_str(&match_len.to_string());
+                                match_len = 0;
+                            }
+                            btop.push(query[qi] as char);
+                            btop.push(subject[si] as char);
+                        }
+                        qi += 1;
+                        si += 1;
+                    }
+                    if match_len > 0 {
+                        btop.push_str(&match_len.to_string());
+                    }
+                }
+                'D' => {
+                    for _ in 0..el.len {
+                        btop.push('-');
+                        btop.push(subject[si] as char);
+                        si += 1;
+                    }
+                }
+                'I' => {
+                    for _ in 0..el.len {
+                        btop.push(query[qi] as char);
+                        btop.push('-');
+                        qi += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        btop
+    }
+
+    /// Expand the alignment into parallel query/subject byte buffers with `-`
+    /// inserted for gaps. Port of `CCigar::ToAlign` (glb_align.cpp:168).
+    pub fn to_align(&self, query: &[u8], subject: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let mut q_out: Vec<u8> = Vec::new();
+        let mut s_out: Vec<u8> = Vec::new();
+        let mut qi = self.qfrom as usize;
+        let mut si = self.sfrom as usize;
+        for el in &self.elements {
+            match el.op {
+                'M' => {
+                    q_out.extend_from_slice(&query[qi..qi + el.len]);
+                    s_out.extend_from_slice(&subject[si..si + el.len]);
+                    qi += el.len;
+                    si += el.len;
+                }
+                'D' => {
+                    q_out.extend(std::iter::repeat_n(b'-', el.len));
+                    s_out.extend_from_slice(&subject[si..si + el.len]);
+                    si += el.len;
+                }
+                'I' => {
+                    q_out.extend_from_slice(&query[qi..qi + el.len]);
+                    s_out.extend(std::iter::repeat_n(b'-', el.len));
+                    qi += el.len;
+                }
+                _ => {}
+            }
+        }
+        (q_out, s_out)
+    }
+
+    /// Write a three-line alignment (query, match markers, subject) to `out`.
+    /// Port of `CCigar::PrintAlign` (glb_align.cpp:262). `delta` scores a
+    /// mismatched pair as positive/zero/negative; positive → `+`, zero → ` `,
+    /// exact match → `|`. Gap columns render as a leading space.
+    pub fn print_align<W: std::io::Write>(
+        &self,
+        query: &[u8],
+        subject: &[u8],
+        delta: &[[i8; 256]; 256],
+        out: &mut W,
+    ) -> std::io::Result<()> {
+        let (q, s) = self.to_align(query, subject);
+        out.write_all(&q)?;
+        out.write_all(b"\n")?;
+        for p in 0..q.len() {
+            if q[p] == b'-' || s[p] == b'-' {
+                out.write_all(b" ")?;
+            } else if q[p] == s[p] {
+                out.write_all(b"|")?;
+            } else if delta[q[p] as usize][s[p] as usize] > 0 {
+                out.write_all(b"+")?;
+            } else {
+                out.write_all(b" ")?;
+            }
+        }
+        out.write_all(b"\n")?;
+        out.write_all(&s)?;
+        out.write_all(b"\n")
     }
 
     /// Query range
@@ -1279,5 +1400,82 @@ mod tests {
         cigar.push_back(CigarElement { len: 1, op: 'I' });
         cigar.push_back(CigarElement { len: 2, op: 'M' });
         assert_eq!(cigar.cigar_string(), "3M1I2M");
+    }
+
+    fn cigar_from_ops(ops: &[(usize, char)]) -> Cigar {
+        let mut c = Cigar::new(-1, -1);
+        for &(len, op) in ops {
+            c.push_back(CigarElement { len, op });
+        }
+        c
+    }
+
+    #[test]
+    fn test_btop_string_all_match() {
+        let c = cigar_from_ops(&[(5, 'M')]);
+        assert_eq!(c.btop_string(b"ACGTA", b"ACGTA"), "5");
+    }
+
+    #[test]
+    fn test_btop_string_mixed_match_and_mismatch() {
+        // Matches collapse to counts; mismatches appear as query/subject pair.
+        let c = cigar_from_ops(&[(5, 'M')]);
+        assert_eq!(c.btop_string(b"ACGTA", b"ACCTA"), "2GC2");
+    }
+
+    #[test]
+    fn test_btop_string_with_gaps() {
+        // Deletion: gap in query → "-X"; insertion: gap in subject → "X-".
+        // Cigar: 1M 2D 1M 1I 1M over query="ATAC" vs subject="ACGTAC".
+        //   1M: A==A                       → "1"
+        //   2D: gap in query + C,G         → "-C-G"
+        //   1M: T==T                       → "1"
+        //   1I: A in query, gap in subject → "A-"
+        //   1M: A==A                       → "1"
+        let c = cigar_from_ops(&[(1, 'M'), (2, 'D'), (1, 'M'), (1, 'I'), (1, 'M')]);
+        assert_eq!(c.btop_string(b"ATAA", b"ACGTAA"), "1-C-G1A-1");
+    }
+
+    #[test]
+    fn test_to_align_all_match() {
+        let c = cigar_from_ops(&[(4, 'M')]);
+        let (q, s) = c.to_align(b"ACGT", b"ACGT");
+        assert_eq!(q, b"ACGT");
+        assert_eq!(s, b"ACGT");
+    }
+
+    #[test]
+    fn test_to_align_inserts_gap_dashes() {
+        let c = cigar_from_ops(&[(2, 'M'), (1, 'D'), (1, 'M'), (1, 'I'), (1, 'M')]);
+        let (q, s) = c.to_align(b"ACCGT", b"ACGCT");
+        assert_eq!(q, b"AC-CGT");
+        assert_eq!(s, b"ACGC-T");
+    }
+
+    #[test]
+    fn test_print_align_renders_match_markers() {
+        // Trivial delta: positive for identical bytes, zero otherwise — makes
+        // the middle line's marker logic deterministic.
+        let mut delta = [[0i8; 256]; 256];
+        for i in 0..256 {
+            delta[i][i] = 1;
+        }
+        let c = cigar_from_ops(&[(5, 'M')]);
+        let mut out = Vec::new();
+        c.print_align(b"ACGTA", b"ACCTA", &delta, &mut out).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "ACGTA\n|| ||\nACCTA\n"
+        );
+    }
+
+    #[test]
+    fn test_print_align_gap_column_is_space() {
+        // Match columns → `|`, gap column in the middle → ` `.
+        let delta = [[0i8; 256]; 256];
+        let c = cigar_from_ops(&[(1, 'M'), (1, 'D'), (1, 'M')]);
+        let mut out = Vec::new();
+        c.print_align(b"AT", b"ACT", &delta, &mut out).unwrap();
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "A-T\n| |\nACT\n");
     }
 }

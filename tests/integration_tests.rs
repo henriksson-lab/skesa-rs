@@ -17,6 +17,24 @@ fn test_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data")
 }
 
+fn external_data_dir() -> std::path::PathBuf {
+    if let Ok(path) = std::env::var("SKESA_EXTERNAL_DATA_DIR") {
+        return std::path::PathBuf::from(path);
+    }
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/external-data")
+}
+
+fn external_fixture_file(fixture_id: &str, filename: &str) -> (std::path::PathBuf, String) {
+    let fixture_dir = external_data_dir().join(fixture_id);
+    let read = fixture_dir.join(filename);
+    assert!(
+        read.exists(),
+        "missing external fixture {fixture_id}; download it with scripts/download-real-world-fixtures.py --dest {}",
+        external_data_dir().display()
+    );
+    (fixture_dir, read.display().to_string())
+}
+
 fn unique_temp_path(stem: &str, extension: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -342,6 +360,83 @@ fn cpp_env_kmercounter_hist_matches_rust_hist() {
     assert_eq!(
         std::fs::read_to_string(&rust_hist).expect("failed to read Rust hist"),
         std::fs::read_to_string(&cpp_hist).expect("failed to read C++ hist")
+    );
+
+    let _ = std::fs::remove_file(&rust_hist);
+    let _ = std::fs::remove_file(&cpp_hist);
+}
+
+#[test]
+#[ignore = "requires downloaded external real-world fixture and bundled C++ SKESA/kmercounter binary"]
+fn cpp_kmercounter_real_world_mgenitalium_hist_matches_rust() {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cpp = manifest.join("SKESA/kmercounter");
+    assert!(
+        cpp.exists(),
+        "missing bundled C++ kmercounter at {}",
+        cpp.display()
+    );
+
+    let rust_bin = cargo_bin();
+    let (_fixture_dir, reads) = external_fixture_file("err486835_mgenitalium", "subset_1.fastq");
+    let rust_hist = unique_temp_path("rust_real_world_mgenitalium_hist", "txt");
+    let cpp_hist = unique_temp_path("cpp_real_world_mgenitalium_hist", "txt");
+
+    let rust_output = Command::new(&rust_bin)
+        .args([
+            "kmercounter",
+            "--reads",
+            &reads,
+            "--kmer",
+            "21",
+            "--min_count",
+            "2",
+            "--vector_percent",
+            "1.0",
+            "--estimated_kmers",
+            "200000",
+            "--cores",
+            "1",
+            "--hist",
+            rust_hist.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run Rust kmercounter on external real-world fixture");
+    assert!(
+        rust_output.status.success(),
+        "Rust kmercounter failed: {}",
+        String::from_utf8_lossy(&rust_output.stderr)
+    );
+
+    let cpp_output = Command::new(&cpp)
+        .args([
+            "--reads",
+            &reads,
+            "--kmer",
+            "21",
+            "--min_count",
+            "2",
+            "--vector_percent",
+            "1.0",
+            "--estimated_kmers",
+            "200000",
+            "--cores",
+            "1",
+            "--hist",
+            cpp_hist.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run bundled C++ kmercounter on external real-world fixture");
+    assert!(
+        cpp_output.status.success(),
+        "C++ kmercounter failed: {}",
+        String::from_utf8_lossy(&cpp_output.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&rust_hist).expect("failed to read Rust hist"),
+        std::fs::read_to_string(&cpp_hist).expect("failed to read C++ hist"),
+        "real-world histogram mismatch for ERR486835"
     );
 
     let _ = std::fs::remove_file(&rust_hist);

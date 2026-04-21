@@ -154,6 +154,25 @@ cargo test assembler                # Run assembler tests
 cargo bench --bench kmer_bench      # Run criterion benchmarks
 ```
 
+For optional real-world coverage without vendoring public reads into the repo,
+download the external fixture(s) first and then run the ignored parity test:
+
+```bash
+scripts/download-real-world-fixtures.py \
+  --dest /husky/henriksson/for_claude/skesa/external
+
+SKESA_EXTERNAL_DATA_DIR=/husky/henriksson/for_claude/skesa/external \
+TMPDIR=/husky/henriksson/for_claude/skesa \
+cargo test --test integration_tests cpp_kmercounter_real_world_mgenitalium_hist_matches_rust -- --ignored
+```
+
+The initial external fixture is ENA run `ERR486835`, a small public paired-end
+*Mycoplasmoides genitalium* WGS dataset. The downloader trims the first 5k read
+pairs into `subset_1.fastq` / `subset_2.fastq`, and the ignored test currently
+compares Rust and bundled C++ `kmercounter --hist` output on `subset_1.fastq`.
+Larger external assembly parity fixtures should be added only after the
+remaining multi-step assembly gaps are closed.
+
 ## Benchmarking
 
 Use `tools/benchmark_command.py` for parity/performance measurements so Rust and

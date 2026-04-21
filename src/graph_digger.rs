@@ -350,11 +350,7 @@ fn find_all_successors(
 /// `fraction × total` abundance.
 fn filter_by_abundance(successors: &mut Vec<SuccessorCandidate>, fraction: f64) {
     if successors.len() > 1 {
-        successors.sort_by(|a, b| {
-            b.abundance
-                .cmp(&a.abundance)
-                .then_with(|| a.nt.cmp(&b.nt))
-        });
+        successors.sort_by(|a, b| b.abundance.cmp(&a.abundance).then_with(|| a.nt.cmp(&b.nt)));
         let total_abundance: u32 = successors.iter().map(|s| s.abundance).sum();
         let threshold = (fraction * total_abundance as f64) as u32;
         successors.retain(|s| s.abundance > threshold);
@@ -433,9 +429,7 @@ fn filter_illumina_acc(
             if nexts.is_empty() {
                 break;
             }
-            nexts.sort_by(|a, b| {
-                b.abundance.cmp(&a.abundance).then_with(|| a.nt.cmp(&b.nt))
-            });
+            nexts.sort_by(|a, b| b.abundance.cmp(&a.abundance).then_with(|| a.nt.cmp(&b.nt)));
             out.push(BIN2NT[nexts[0].nt as usize]);
             cur = nexts[0].kmer;
         }
@@ -561,7 +555,15 @@ fn find_and_filter_successors(
     filter_illumina_ggt(&mut successors, kmers, kmer_len, fraction);
 
     // Illumina ACC-based strand-noise filter (graphdigger.hpp:1838-1860).
-    filter_illumina_acc(&mut successors, kmers, kmer_len, max_kmer, fraction, low_count, true);
+    filter_illumina_acc(
+        &mut successors,
+        kmers,
+        kmer_len,
+        max_kmer,
+        fraction,
+        low_count,
+        true,
+    );
 
     // Strand-balance filter for stranded graphs (matches C++ FilterNeighbors
     // at graphdigger.hpp:1862-1885) — removes Illumina strand-bias artifacts.
@@ -608,16 +610,24 @@ fn has_backward_reachability(
     let mut predecessors = find_all_successors(kmers, &rc, kmer_len, max_kmer, low_count);
     filter_by_abundance(&mut predecessors, fraction);
     filter_illumina_ggt(&mut predecessors, kmers, kmer_len, fraction);
-    filter_illumina_acc(&mut predecessors, kmers, kmer_len, max_kmer, fraction, low_count, true);
+    filter_illumina_acc(
+        &mut predecessors,
+        kmers,
+        kmer_len,
+        max_kmer,
+        fraction,
+        low_count,
+        true,
+    );
     // Match C++ FilterNeighbors(predecessors, true) which applies both the
     // ExtendableSuccessor dead-end trim and the strand-balance filter on the
     // predecessor lookup.
-    if predecessors.len() > 1
-        && predecessors[0].abundance > 5
-    {
+    if predecessors.len() > 1 && predecessors[0].abundance > 5 {
         let check_len = kmer_len.max(100);
         predecessors.retain(|p| {
-            is_extendable(kmers, &p.kmer, kmer_len, max_kmer, check_len, fraction, low_count)
+            is_extendable(
+                kmers, &p.kmer, kmer_len, max_kmer, check_len, fraction, low_count,
+            )
         });
     }
     filter_by_strand_balance(&mut predecessors, kmers, fraction, low_count);
@@ -1203,7 +1213,11 @@ pub fn connect_contigs_through_graph(
         if seq.len() >= kmer_len {
             let first_kmer = Kmer::from_kmer_str(&seq[..kmer_len]);
             let rkmer = first_kmer.revcomp(kmer_len);
-            let canonical = if first_kmer < rkmer { first_kmer } else { rkmer };
+            let canonical = if first_kmer < rkmer {
+                first_kmer
+            } else {
+                rkmer
+            };
             let key = canonical.to_words()[..precision].to_vec();
             first_kmer_map.entry(key).or_insert(i);
         }
@@ -1224,7 +1238,11 @@ pub fn connect_contigs_through_graph(
         for suc in &succs {
             let canonical = {
                 let r = suc.kmer.revcomp(kmer_len);
-                if suc.kmer < r { suc.kmer } else { r }
+                if suc.kmer < r {
+                    suc.kmer
+                } else {
+                    r
+                }
             };
             let key = canonical.to_words()[..precision].to_vec();
             if let Some(&right_idx) = first_kmer_map.get(&key) {
@@ -1246,7 +1264,11 @@ pub fn connect_contigs_through_graph(
                 for suc in &succs {
                     let canonical = {
                         let r = suc.kmer.revcomp(kmer_len);
-                        if suc.kmer < r { suc.kmer } else { r }
+                        if suc.kmer < r {
+                            suc.kmer
+                        } else {
+                            r
+                        }
                     };
                     let key = canonical.to_words()[..precision].to_vec();
                     if let Some(&right_idx) = first_kmer_map.get(&key) {
@@ -1281,8 +1303,9 @@ pub fn connect_contigs_through_graph(
     };
 
     // Compute each contig's right-neighbor-if-unique once, then chain-walk.
-    let neighbors: Vec<Option<(usize, Vec<char>)>> =
-        (0..contigs.len()).map(|i| find_neighbor(i, &seqs)).collect();
+    let neighbors: Vec<Option<(usize, Vec<char>)>> = (0..contigs.len())
+        .map(|i| find_neighbor(i, &seqs))
+        .collect();
 
     let mut consumed = vec![false; contigs.len()];
     let mut new_contigs: ContigSequenceList = Vec::with_capacity(contigs.len());
@@ -1340,7 +1363,11 @@ pub fn connect_contigs_through_graph(
             if seq.len() >= kmer_len {
                 let first_kmer = Kmer::from_kmer_str(&seq[..kmer_len]);
                 let rkmer = first_kmer.revcomp(kmer_len);
-                let canonical = if first_kmer < rkmer { first_kmer } else { rkmer };
+                let canonical = if first_kmer < rkmer {
+                    first_kmer
+                } else {
+                    rkmer
+                };
                 let key = canonical.to_words()[..precision].to_vec();
                 first_kmer_map.entry(key).or_insert(i);
             }
@@ -1514,7 +1541,11 @@ fn deduplicate_contigs(contigs: ContigSequenceList) -> ContigSequenceList {
         rc = (rc >> 32) | (rc << 32);
         rc ^= 0xAAAA_AAAA_AAAA_AAAA;
         rc >>= 2 * (32 - klen);
-        if k < rc { k } else { rc }
+        if k < rc {
+            k
+        } else {
+            rc
+        }
     }
 
     for contig in contigs {
@@ -1557,9 +1588,9 @@ fn deduplicate_contigs(contigs: ContigSequenceList) -> ContigSequenceList {
             }
         }
 
-        let is_contained = candidates
-            .iter()
-            .any(|&i| kept_seqs[i as usize].contains(&seq) || kept_seqs[i as usize].contains(&rc_seq));
+        let is_contained = candidates.iter().any(|&i| {
+            kept_seqs[i as usize].contains(&seq) || kept_seqs[i as usize].contains(&rc_seq)
+        });
 
         // The previous "is_mostly_covered" middle-chunk heuristic was a
         // Rust-only addition; C++ CheckRepeats (graphdigger.hpp:2487) doesn't

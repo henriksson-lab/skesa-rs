@@ -1463,10 +1463,7 @@ mod tests {
         let c = cigar_from_ops(&[(5, 'M')]);
         let mut out = Vec::new();
         c.print_align(b"ACGTA", b"ACCTA", &delta, &mut out).unwrap();
-        assert_eq!(
-            std::str::from_utf8(&out).unwrap(),
-            "ACGTA\n|| ||\nACCTA\n"
-        );
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "ACGTA\n|| ||\nACCTA\n");
     }
 
     #[test]

@@ -15,8 +15,12 @@
 //! This module is deliberately gated on `#[allow(dead_code)]` so these stubs
 //! do not produce warnings while they wait to be ported.
 
-#![allow(dead_code, unused_variables, non_snake_case, clippy::too_many_arguments)]
-
+#![allow(
+    dead_code,
+    unused_variables,
+    non_snake_case,
+    clippy::too_many_arguments
+)]
 
 /// Stubs ported from `SKESA/DBGraph.hpp`.
 pub mod db_graph_hpp {
@@ -42,7 +46,6 @@ pub mod db_graph_hpp {
     // `assemble_contigs_with_visited` (src/graph_digger.rs:63). Color/holdings
     // have no current Rust consumer. Revisit when a concrete DBGraph impl
     // needs them.
-
 }
 
 /// Stubs ported from `SKESA/LargeInt.hpp`.
@@ -50,7 +53,6 @@ pub mod large_int_hpp {
     // getName from LargeInt.hpp:124 ported to LargeInt::type_name (returns
     // e.g. "LargeInt<2>"). Const generic N is known at monomorphisation so no
     // C++-style static buffer is required.
-
 }
 
 /// Stubs ported from `SKESA/assembler.hpp`.
@@ -103,7 +105,6 @@ pub mod assembler_hpp {
     // CDBGAssembler<CDBGraph>::GetGraph (assembler.hpp:956) has a Rust
     // equivalent in `assembler::build_graph` (src/assembler.rs:953). The
     // CDBHashGraph variant at :1000 is deferred with --hash_count mode.
-
 }
 
 /// Stubs ported from `SKESA/common_util.hpp`.
@@ -121,7 +122,6 @@ pub mod common_util_hpp {
     // CKmerMap<V> from common_util.hpp:580 is replaced by plain
     // `std::collections::HashMap<Kmer, V>` — no variant-typed wrapper needed
     // because Rust's const-generic LargeInt<N> is monomorphised at call sites.
-
 }
 
 /// Stubs ported from `SKESA/concurrenthash.hpp`.
@@ -151,7 +151,6 @@ pub mod counter_hpp {
     // `sorted_counter::count_kmers_sorted`, which collects partial KmerCounts
     // via rayon and runs a single final sort_and_uniq instead of C++'s
     // iterative pairwise merge reduction.
-
 }
 
 /// Stubs ported from `SKESA/gfa.hpp`.
@@ -655,7 +654,6 @@ pub mod gfa_hpp {
     pub fn align_reads_job() {
         panic!("yet to be translated: gfa.hpp:4573 AlignReadsJob");
     }
-
 }
 
 /// Stubs ported from `SKESA/gfa_connector.cpp`.
@@ -678,7 +676,6 @@ pub mod glb_align_cpp {
     // SRawMemory from glb_align.cpp:343/349 are raw `new[]/delete[]` buffer
     // allocators for alignment DP scratch space. The Rust port uses `Vec`s
     // inside `constrained_lcl_align`, so no separate allocator type exists.
-
 }
 
 /// Stubs ported from `SKESA/graphdigger.hpp`.
@@ -733,7 +730,6 @@ pub mod graphdigger_hpp {
     // are per-thread workers for GenerateNewSeeds and ConnectAndExtendContigs.
     // TODO.md's 528 bp paired-fixture gap flags both as part of the C++
     // extension-distance bookkeeping that the Rust port currently truncates.
-
 }
 
 /// Stubs ported from `SKESA/guidedassembler.hpp`.
@@ -812,7 +808,6 @@ pub mod guidedassembler_hpp {
     pub fn assembler_job_v2() {
         panic!("yet to be translated: guidedassembler.hpp:1021 AssemblerJob");
     }
-
 }
 
 /// Stubs ported from `SKESA/guidedgraph.hpp`.
@@ -861,7 +856,6 @@ pub mod guidedgraph_hpp {
     pub fn step_left() {
         panic!("yet to be translated: guidedgraph.hpp:605 StepLeft");
     }
-
 }
 
 /// Stubs ported from `SKESA/guidedpath_naa.hpp`.
@@ -940,7 +934,6 @@ pub mod guidedpath_naa_hpp {
     pub fn add_one_base_v3() {
         panic!("yet to be translated: guidedpath_naa.hpp:711 AddOneBase");
     }
-
 }
 
 /// Stubs ported from `SKESA/nuc_prot_align.hpp`.
@@ -983,7 +976,6 @@ pub mod readsgetter_hpp {
     // explicitly unsupported in skesa-rs per TODO.md ("SRA-related behavior…
     // intentionally unsupported, document and reject clearly"). Rust rejects
     // `--use_paired_ends` SRA accessions at CLI parse time instead.
-
 }
 
 /// Stubs ported from `SKESA/skesa.cpp`.

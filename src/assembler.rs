@@ -88,8 +88,13 @@ pub fn run_assembly(
     let run_initial_same_k_connect_extend = params.steps <= 1;
 
     // Build graph at min_kmer
-    let (mut kmers, average_count) =
-        build_graph(reads, params.min_kmer, params.min_count, true, params.memory_gb);
+    let (mut kmers, average_count) = build_graph(
+        reads,
+        params.min_kmer,
+        params.min_count,
+        true,
+        params.memory_gb,
+    );
     let bins = sorted_counter::get_bins(&kmers);
     let genome_size = histogram::calculate_genome_size(&bins);
 
@@ -297,8 +302,13 @@ pub fn run_assembly(
                 }
             }
 
-            let (mut iter_kmers, _iter_avg) =
-                build_graph(&iter_reads, kmer_len, params.min_count, true, params.memory_gb);
+            let (mut iter_kmers, _iter_avg) = build_graph(
+                &iter_reads,
+                kmer_len,
+                params.min_count,
+                true,
+                params.memory_gb,
+            );
             if iter_kmers.size() == 0 {
                 eprintln!(
                     "Empty graph for kmer length: {} skipping this and longer kmers",
@@ -459,8 +469,7 @@ Connecting mate pairs using kmer length: {}",
             eprintln!("Added notconnected: {}", added);
             let mut long_kmers = [(1.25 * max_kmer as f64) as usize, 0, paired_insert_n50];
             long_kmers[1] = (long_kmers[0] + long_kmers[2]) / 2;
-            let connected_read_pairs =
-                vec![[combined_connected_reads, ReadHolder::new(false)]];
+            let connected_read_pairs = vec![[combined_connected_reads, ReadHolder::new(false)]];
 
             for mut kmer_len in long_kmers {
                 kmer_len -= 1 - kmer_len % 2;
@@ -819,10 +828,7 @@ fn connect_and_extend_contigs(
         if left + right >= primary_len {
             continue;
         }
-        let mut linked = crate::linked_contig::LinkedContig::new(
-            std::mem::take(contig),
-            kmer_len,
-        );
+        let mut linked = crate::linked_contig::LinkedContig::new(std::mem::take(contig), kmer_len);
         linked.left_extend = left as i32;
         linked.right_extend = right as i32;
 

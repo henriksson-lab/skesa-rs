@@ -132,13 +132,7 @@ fn find_read_position(
     None
 }
 
-fn pair_span_is_deep(
-    pos: i32,
-    plus: i32,
-    contig: &ContigSequence,
-    margin: i32,
-    span: i32,
-) -> bool {
+fn pair_span_is_deep(pos: i32, plus: i32, contig: &ContigSequence, margin: i32, span: i32) -> bool {
     let clen = contig.len_max() as i32;
     let lr = contig.left_repeat;
     let rr = contig.right_repeat;
@@ -147,13 +141,7 @@ fn pair_span_is_deep(
         || (plus < 0 && pos - span + 1 >= margin + lr && pos < clen - margin - rr)
 }
 
-fn read_is_deep(
-    pos: i32,
-    plus: i32,
-    contig: &ContigSequence,
-    margin: i32,
-    read_len: i32,
-) -> bool {
+fn read_is_deep(pos: i32, plus: i32, contig: &ContigSequence, margin: i32, read_len: i32) -> bool {
     let clen = contig.len_max() as i32;
     let lr = contig.left_repeat;
     let rr = contig.right_repeat;
@@ -284,13 +272,9 @@ pub fn clean_reads(
 
                 let pos = find_read_position(&read, kmer_len, &map);
                 let should_remove = match pos {
-                    Some((p, plus, ci)) => read_is_deep(
-                        p,
-                        plus,
-                        &contigs[ci],
-                        margin as i32,
-                        read.len() as i32,
-                    ),
+                    Some((p, plus, ci)) => {
+                        read_is_deep(p, plus, &contigs[ci], margin as i32, read.len() as i32)
+                    }
                     None => false,
                 };
 
@@ -363,12 +347,9 @@ pub fn clean_pair_connection_reads(
                             let rr = contig.right_repeat;
                             let span_p1 = if plus1 > 0 { p1 + 1 } else { p1 - 1 };
                             let span_p2 = if plus2 > 0 { p2 + 1 } else { p2 - 1 };
-                            let is_deep_inside = (plus1 > 0
-                                && span_p1 >= m + lr
-                                && span_p2 < clen - m - rr)
-                                || (plus1 < 0
-                                && span_p2 >= m + lr
-                                    && span_p1 < clen - m - rr);
+                            let is_deep_inside =
+                                (plus1 > 0 && span_p1 >= m + lr && span_p2 < clen - m - rr)
+                                    || (plus1 < 0 && span_p2 >= m + lr && span_p1 < clen - m - rr);
                             if is_deep_inside {
                                 continue;
                             }

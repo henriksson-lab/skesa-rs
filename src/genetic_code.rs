@@ -3,7 +3,7 @@
 
 /// A genetic code table entry: (amino_acids, starts_stops, code_number, name)
 pub struct TableInfo {
-    pub amino_acids: &'static str,  // 64 characters: amino acid for each codon
+    pub amino_acids: &'static str, // 64 characters: amino acid for each codon
     pub starts_stops: &'static str, // 64 characters: M for start, * for stop
     pub code_number: u32,
     pub name: &'static str,

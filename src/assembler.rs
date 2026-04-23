@@ -14,6 +14,10 @@ use crate::reads_getter::ReadPair;
 use crate::sorted_counter;
 use std::collections::HashSet;
 
+fn debug_connect_extend_enabled() -> bool {
+    std::env::var_os("SKESA_DEBUG_CONNECT_EXTEND").is_some()
+}
+
 /// Assembly parameters
 pub struct AssemblerParams {
     pub min_kmer: usize,
@@ -59,6 +63,15 @@ pub struct AssemblyResult {
     pub connected_reads: ReadHolder,
 }
 
+fn histogram_minimum_from_bins(bins: &crate::histogram::Bins) -> usize {
+    let (first, _) = crate::histogram::histogram_range(bins);
+    if first < 0 {
+        0
+    } else {
+        bins[first as usize].0 as usize
+    }
+}
+
 /// Run the iterative assembly pipeline.
 pub fn run_assembly(
     reads: &[ReadPair],
@@ -85,8 +98,6 @@ pub fn run_assembly(
         && reads
             .iter()
             .any(|r| r[0].read_num() > 0 && r[0].contains_paired());
-    let run_initial_same_k_connect_extend = params.steps <= 1;
-
     // Build graph at min_kmer
     let (mut kmers, average_count) = build_graph(
         reads,
@@ -105,6 +116,7 @@ pub fn run_assembly(
     let digger_params = DiggerParams {
         fraction: params.fraction,
         jump: params.max_snp_len,
+        hist_min: histogram_minimum_from_bins(&bins),
         low_count: params.min_count,
         // SKESA's initial ImproveContigs pass is conservative even when
         // --allow_snps is requested; SNP-aware traversal is a later pass.
@@ -119,20 +131,7 @@ pub fn run_assembly(
             &digger_params,
         );
 
-        // Process initial seeds: clip kmer_len from both ends (uncertain extension zones)
-        // and filter by minimum length, matching C++ GenerateNewSeeds behavior
-        let min_seed_len = 3 * params.min_kmer;
-        for contig in &mut contigs {
-            if !contig.circular {
-                clip_new_seed_flanks(contig, params.min_kmer);
-                contig.left_repeat = (params.min_kmer - 1) as i32;
-                contig.right_repeat = (params.min_kmer - 1) as i32;
-            }
-        }
-        contigs.retain(|c| c.len_min() >= min_seed_len);
-        if run_initial_same_k_connect_extend {
-            connect_and_extend_contigs(&mut contigs, &kmers, params.min_kmer, &digger_params);
-        }
+        connect_and_extend_contigs(&mut contigs, &kmers, params.min_kmer, &digger_params);
         contigs.sort();
 
         eprintln!(
@@ -162,18 +161,7 @@ pub fn run_assembly(
             &digger_params,
             pre_visited,
         );
-        let min_seed_len = 3 * params.min_kmer;
-        for contig in &mut new_seeds {
-            if !contig.circular {
-                clip_new_seed_flanks(contig, params.min_kmer);
-                contig.left_repeat = (params.min_kmer - 1) as i32;
-                contig.right_repeat = (params.min_kmer - 1) as i32;
-            }
-        }
-        new_seeds.retain(|c| c.len_min() >= min_seed_len);
-        if run_initial_same_k_connect_extend {
-            connect_and_extend_contigs(&mut new_seeds, &kmers, params.min_kmer, &digger_params);
-        }
+        connect_and_extend_contigs(&mut new_seeds, &kmers, params.min_kmer, &digger_params);
         eprintln!(
             "Kmer: {} Graph size: {} Contigs in: {} New seeds: {}",
             params.min_kmer,
@@ -193,16 +181,20 @@ pub fn run_assembly(
 
     // Estimate max_kmer before paired-read handling and cleaning. C++ uses this
     // to decide whether long-insert paired iterations should run.
-    let max_kmer = if params.max_kmer > 0 {
+    let mut max_kmer = if params.max_kmer > 0 {
         params.max_kmer
     } else if params.steps > 1 && average_count > params.max_kmer_count as f64 {
         let est = (read_len as f64 + 1.0
             - (params.max_kmer_count as f64 / average_count)
-                * (read_len as f64 - params.min_kmer as f64 + 1.0)) as usize;
+                * (read_len as f64 - params.min_kmer as f64 + 1.0))
+            .floor() as usize;
         est.min(kmer::MAX_KMER)
     } else {
         params.min_kmer
     };
+    if max_kmer > params.min_kmer {
+        max_kmer -= 1 - max_kmer % 2;
+    }
 
     // Estimate insert size if paired reads are available. C++ uses the first
     // graph connection pass only to estimate N50; long-insert connected reads
@@ -216,8 +208,13 @@ pub fn run_assembly(
     let mut use_long_paired_iterations = false;
     if has_paired {
         paired_insert_n50 = if params.insert_size == 0 {
-            let insert_n50 =
-                crate::paired_reads::estimate_insert_size(reads, &kmers, params.min_kmer, 10000);
+            let insert_n50 = crate::paired_reads::estimate_insert_size_with_low_count(
+                reads,
+                &kmers,
+                params.min_kmer,
+                10000,
+                params.min_count,
+            );
             if insert_n50 > 0 {
                 eprintln!("N50 for inserts: {}", insert_n50);
             }
@@ -229,11 +226,12 @@ pub fn run_assembly(
         use_long_paired_iterations =
             paired_insert_n50 > 0 && paired_insert_n50 as f64 > 1.5 * max_kmer as f64;
         if !use_long_paired_iterations {
-            connected_reads = crate::paired_reads::connect_pairs(
+            connected_reads = crate::paired_reads::connect_pairs_with_low_count(
                 reads,
                 &kmers,
                 params.min_kmer,
                 paired_insert_limit,
+                params.min_count,
             )
             .connected;
         }
@@ -247,11 +245,15 @@ pub fn run_assembly(
     let raw_read_margin = max_kmer + 50;
     let cleanup_repeat = (params.min_kmer as i32 - 5).max(0);
     let pair_cleanup_repeat = (params.min_kmer as i32 - 1).max(0);
+    let cleanup_min_contig_len = max_kmer.max(paired_insert_limit);
+    let cleanup_graph = Some(crate::clean_reads::CleanupGraphParams {
+        kmers: &graphs[0].1,
+        fraction: params.fraction,
+        average_count,
+    });
     let cleanup_contigs = if use_long_paired_iterations && params.steps > 1 {
         let mut cleanup = current_contigs.clone();
-        connect_and_extend_contigs(&mut cleanup, &graphs[0].1, params.min_kmer, &digger_params);
-        for (cleanup_contig, original_contig) in cleanup.iter_mut().zip(current_contigs.iter()) {
-            let _ = original_contig;
+        for cleanup_contig in &mut cleanup {
             cleanup_contig.left_repeat = cleanup_repeat;
             cleanup_contig.right_repeat = cleanup_repeat;
         }
@@ -263,8 +265,10 @@ pub fn run_assembly(
         reads,
         &cleanup_contigs,
         params.min_kmer,
+        cleanup_min_contig_len,
         raw_read_margin,
         paired_insert_limit,
+        cleanup_graph,
     );
     if use_long_paired_iterations {
         let mut pair_cleanup_contigs = cleanup_contigs.clone();
@@ -276,8 +280,10 @@ pub fn run_assembly(
             reads,
             &pair_cleanup_contigs,
             params.min_kmer,
+            cleanup_min_contig_len,
             50,
             paired_insert_limit,
+            cleanup_graph,
         );
         connection_reads = cleanup.remaining_pairs;
         internal_connected_reads = cleanup.internal_reads;
@@ -302,7 +308,7 @@ pub fn run_assembly(
                 }
             }
 
-            let (mut iter_kmers, _iter_avg) = build_graph(
+            let (mut iter_kmers, iter_avg) = build_graph(
                 &iter_reads,
                 kmer_len,
                 params.min_count,
@@ -318,6 +324,10 @@ pub fn run_assembly(
             }
 
             let iter_bins = sorted_counter::get_bins(&iter_kmers);
+            let iter_digger_params = DiggerParams {
+                hist_min: histogram_minimum_from_bins(&iter_bins),
+                ..digger_params
+            };
 
             // Mark k-mers from previous contigs as visited in the new graph
             let pre_visited = mark_previous_contigs(&current_contigs, &iter_kmers, kmer_len);
@@ -329,13 +339,14 @@ pub fn run_assembly(
                 &iter_bins,
                 kmer_len,
                 true,
-                &digger_params,
+                &iter_digger_params,
                 pre_visited,
             );
 
             // Filter: new seeds should be at least 3*kmer_len to avoid noise
             let min_new_seed_len = 3 * kmer_len;
             iter_contigs.retain(|c| c.len_min() >= min_new_seed_len);
+            reset_extend_budgets(&mut iter_contigs);
 
             eprintln!(
                 "Kmer: {} Graph size: {} Contigs in: {} New seeds: {}",
@@ -346,7 +357,12 @@ pub fn run_assembly(
             );
 
             // Extend and connect contigs in the new graph using link-chain approach
-            connect_and_extend_contigs(&mut current_contigs, &iter_kmers, kmer_len, &digger_params);
+            connect_and_extend_contigs(
+                &mut current_contigs,
+                &iter_kmers,
+                kmer_len,
+                &iter_digger_params,
+            );
 
             // Filter existing contigs: remove ones that don't anchor well in the new graph
             filter_poorly_anchored(&mut current_contigs, &iter_kmers, kmer_len);
@@ -356,6 +372,11 @@ pub fn run_assembly(
 
             all_iterations.push(current_contigs.clone());
             graphs.push((kmer_len, iter_kmers));
+            let iter_cleanup_graph = Some(crate::clean_reads::CleanupGraphParams {
+                kmers: &graphs.last().expect("current graph exists").1,
+                fraction: params.fraction,
+                average_count: iter_avg,
+            });
 
             if use_long_paired_iterations {
                 let mut cleanup_view = current_contigs.clone();
@@ -372,21 +393,27 @@ pub fn run_assembly(
                     &iter_reads,
                     &cleanup_view,
                     kmer_len,
+                    cleanup_min_contig_len,
                     raw_read_margin,
                     paired_insert_limit,
+                    iter_cleanup_graph,
                 );
                 internal_connected_reads = crate::clean_reads::clean_internal_reads(
                     &internal_connected_reads,
                     &pair_cleanup_view,
                     kmer_len,
+                    cleanup_min_contig_len,
                     50,
+                    iter_cleanup_graph,
                 );
                 let cleanup = crate::clean_reads::clean_pair_connection_reads(
                     &connection_reads,
                     &pair_cleanup_view,
                     kmer_len,
+                    cleanup_min_contig_len,
                     50,
                     paired_insert_limit,
+                    iter_cleanup_graph,
                 );
                 connection_reads = cleanup.remaining_pairs;
                 let mut iter = cleanup.internal_reads.string_iter();
@@ -399,8 +426,10 @@ pub fn run_assembly(
                     &iter_reads,
                     &current_contigs,
                     kmer_len,
+                    cleanup_min_contig_len,
                     raw_read_margin,
                     paired_insert_limit,
+                    iter_cleanup_graph,
                 );
             }
             let mut total_cleaned: usize = 0;
@@ -427,11 +456,12 @@ pub fn run_assembly(
 Connecting mate pairs using kmer length: {}",
                 kmer_len
             );
-            let pair_result = crate::paired_reads::connect_pairs_extending(
+            let pair_result = crate::paired_reads::connect_pairs_extending_with_low_count(
                 &remaining_pairs,
                 graph_kmers,
                 *kmer_len,
                 paired_insert_limit,
+                params.min_count,
             );
             let mut iter = pair_result.connected.string_iter();
             while !iter.at_end() {
@@ -489,13 +519,17 @@ Connecting mate pairs using kmer length: {}",
                 }
 
                 let paired_bins = sorted_counter::get_bins(&paired_kmers);
+                let paired_digger_params = DiggerParams {
+                    hist_min: histogram_minimum_from_bins(&paired_bins),
+                    ..digger_params
+                };
                 let pre_visited = mark_previous_contigs(&current_contigs, &paired_kmers, kmer_len);
                 let mut paired_contigs = graph_digger::assemble_contigs_with_visited(
                     &mut paired_kmers,
                     &paired_bins,
                     kmer_len,
                     true,
-                    &digger_params,
+                    &paired_digger_params,
                     pre_visited,
                 );
                 paired_contigs.retain(|c| c.len_min() >= 3 * kmer_len);
@@ -512,7 +546,7 @@ Connecting mate pairs using kmer length: {}",
                     &mut current_contigs,
                     &paired_kmers,
                     kmer_len,
-                    &digger_params,
+                    &paired_digger_params,
                 );
                 filter_poorly_anchored(&mut current_contigs, &paired_kmers, kmer_len);
                 current_contigs = merge_contigs(current_contigs, paired_contigs, kmer_len);
@@ -580,13 +614,6 @@ Connecting mate pairs using kmer length: {}",
     }
 }
 
-fn clip_new_seed_flanks(contig: &mut ContigSequence, kmer_len: usize) {
-    let mut linked = crate::linked_contig::LinkedContig::new(std::mem::take(contig), kmer_len);
-    linked.clip_left(kmer_len);
-    linked.clip_right(kmer_len);
-    *contig = linked.seq;
-}
-
 fn seed_to_contig(seed: &str) -> ContigSequence {
     let mut contig = ContigSequence::new();
     contig.insert_new_chunk();
@@ -607,6 +634,13 @@ fn seed_to_contig(seed: &str) -> ContigSequence {
     }
 
     contig
+}
+
+fn reset_extend_budgets(contigs: &mut ContigSequenceList) {
+    for contig in contigs {
+        contig.left_extend = 0;
+        contig.right_extend = 0;
+    }
 }
 
 /// Mark k-mers from previous contigs as visited in the new graph.
@@ -664,6 +698,13 @@ fn connect_and_extend_contigs(
 
     let max_kmer = crate::kmer::Kmer::from_chars(kmer_len, std::iter::repeat_n('G', kmer_len));
 
+    let good_node = |kmer: crate::kmer::Kmer| -> bool {
+        let rc = kmer.revcomp(kmer_len);
+        let canonical = if kmer < rc { kmer } else { rc };
+        let idx = kmers.find(&canonical);
+        idx < kmers.size() && ((kmers.get_count(idx) & 0xFFFF_FFFF) as usize) >= params.low_count
+    };
+
     // Build visited set from all contig k-mers
     let mut visited = vec![false; kmers.size()];
     for contig in contigs.iter() {
@@ -690,202 +731,496 @@ fn connect_and_extend_contigs(
     let mut extensions: Vec<LinkedContig> = Vec::new();
     let mut connectors = 0;
     let mut extenders = 0;
-    for (contig_idx, contig) in contigs.iter().enumerate() {
-        let seq = contig.primary_sequence();
-        if seq.len() < kmer_len {
+    for contig_idx in 0..contigs.len() {
+        let mut parent = LinkedContig::new(contigs[contig_idx].clone(), kmer_len);
+        parent.left_extend = contigs[contig_idx].left_extend;
+        parent.right_extend = contigs[contig_idx].right_extend;
+        let seq = parent.seq.primary_sequence();
+        if parent.seq.circular || seq.len() < kmer_len {
             continue;
         }
 
         // Extend right end
-        let last_kmer_str = &seq[seq.len() - kmer_len..];
-        let last_kmer = crate::kmer::Kmer::from_kmer_str(last_kmer_str);
-        let right_ext = graph_digger::extend_right_simple(
-            kmers,
-            &last_kmer,
-            kmer_len,
-            &max_kmer,
-            &mut visited,
-            params,
-        );
-
-        // Extend left end (by extending revcomp of first kmer to the right)
-        let first_kmer_str = &seq[..kmer_len];
-        let first_kmer = crate::kmer::Kmer::from_kmer_str(first_kmer_str);
-        let left_ext = graph_digger::extend_left_simple(
-            kmers,
-            &first_kmer,
-            kmer_len,
-            &max_kmer,
-            &mut visited,
-            params,
-        );
-
-        if !right_ext.is_empty() {
-            // Create extension with left_link pointing back to parent contig
-            let mut ext_seq_chars: Vec<char> = seq[seq.len() - kmer_len + 1..].chars().collect();
-            ext_seq_chars.extend(&right_ext);
-
-            let mut ext_contig = ContigSequence::new();
-            ext_contig.insert_new_chunk_with(ext_seq_chars);
-
-            let mut ext = LinkedContig::new(ext_contig, kmer_len);
-            ext.left_link = Some(contig_idx);
-            ext.next_left = Some(last_kmer);
-            extenders += 1;
-            extensions.push(ext);
+        if parent.seq.right_repeat < kmer_len as i32 {
+            let right_chunk_idx = parent.seq.len() - 1;
+            let allowed_right_intrusion = parent
+                .seq
+                .chunk_len_max(right_chunk_idx)
+                .saturating_sub(kmer_len);
+            let last_kmer = parent
+                .back_kmer()
+                .expect("connect/extend parent has full right kmer");
+            if good_node(last_kmer) {
+                let right_ext = graph_digger::extend_right_for_connect(
+                    kmers,
+                    &last_kmer,
+                    kmer_len,
+                    &max_kmer,
+                    &mut visited,
+                    params,
+                    allowed_right_intrusion,
+                );
+                if !right_ext.sequence.is_empty() || right_ext.last_kmer.is_some() {
+                    let mut skip = false;
+                    if right_ext.intrusion > 0 && right_ext.last_kmer.is_none() {
+                        let ext_len = right_ext.sequence.len();
+                        if ext_len >= 2 {
+                            let last_chunk = 1usize;
+                            let snp_chunk = ext_len.saturating_sub(1);
+                            if snp_chunk < kmer_len
+                                && ext_len
+                                    .saturating_sub(last_chunk)
+                                    .saturating_sub(snp_chunk)
+                                    < right_ext.intrusion
+                            {
+                                skip = true;
+                            }
+                        }
+                        if !skip && right_ext.intrusion <= seq.len().saturating_sub(kmer_len) {
+                            let clipped_start = seq.len() - right_ext.intrusion - kmer_len;
+                            let clipped = crate::kmer::Kmer::from_kmer_str(
+                                &seq[clipped_start..clipped_start + kmer_len],
+                            );
+                            if !good_node(clipped) {
+                                skip = true;
+                            }
+                        }
+                    }
+                    if !skip {
+                        if right_ext.intrusion > 0 {
+                            parent.clip_right(right_ext.intrusion);
+                        }
+                        let takeoff = parent
+                            .back_kmer()
+                            .expect("clipped connect/extend parent keeps right kmer");
+                        let ext = LinkedContig::from_right_extension(
+                            contig_idx,
+                            takeoff,
+                            &right_ext.sequence,
+                            right_ext.last_kmer,
+                            kmer_len,
+                        );
+                        if debug_connect_extend_enabled() {
+                            eprintln!(
+                                "CE_EXT k={} parent={} side=R parent_len={} ext_len={} denied={} takeoff={}",
+                                kmer_len,
+                                contig_idx,
+                                seq.len(),
+                                ext.seq.len_max(),
+                                ext.next_right
+                                    .map(|k| k.to_kmer_string(kmer_len))
+                                    .unwrap_or_else(|| "-".to_string()),
+                                takeoff.to_kmer_string(kmer_len),
+                            );
+                        }
+                        extenders += 1;
+                        extensions.push(ext);
+                    }
+                }
+            }
         }
 
-        if !left_ext.is_empty() {
-            // Create extension with right_link pointing back to parent contig
-            let mut ext_seq_chars: Vec<char> = left_ext.clone();
-            ext_seq_chars.extend(seq[..kmer_len - 1].chars());
+        if parent.seq.left_repeat < kmer_len as i32 {
+            let first_kmer = parent
+                .front_kmer()
+                .expect("connect/extend parent has full left kmer");
+            let allowed_left_intrusion = parent.seq.chunk_len_max(0).saturating_sub(kmer_len);
+            if good_node(first_kmer) {
+                let left_ext = graph_digger::extend_left_for_connect(
+                    kmers,
+                    &first_kmer,
+                    kmer_len,
+                    &max_kmer,
+                    &mut visited,
+                    params,
+                    allowed_left_intrusion,
+                );
 
-            let mut ext_contig = ContigSequence::new();
-            ext_contig.insert_new_chunk_with(ext_seq_chars);
-
-            let mut ext = LinkedContig::new(ext_contig, kmer_len);
-            ext.right_link = Some(contig_idx);
-            ext.next_right = Some(first_kmer);
-            extenders += 1;
-            extensions.push(ext);
+                if !left_ext.sequence.is_empty() || left_ext.last_kmer.is_some() {
+                    let mut skip = false;
+                    if left_ext.intrusion > 0 && left_ext.last_kmer.is_none() {
+                        let ext_len = left_ext.sequence.len();
+                        if ext_len >= 2 {
+                            let last_chunk = 1usize;
+                            let snp_chunk = ext_len.saturating_sub(1);
+                            if snp_chunk < kmer_len
+                                && ext_len
+                                    .saturating_sub(last_chunk)
+                                    .saturating_sub(snp_chunk)
+                                    < left_ext.intrusion
+                            {
+                                skip = true;
+                            }
+                        }
+                        if !skip && left_ext.intrusion + kmer_len <= seq.len() {
+                            let clipped = crate::kmer::Kmer::from_kmer_str(
+                                &seq[left_ext.intrusion..left_ext.intrusion + kmer_len],
+                            );
+                            if !good_node(clipped) {
+                                skip = true;
+                            }
+                        }
+                    }
+                    if !skip {
+                        if left_ext.intrusion > 0 {
+                            parent.clip_left(left_ext.intrusion);
+                        }
+                        let takeoff = parent
+                            .front_kmer()
+                            .expect("clipped connect/extend parent keeps left kmer");
+                        let ext = LinkedContig::from_left_extension(
+                            contig_idx,
+                            takeoff,
+                            &left_ext.sequence,
+                            left_ext.last_kmer,
+                            kmer_len,
+                        );
+                        if debug_connect_extend_enabled() {
+                            eprintln!(
+                                "CE_EXT k={} parent={} side=L parent_len={} ext_len={} denied={} takeoff={}",
+                                kmer_len,
+                                contig_idx,
+                                seq.len(),
+                                ext.seq.len_max(),
+                                ext.next_left
+                                    .map(|k| k.to_kmer_string(kmer_len))
+                                    .unwrap_or_else(|| "-".to_string()),
+                                takeoff.to_kmer_string(kmer_len),
+                            );
+                        }
+                        extenders += 1;
+                        extensions.push(ext);
+                    }
+                }
+            }
         }
+
+        contigs[contig_idx] = parent.seq;
     }
-
-    // If both left_link and right_link of an extension connect to different contigs,
-    // it's a connector
-    for ext in &extensions {
-        if ext.left_link.is_some() && ext.right_link.is_some() {
-            connectors += 1;
-        }
-    }
-
-    eprintln!("Connectors: {} Extenders: {}", connectors, extenders);
 
     if extensions.is_empty() {
+        eprintln!("Connectors: {} Extenders: {}", connectors, extenders);
         return;
     }
 
     // Connect fragments (merge extensions that share denied nodes)
-    crate::linked_contig::connect_fragments(&mut extensions);
+    crate::linked_contig::connect_fragments_with_graph(&mut extensions, kmers);
 
-    // Apply extensions to contigs: for each extension with a left_link or right_link,
-    // extend the parent contig and track the new bases in left_extend/right_extend.
+    connectors = 0;
+    extenders = 0;
     for ext in &extensions {
-        if let Some(parent_idx) = ext.left_link {
-            if parent_idx < contigs.len() {
-                // Extension extends parent's right end
-                let parent_seq = contigs[parent_idx].primary_sequence();
-                let ext_seq = ext.seq.primary_sequence();
-                // Find overlap (the parent's last kmer-1 chars should match ext's beginning)
-                let overlap = kmer_len - 1;
-                if ext_seq.len() > overlap {
-                    let added = ext_seq.len() - overlap;
-                    let prev_left_extend = contigs[parent_idx].left_extend;
-                    let prev_right_extend = contigs[parent_idx].right_extend;
-                    let mut new_seq: Vec<char> = parent_seq.chars().collect();
-                    new_seq.extend(ext_seq[overlap..].chars());
-                    contigs[parent_idx] = ContigSequence::new();
-                    contigs[parent_idx].insert_new_chunk_with(new_seq);
-                    contigs[parent_idx].left_extend = prev_left_extend;
-                    contigs[parent_idx].right_extend = prev_right_extend + added as i32;
+        if debug_connect_extend_enabled() {
+            eprintln!(
+                "CE_POST k={} seq_len={} empty={} next_left={} next_right={} left_link={:?} right_link={:?}",
+                kmer_len,
+                ext.seq.len_max(),
+                ext.empty_linker(),
+                ext.next_left
+                    .map(|k| k.to_kmer_string(kmer_len))
+                    .unwrap_or_else(|| "-".to_string()),
+                ext.next_right
+                    .map(|k| k.to_kmer_string(kmer_len))
+                    .unwrap_or_else(|| "-".to_string()),
+                ext.left_link,
+                ext.right_link,
+            );
+        }
+        if ext.left_link.is_some() && ext.right_link.is_some() {
+            connectors += 1;
+        } else {
+            extenders += 1;
+        }
+    }
+    eprintln!("Connectors: {} Extenders: {}", connectors, extenders);
+
+    let parent_count = contigs.len();
+    let mut arena: Vec<LinkedContig> = contigs
+        .iter()
+        .cloned()
+        .map(|seq| {
+            let left_extend = seq.left_extend;
+            let right_extend = seq.right_extend;
+            let mut linked = LinkedContig::new(seq, kmer_len);
+            linked.left_extend = left_extend;
+            linked.right_extend = right_extend;
+            linked
+        })
+        .collect();
+    arena.extend(extensions);
+
+    assign_connect_and_extend_links(&mut arena, parent_count, kmer_len);
+    select_connect_and_extend_chain_starts(&mut arena, parent_count);
+
+    for start in 0..parent_count {
+        if arena[start].is_taken != 0 {
+            continue;
+        }
+        arena[start].is_taken = 1;
+        let before_len = arena[start].seq.len_max();
+        let before_left_extend = arena[start].left_extend;
+        let before_right_extend = arena[start].right_extend;
+        let mut chain_trace = Vec::new();
+
+        let mut parent = start;
+        let mut num = 0usize;
+        let mut circular = false;
+        while let Some(child) = arena[parent].right_link {
+            if arena[child].left_link != Some(parent) {
+                arena[child].reverse_complement();
+            }
+            if arena[child].right_link == Some(start) {
+                circular = true;
+                if arena[child].left_link == Some(start)
+                    && arena[start].right_connecting_kmer() != arena[child].next_left
+                {
+                    arena[child].reverse_complement();
                 }
             }
+
+            let child_copy = arena[child].clone();
+            chain_trace.push(format!("R:{parent}->{child}:len{}", child_copy.seq.len_max()));
+            arena[start].add_to_right(&child_copy);
+            if num % 2 == 1 {
+                arena[start].seq.right_repeat = child_copy.seq.right_repeat;
+            }
+            arena[child].is_taken = 2;
+            if circular {
+                arena[start].seq.circular = arena[start].seq.len_max() >= 2 * kmer_len - 1;
+                break;
+            }
+            parent = child;
+            num += 1;
         }
-        if let Some(parent_idx) = ext.right_link {
-            if parent_idx < contigs.len() {
-                // Extension extends parent's left end
-                let parent_seq = contigs[parent_idx].primary_sequence();
-                let ext_seq = ext.seq.primary_sequence();
-                let overlap = kmer_len - 1;
-                if ext_seq.len() > overlap {
-                    let added = ext_seq.len() - overlap;
-                    let prev_left_extend = contigs[parent_idx].left_extend;
-                    let prev_right_extend = contigs[parent_idx].right_extend;
-                    let mut new_seq: Vec<char> =
-                        ext_seq[..ext_seq.len() - overlap].chars().collect();
-                    new_seq.extend(parent_seq.chars());
-                    contigs[parent_idx] = ContigSequence::new();
-                    contigs[parent_idx].insert_new_chunk_with(new_seq);
-                    contigs[parent_idx].left_extend = prev_left_extend + added as i32;
-                    contigs[parent_idx].right_extend = prev_right_extend;
-                }
+        if circular {
+            continue;
+        }
+
+        parent = start;
+        num = 0;
+        while let Some(child) = arena[parent].left_link {
+            if arena[child].right_link != Some(parent) {
+                arena[child].reverse_complement();
+            }
+            let child_copy = arena[child].clone();
+            chain_trace.push(format!("L:{parent}->{child}:len{}", child_copy.seq.len_max()));
+            arena[start].add_to_left(&child_copy);
+            if num % 2 == 1 {
+                arena[start].seq.left_repeat = child_copy.seq.left_repeat;
+            }
+            arena[child].is_taken = 2;
+            parent = child;
+            num += 1;
+        }
+
+        clip_connect_and_extend_flanks(&mut arena[start], kmers, kmer_len);
+        if debug_connect_extend_enabled() {
+            eprintln!(
+                "CE_CHAIN k={} start={} len {}->{} left_extend {}->{} right_extend {}->{} circular={}",
+                kmer_len,
+                start,
+                before_len,
+                arena[start].seq.len_max(),
+                before_left_extend,
+                arena[start].left_extend,
+                before_right_extend,
+                arena[start].right_extend,
+                arena[start].seq.circular,
+            );
+            if !chain_trace.is_empty() {
+                eprintln!("CE_TRACE k={} start={} {}", kmer_len, start, chain_trace.join(" "));
             }
         }
     }
 
-    // Clip the newly-added extension bases tracked above. C++ keeps
-    // m_left_extend / m_right_extend on each SContig and clips them at the
-    // start of the next iteration (or at end-of-pipeline). For fixtures using
-    // `--steps 1` the clip happens here; for multi-step pipelines the next
-    // iteration will see the trimmed contig.
-    for contig in contigs.iter_mut() {
-        let left = contig.left_extend.max(0) as usize;
-        let right = contig.right_extend.max(0) as usize;
-        if left == 0 && right == 0 {
+    contigs.clear();
+    for linked in arena.iter().take(parent_count) {
+        if linked.is_taken == 2 || linked.seq.len_min() < kmer_len {
             continue;
         }
-        let primary_len = contig.primary_sequence().len();
-        if left + right >= primary_len {
-            continue;
-        }
-        let mut linked = crate::linked_contig::LinkedContig::new(std::mem::take(contig), kmer_len);
-        linked.left_extend = left as i32;
-        linked.right_extend = right as i32;
-
-        for _ in 0..10 {
-            if linked.left_extend <= 0 {
-                break;
-            }
-            let Some(front) = linked.front_kmer() else {
-                break;
-            };
-            let rfront = front.revcomp(kmer_len);
-            let canonical = if front < rfront { front } else { rfront };
-            let idx = kmers.find(&canonical);
-            if idx >= kmers.size() {
-                break;
-            }
-            let count = (kmers.get_count(idx) & 0xFFFF_FFFF) as u32;
-            if count > 5 {
-                break;
-            }
-            linked.clip_left(1);
-        }
-
-        for _ in 0..10 {
-            if linked.right_extend <= 0 {
-                break;
-            }
-            let Some(back) = linked.back_kmer() else {
-                break;
-            };
-            let rback = back.revcomp(kmer_len);
-            let canonical = if back < rback { back } else { rback };
-            let idx = kmers.find(&canonical);
-            if idx >= kmers.size() {
-                break;
-            }
-            let count = (kmers.get_count(idx) & 0xFFFF_FFFF) as u32;
-            if count > 5 {
-                break;
-            }
-            linked.clip_right(1);
-        }
-        if left > 0 {
-            linked.clip_left(left);
-        }
-        if right > 0 {
-            linked.clip_right(right);
-        }
-        *contig = linked.seq;
-        contig.left_extend = 0;
-        contig.right_extend = 0;
+        let mut seq = linked.seq.clone();
+        seq.left_extend = 0;
+        seq.right_extend = 0;
+        contigs.push(seq);
     }
 
     contigs.sort();
     // BFS-based connect_contigs_through_graph removed here as well — C++
     // ConnectAndExtendContigs uses ConnectFragments + extend_distance
     // bookkeeping, not a BFS-find-path step.
+}
+
+fn assign_connect_and_extend_links(
+    arena: &mut [crate::linked_contig::LinkedContig],
+    parent_count: usize,
+    kmer_len: usize,
+) {
+    for ext_idx in parent_count..arena.len() {
+        if let (Some(parent_idx), Some(next_left)) =
+            (arena[ext_idx].left_link, arena[ext_idx].next_left)
+        {
+            if parent_idx < parent_count {
+                if arena[parent_idx].right_connecting_kmer() == Some(next_left) {
+                    set_connect_and_extend_link(
+                        &mut arena[parent_idx].right_link,
+                        ext_idx,
+                        "Multiple connection of contigs",
+                    );
+                } else if arena[parent_idx].left_connecting_kmer()
+                    == Some(next_left.revcomp(kmer_len))
+                {
+                    set_connect_and_extend_link(
+                        &mut arena[parent_idx].left_link,
+                        ext_idx,
+                        "Multiple connection of contigs",
+                    );
+                }
+            }
+        }
+
+        if let (Some(parent_idx), Some(next_right)) =
+            (arena[ext_idx].right_link, arena[ext_idx].next_right)
+        {
+            if parent_idx < parent_count {
+                if arena[parent_idx].left_connecting_kmer() == Some(next_right) {
+                    set_connect_and_extend_link(
+                        &mut arena[parent_idx].left_link,
+                        ext_idx,
+                        "Multiple connection of contigs",
+                    );
+                } else if arena[parent_idx].right_connecting_kmer()
+                    == Some(next_right.revcomp(kmer_len))
+                {
+                    set_connect_and_extend_link(
+                        &mut arena[parent_idx].right_link,
+                        ext_idx,
+                        "Multiple connection of contigs",
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn set_connect_and_extend_link(slot: &mut Option<usize>, target: usize, message: &str) {
+    if slot.is_some() {
+        panic!("{message}");
+    }
+    *slot = Some(target);
+}
+
+fn select_connect_and_extend_chain_starts(
+    arena: &mut [crate::linked_contig::LinkedContig],
+    parent_count: usize,
+) {
+    for idx in 0..parent_count {
+        if arena[idx].is_taken != 0 {
+            continue;
+        }
+        if arena[idx].left_link.is_none() && arena[idx].right_link.is_none() {
+            arena[idx].is_taken = 1;
+            continue;
+        }
+
+        let mut parent = idx;
+        let mut child = arena[parent].right_link;
+        let mut circular = false;
+        while let Some(child_idx) = child {
+            arena[child_idx].is_taken = 1;
+            child = if arena[child_idx].left_link == Some(parent) {
+                arena[child_idx].right_link
+            } else {
+                arena[child_idx].left_link
+            };
+            parent = child_idx;
+            circular = child == Some(idx);
+            if circular {
+                break;
+            }
+        }
+        if circular {
+            continue;
+        }
+
+        parent = idx;
+        child = arena[parent].left_link;
+        while let Some(child_idx) = child {
+            arena[child_idx].is_taken = 1;
+            child = if arena[child_idx].left_link == Some(parent) {
+                arena[child_idx].right_link
+            } else {
+                arena[child_idx].left_link
+            };
+            parent = child_idx;
+        }
+    }
+}
+
+fn clip_connect_and_extend_flanks(
+    contig: &mut crate::linked_contig::LinkedContig,
+    kmers: &KmerCount,
+    kmer_len: usize,
+) {
+    for _ in 0..10 {
+        if contig.left_extend <= 0 {
+            break;
+        }
+        let Some(front) = contig.front_kmer() else {
+            break;
+        };
+        let canonical = {
+            let rc = front.revcomp(kmer_len);
+            if front < rc {
+                front
+            } else {
+                rc
+            }
+        };
+        let idx = kmers.find(&canonical);
+        if idx >= kmers.size() {
+            break;
+        }
+        if (kmers.get_count(idx) & 0xFFFF_FFFF) as u32 > 5 {
+            break;
+        }
+        contig.clip_left(1);
+    }
+    let left_clip = kmer_len.min(contig.left_extend.max(0) as usize);
+    contig.clip_left(left_clip);
+    if contig.left_extend > 0 {
+        contig.seq.left_repeat =
+            (kmer_len as i32 - 1).min(contig.left_extend + contig.seq.left_repeat);
+    }
+
+    for _ in 0..10 {
+        if contig.right_extend <= 0 {
+            break;
+        }
+        let Some(back) = contig.back_kmer() else {
+            break;
+        };
+        let canonical = {
+            let rc = back.revcomp(kmer_len);
+            if back < rc {
+                back
+            } else {
+                rc
+            }
+        };
+        let idx = kmers.find(&canonical);
+        if idx >= kmers.size() {
+            break;
+        }
+        if (kmers.get_count(idx) & 0xFFFF_FFFF) as u32 > 5 {
+            break;
+        }
+        contig.clip_right(1);
+    }
+    let right_clip = kmer_len.min(contig.right_extend.max(0) as usize);
+    contig.clip_right(right_clip);
+    if contig.right_extend > 0 {
+        contig.seq.right_repeat =
+            (kmer_len as i32 - 1).min(contig.right_extend + contig.seq.right_repeat);
+    }
 }
 
 /// Merge contigs that share significant suffix/prefix overlaps.
@@ -1266,6 +1601,8 @@ fn calculate_l50(contigs: &[ContigSequence]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kmer::Kmer;
+    use crate::linked_contig::LinkedContig;
     use crate::reads_getter::ReadsGetter;
 
     #[test]
@@ -1301,5 +1638,20 @@ mod tests {
         // Total = 1500, N50 should be 400 (cumulative at 500: 500, at 400: 900 >= 750)
         assert_eq!(calculate_n50(&contigs), 400);
         assert_eq!(calculate_l50(&contigs), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Multiple connection of contigs")]
+    fn test_connect_and_extend_link_assignment_rejects_multiple_parent_links_like_cpp() {
+        let kmer_len = 5;
+        let takeoff = Kmer::from_kmer_str("CCCCC");
+        let mut parent_seq = ContigSequence::new();
+        parent_seq.insert_new_chunk_with("AAAAACCCCC".chars().collect());
+        let parent = LinkedContig::new(parent_seq, kmer_len);
+        let ext_a = LinkedContig::from_right_extension(0, takeoff, &['A'], None, kmer_len);
+        let ext_b = LinkedContig::from_right_extension(0, takeoff, &['T'], None, kmer_len);
+        let mut arena = vec![parent, ext_a, ext_b];
+
+        assign_connect_and_extend_links(&mut arena, 1, kmer_len);
     }
 }

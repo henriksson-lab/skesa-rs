@@ -17,10 +17,10 @@
 /// exceed `u32::MAX` per k-mer; spilling out of the low 32 bits would carry into
 /// the plus-strand/branching field just as it does in C++.
 use crate::kmer::Kmer;
-use crate::large_int::oahash64;
 
 use rayon::slice::ParallelSliceMut;
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{Read, Write};
 
 /// Internal storage — flat for precision=1, general for precision>1.
@@ -29,11 +29,40 @@ enum Storage {
     General(Vec<(Vec<u64>, u64)>),
 }
 
+#[derive(Default)]
+struct U64Hasher(u64);
+
+impl Hasher for U64Hasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut value = 0u64;
+        for (shift, byte) in bytes.iter().copied().enumerate().take(8) {
+            value |= u64::from(byte) << (shift * 8);
+        }
+        self.0 = value;
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+enum HashIndex {
+    Flat(HashMap<u64, usize, BuildHasherDefault<U64Hasher>>),
+    General(HashMap<u64, Vec<usize>>),
+}
+
 pub struct KmerCount {
     storage: Storage,
     kmer_len: usize,
     precision: usize,
-    hash_index: Option<HashMap<u64, Vec<usize>>>,
+    hash_index: Option<HashIndex>,
 }
 
 impl KmerCount {
@@ -154,22 +183,25 @@ impl KmerCount {
 
     /// Build a hash index for O(1) lookups.
     pub fn build_hash_index(&mut self) {
-        let mut index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(self.size());
         match &self.storage {
             Storage::Flat(v) => {
+                let mut index: HashMap<u64, usize, BuildHasherDefault<U64Hasher>> =
+                    HashMap::with_capacity_and_hasher(v.len(), BuildHasherDefault::default());
                 for (i, (val, _)) in v.iter().enumerate() {
-                    index.entry(oahash64(*val)).or_default().push(i);
+                    index.insert(*val, i);
                 }
+                self.hash_index = Some(HashIndex::Flat(index));
             }
             Storage::General(v) => {
+                let mut index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(v.len());
                 for (i, (key, _)) in v.iter().enumerate() {
                     let mut kmer = Kmer::zero(self.kmer_len);
                     kmer.copy_words_from(key);
                     index.entry(kmer.oahash()).or_default().push(i);
                 }
+                self.hash_index = Some(HashIndex::General(index));
             }
         }
-        self.hash_index = Some(index);
     }
 
     /// Find kmer index.
@@ -177,14 +209,9 @@ impl KmerCount {
         match &self.storage {
             Storage::Flat(v) => {
                 let val = kmer.get_val();
-                if let Some(ref index) = self.hash_index {
-                    let hash = oahash64(val);
-                    if let Some(indices) = index.get(&hash) {
-                        for &idx in indices {
-                            if v[idx].0 == val {
-                                return idx;
-                            }
-                        }
+                if let Some(HashIndex::Flat(index)) = &self.hash_index {
+                    if let Some(&idx) = index.get(&val) {
+                        return idx;
                     }
                     v.len()
                 } else {
@@ -197,7 +224,7 @@ impl KmerCount {
             Storage::General(v) => {
                 let words = kmer.to_words();
                 let key = &words[..self.precision];
-                if let Some(ref index) = self.hash_index {
+                if let Some(HashIndex::General(index)) = &self.hash_index {
                     let hash = kmer.oahash();
                     if let Some(indices) = index.get(&hash) {
                         for &idx in indices {

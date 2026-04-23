@@ -325,6 +325,7 @@ fn write_iteration_contigs<W: Write>(
     fallback_exclusions: Option<&std::collections::HashSet<String>>,
 ) -> std::io::Result<()> {
     let mut contigs = contigs.clone();
+    stabilize_iteration_directions(&mut contigs);
     contigs.sort_by_key(|contig| contig.primary_sequence());
     for (i, contig) in contigs.iter().enumerate() {
         let seq = contig.primary_sequence();
@@ -350,6 +351,56 @@ fn write_iteration_contigs<W: Write>(
         writeln!(writer, "{}", seq)?;
     }
     Ok(())
+}
+
+fn stabilize_iteration_directions(contigs: &mut crate::contig::ContigSequenceList) {
+    for contig in contigs.iter_mut() {
+        if contig.len() != 1 || contig.len_min() == 0 {
+            continue;
+        }
+
+        let seq = contig.primary_sequence();
+        let kmer_len = contig
+            .left_repeat
+            .max(contig.right_repeat)
+            .max(0) as usize
+            + 1;
+        if kmer_len == 0 || seq.len() < kmer_len {
+            continue;
+        }
+
+        let mut kmers: std::collections::HashMap<crate::kmer::Kmer, (u32, bool)> =
+            std::collections::HashMap::with_capacity(seq.len() - kmer_len + 1);
+        for pos in 0..=seq.len() - kmer_len {
+            let kmer = crate::kmer::Kmer::from_kmer_str(&seq[pos..pos + kmer_len]);
+            let rkmer = kmer.revcomp(kmer_len);
+            let (canonical, is_reverse) = if rkmer < kmer {
+                (rkmer, true)
+            } else {
+                (kmer, false)
+            };
+            kmers
+                .entry(canonical)
+                .and_modify(|entry| entry.0 += 1)
+                .or_insert((1, is_reverse));
+        }
+
+        let mut min_unique: Option<(crate::kmer::Kmer, bool)> = None;
+        for (kmer, (count, is_reverse)) in kmers {
+            if count != 1 {
+                continue;
+            }
+            if min_unique
+                .as_ref()
+                .is_none_or(|(min_kmer, _)| kmer < *min_kmer)
+            {
+                min_unique = Some((kmer, is_reverse));
+            }
+        }
+        if min_unique.is_some_and(|(_, is_reverse)| is_reverse) {
+            contig.reverse_complement();
+        }
+    }
 }
 
 fn format_cpp_float(value: f64) -> String {

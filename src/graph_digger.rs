@@ -38,6 +38,8 @@ pub struct DiggerParams {
     pub fraction: f64,
     /// Maximum SNP length (dead-end length for trimming)
     pub jump: usize,
+    /// Histogram minimum (`Valley`) for starting a new seed contig
+    pub hist_min: usize,
     /// Minimum k-mer count for contig inclusion
     pub low_count: usize,
     /// Whether SNP/fork traversal is allowed during extension
@@ -49,6 +51,7 @@ impl Default for DiggerParams {
         DiggerParams {
             fraction: 0.1,
             jump: 150,
+            hist_min: 0,
             low_count: 2,
             allow_snps: false,
         }
@@ -113,7 +116,7 @@ pub fn assemble_contigs_with_visited(
 
         let (seed_kmer, seed_count) = kmers.get_kmer_count(seed_idx);
         let total_count = (seed_count & 0xFFFFFFFF) as u32;
-        if total_count < params.low_count as u32 {
+        if total_count < params.hist_min as u32 || total_count < params.low_count as u32 {
             continue;
         }
 
@@ -224,8 +227,10 @@ pub fn assemble_contigs_with_visited(
     contigs.sort();
     contigs.retain(|c| c.len_min() >= kmer_len);
 
-    connect_at_denied_nodes(&mut contigs, kmer_len);
-    join_overlapping_contigs(&mut contigs, kmer_len);
+    // C++ GenerateNewSeeds uses SContig::ConnectFragments here, which joins
+    // fragments through graph-owned linker metadata. The old Rust denied-node
+    // and raw-overlap stitching over-merged independent seeds on real data.
+    finalize_new_seed_contigs(&mut contigs, kmers, kmer_len, &mut visited);
     // Note: BFS-based connect_contigs_through_graph is NOT called here in
     // initial seed assembly. C++ ConnectOverlappingContigs (graphdigger.hpp:
     // 2649) only joins contigs with direct k-mer-level sequence overlap;
@@ -261,70 +266,35 @@ fn find_kmer_in_graph(
     Some((idx, branch_bits, is_minus))
 }
 
-/// Find successors using pre-computed branch bits for efficiency.
-/// The branch bits (stored in count bits 32-39) encode which of the 4 nucleotide
-/// extensions exist in the graph. Lower 4 bits = forward, upper 4 bits = reverse.
-fn find_successors_from_branches(
+/// Find successors by checking all four nucleotide extensions directly against
+/// the graph. This is slower than using precomputed branch bits, but it tracks
+/// the original SKESA behavior more faithfully on self-overlap / homopolymer
+/// paths where the translated branch-bit pruning can miss valid neighbors.
+fn find_successors_direct(
     kmers: &KmerCount,
     current: &Kmer,
     kmer_len: usize,
     max_kmer: &Kmer,
     low_count: usize,
 ) -> Vec<SuccessorCandidate> {
-    // First, find the current kmer in the graph to get its branch info
-    let branch_info = find_kmer_in_graph(kmers, current, kmer_len);
-
     let shifted = (current.shl(2)) & *max_kmer;
     let mut successors = Vec::new();
 
-    if let Some((_idx, branch_bits, is_minus)) = branch_info {
-        // Use branch bits to only check known neighbors
-        let bits = if is_minus {
-            branch_bits >> 4
-        } else {
-            branch_bits & 0x0F
-        };
-
-        for nt in 0..4u64 {
-            if bits & (1 << nt) == 0 {
-                continue; // This neighbor doesn't exist in the graph
-            }
-            let next = shifted + nt;
-            let rnext = next.revcomp(kmer_len);
-            let canonical = if next < rnext { next } else { rnext };
-            let idx = kmers.find(&canonical);
-            if idx < kmers.size() {
-                let count = kmers.get_count(idx);
-                let total_count = (count & 0xFFFFFFFF) as u32;
-                if total_count >= low_count as u32 {
-                    successors.push(SuccessorCandidate {
-                        kmer: next,
-                        index: idx,
-                        nt,
-                        abundance: total_count,
-                    });
-                }
-            }
-        }
-    } else {
-        // Fallback: current kmer not in graph (shouldn't happen normally)
-        // Do full search
-        for nt in 0..4u64 {
-            let next = shifted + nt;
-            let rnext = next.revcomp(kmer_len);
-            let canonical = if next < rnext { next } else { rnext };
-            let idx = kmers.find(&canonical);
-            if idx < kmers.size() {
-                let count = kmers.get_count(idx);
-                let total_count = (count & 0xFFFFFFFF) as u32;
-                if total_count >= low_count as u32 {
-                    successors.push(SuccessorCandidate {
-                        kmer: next,
-                        index: idx,
-                        nt,
-                        abundance: total_count,
-                    });
-                }
+    for nt in 0..4u64 {
+        let next = shifted + nt;
+        let rnext = next.revcomp(kmer_len);
+        let canonical = if next < rnext { next } else { rnext };
+        let idx = kmers.find(&canonical);
+        if idx < kmers.size() {
+            let count = kmers.get_count(idx);
+            let total_count = (count & 0xFFFFFFFF) as u32;
+            if total_count >= low_count as u32 {
+                successors.push(SuccessorCandidate {
+                    kmer: next,
+                    index: idx,
+                    nt,
+                    abundance: total_count,
+                });
             }
         }
     }
@@ -340,7 +310,7 @@ fn find_all_successors(
     max_kmer: &Kmer,
     low_count: usize,
 ) -> Vec<SuccessorCandidate> {
-    find_successors_from_branches(kmers, current, kmer_len, max_kmer, low_count)
+    find_successors_direct(kmers, current, kmer_len, max_kmer, low_count)
 }
 
 /// Filter successors by abundance (noise-to-signal ratio). Mirrors the
@@ -496,42 +466,51 @@ fn filter_by_strand_balance(
 fn is_extendable(
     kmers: &KmerCount,
     start: &Kmer,
+    initial_nt: u64,
     kmer_len: usize,
     max_kmer: &Kmer,
     min_len: usize,
-    _fraction: f64,
+    fraction: f64,
     low_count: usize,
 ) -> bool {
-    let mut current = *start;
-    let bin2nt_mask = *max_kmer; // reuse for shifting
+    use std::collections::HashMap;
 
-    for _step in 0..min_len {
-        // Inline successor search for speed - skip allocation
-        let shifted = (current.shl(2)) & bin2nt_mask;
-        let mut best_kmer = None;
-        let mut best_abundance = 0u32;
+    let total_len = min_len;
+    let complement_nt = initial_nt ^ 0b10;
+    let mut active_nodes = vec![(*start, 0usize)];
+    let mut node_len: HashMap<Kmer, usize> = HashMap::new();
 
-        for nt in 0..4u64 {
-            let next = shifted + nt;
-            let rnext = next.revcomp(kmer_len);
-            let canonical = if next < rnext { next } else { rnext };
-            let idx = kmers.find(&canonical);
-            if idx < kmers.size() {
-                let count = kmers.get_count(idx);
-                let total_count = (count & 0xFFFFFFFF) as u32;
-                if total_count >= low_count as u32 && total_count > best_abundance {
-                    best_abundance = total_count;
-                    best_kmer = Some(next);
-                }
+    while let Some((node, len)) = active_nodes.pop() {
+        if len == kmer_len {
+            let mut step_back =
+                find_all_successors(kmers, &node.revcomp(kmer_len), kmer_len, max_kmer, low_count);
+            filter_by_abundance(&mut step_back, fraction);
+            if !step_back.iter().any(|back| back.nt == complement_nt) {
+                continue;
             }
         }
 
-        match best_kmer {
-            Some(k) => current = k,
-            None => return false,
+        if len == total_len {
+            return true;
+        }
+
+        if len > kmer_len {
+            let best = node_len.entry(node).or_insert(0);
+            if len > *best {
+                *best = len;
+            } else {
+                continue;
+            }
+        }
+
+        let mut successors = find_all_successors(kmers, &node, kmer_len, max_kmer, low_count);
+        filter_by_abundance(&mut successors, fraction);
+        for suc in successors.into_iter().rev() {
+            active_nodes.push((suc.kmer, len + 1));
         }
     }
-    true
+
+    false
 }
 
 /// Find successors for a k-mer and filter by noise-to-signal ratio + dead-end trimming.
@@ -579,6 +558,7 @@ fn find_and_filter_successors(
             if is_extendable(
                 kmers,
                 &successors[i].kmer,
+                successors[i].nt,
                 kmer_len,
                 max_kmer,
                 check_len,
@@ -626,7 +606,14 @@ fn has_backward_reachability(
         let check_len = kmer_len.max(100);
         predecessors.retain(|p| {
             is_extendable(
-                kmers, &p.kmer, kmer_len, max_kmer, check_len, fraction, low_count,
+                kmers,
+                &p.kmer,
+                p.nt,
+                kmer_len,
+                max_kmer,
+                check_len,
+                fraction,
+                low_count,
             )
         });
     }
@@ -752,8 +739,15 @@ pub struct ExtensionResult {
     pub forks: Vec<ForkInfo>,
 }
 
+/// Connect/extend-only result that also carries C++ `initial_node_intrusion`.
+pub struct ConnectExtensionResult {
+    pub sequence: Vec<char>,
+    pub last_kmer: Option<Kmer>,
+    pub intrusion: usize,
+}
+
 /// Extend right and return both the sequence and endpoint k-mer
-fn extend_right_with_endpoint(
+pub fn extend_right_with_endpoint(
     kmers: &KmerCount,
     start_kmer: &Kmer,
     kmer_len: usize,
@@ -983,6 +977,344 @@ fn extend_right_with_endpoint(
     }
 }
 
+/// Extend left and return both added bases and the denied endpoint k-mer.
+pub fn extend_left_with_endpoint(
+    kmers: &KmerCount,
+    start_kmer: &Kmer,
+    kmer_len: usize,
+    max_kmer: &Kmer,
+    visited: &mut [bool],
+    params: &DiggerParams,
+) -> ExtensionResult {
+    let rc = start_kmer.revcomp(kmer_len);
+    let right_ext = extend_right_with_endpoint(kmers, &rc, kmer_len, max_kmer, visited, params);
+    ExtensionResult {
+        sequence: right_ext
+            .sequence
+            .iter()
+            .rev()
+            .map(|&c| crate::model::complement(c))
+            .collect(),
+        last_kmer: right_ext.last_kmer.map(|k| k.revcomp(kmer_len)),
+        forks: right_ext.forks,
+    }
+}
+
+/// C++ `ExtendContigsJob` uses `ExtendToRight(initial_node, allowed_intrusion)`
+/// rather than the general seed-extension helper. This variant keeps the
+/// intrusion bookkeeping isolated to connect/extend parity work.
+pub fn extend_right_for_connect(
+    kmers: &KmerCount,
+    start_kmer: &Kmer,
+    kmer_len: usize,
+    max_kmer: &Kmer,
+    visited: &mut [bool],
+    params: &DiggerParams,
+    allowed_intrusion: usize,
+) -> ConnectExtensionResult {
+    let trace_target = std::env::var("SKESA_DEBUG_CONNECT_START").ok();
+    let trace_enabled = trace_target
+        .as_deref()
+        .is_some_and(|target| target == start_kmer.to_kmer_string(kmer_len));
+    let mut extension = Vec::new();
+    let mut current = *start_kmer;
+    let mut initial_node_intrusion = 0usize;
+    let bin2nt = ['A', 'C', 'T', 'G'];
+
+    if trace_enabled {
+        eprintln!(
+            "CEC_TRACE start={} allowed_intrusion={}",
+            start_kmer.to_kmer_string(kmer_len),
+            allowed_intrusion
+        );
+    }
+
+    loop {
+        let successors = find_and_filter_successors(
+            kmers,
+            &current,
+            kmer_len,
+            max_kmer,
+            visited,
+            params.fraction,
+            params.low_count,
+            params.jump,
+        );
+
+        if trace_enabled {
+            let desc = successors
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{}:{}:{}",
+                        s.kmer.to_kmer_string(kmer_len),
+                        s.abundance,
+                        bin2nt[s.nt as usize]
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "CEC_TRACE current={} ext_len={} successors=[{}]",
+                current.to_kmer_string(kmer_len),
+                extension.len(),
+                desc
+            );
+        }
+
+        if successors.is_empty() {
+            break;
+        } else if successors.len() == 1 {
+            let suc = &successors[0];
+            if trace_enabled {
+                let rc = suc.kmer.revcomp(kmer_len);
+                let mut preds = find_all_successors(kmers, &rc, kmer_len, max_kmer, params.low_count);
+                let shifted = (rc.shl(2)) & *max_kmer;
+                let mut preds_full = Vec::new();
+                for nt in 0..4u64 {
+                    let next = shifted + nt;
+                    let rnext = next.revcomp(kmer_len);
+                    let canonical = if next < rnext { next } else { rnext };
+                    let idx = kmers.find(&canonical);
+                    if idx < kmers.size() {
+                        let count = kmers.get_count(idx);
+                        let total_count = (count & 0xFFFFFFFF) as u32;
+                        if total_count >= params.low_count as u32 {
+                            preds_full.push(next);
+                        }
+                    }
+                }
+                filter_by_abundance(&mut preds, params.fraction);
+                filter_illumina_ggt(&mut preds, kmers, kmer_len, params.fraction);
+                filter_illumina_acc(
+                    &mut preds,
+                    kmers,
+                    kmer_len,
+                    max_kmer,
+                    params.fraction,
+                    params.low_count,
+                    true,
+                );
+                if preds.len() > 1 && preds[0].abundance > 5 {
+                    let check_len = kmer_len.max(100);
+                    preds.retain(|p| {
+                        is_extendable(
+                            kmers,
+                            &p.kmer,
+                            p.nt,
+                            kmer_len,
+                            max_kmer,
+                            check_len,
+                            params.fraction,
+                            params.low_count,
+                        )
+                    });
+                }
+                filter_by_strand_balance(&mut preds, kmers, params.fraction, params.low_count);
+                eprintln!(
+                    "CEC_TRACE unique next={} backward_ok={} preds=[{}] preds_full=[{}]",
+                    suc.kmer.to_kmer_string(kmer_len),
+                    has_backward_reachability(
+                        kmers,
+                        &suc.kmer,
+                        &current,
+                        kmer_len,
+                        max_kmer,
+                        params.fraction,
+                        params.low_count,
+                    ),
+                    preds.iter()
+                        .map(|p| p.kmer.revcomp(kmer_len).to_kmer_string(kmer_len))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    preds_full
+                        .iter()
+                        .map(|p| p.revcomp(kmer_len).to_kmer_string(kmer_len))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+            }
+            if !has_backward_reachability(
+                kmers,
+                &suc.kmer,
+                &current,
+                kmer_len,
+                max_kmer,
+                params.fraction,
+                params.low_count,
+            ) {
+                break;
+            }
+
+            current = suc.kmer;
+            if visited[suc.index] {
+                return ConnectExtensionResult {
+                    sequence: extension,
+                    last_kmer: Some(current),
+                    intrusion: initial_node_intrusion,
+                };
+            }
+
+            visited[suc.index] = true;
+            if extension.is_empty() {
+                extension = Vec::new();
+            }
+            extension.push(bin2nt[suc.nt as usize]);
+        } else if !params.allow_snps {
+            break;
+        } else {
+            let last_chunk_len = extension.len();
+            let mut last_chunk = start_kmer.to_kmer_string(kmer_len).chars().collect::<Vec<_>>();
+            if last_chunk_len > 0 {
+                last_chunk.extend_from_slice(&extension);
+            }
+
+            let snp_succs: Vec<(Kmer, u64, char)> = successors
+                .iter()
+                .map(|s| (s.kmer, s.abundance as u64, bin2nt[s.nt as usize]))
+                .collect();
+
+            let Some(snp) =
+                crate::snp_discovery::discover_snp(kmers, &snp_succs, kmer_len, params.jump)
+            else {
+                break;
+            };
+            if trace_enabled {
+                eprintln!(
+                    "CEC_TRACE snp shift={} variants={}",
+                    snp.shift,
+                    snp.variants
+                        .iter()
+                        .map(|v| v.iter().collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join("|")
+                );
+            }
+            let Some(conv) = snp.convergence_kmer else {
+                break;
+            };
+
+            let rc_conv = conv.revcomp(kmer_len);
+            let back_succs_raw = find_and_filter_successors(
+                kmers,
+                &rc_conv,
+                kmer_len,
+                max_kmer,
+                visited,
+                params.fraction,
+                params.low_count,
+                params.jump,
+            );
+
+            let back_snp_succs: Vec<(Kmer, u64, char)> = back_succs_raw
+                .iter()
+                .map(|s| (s.kmer, s.abundance as u64, bin2nt[s.nt as usize]))
+                .collect();
+
+            let backward_ok = if back_snp_succs.len() >= 2 {
+                crate::snp_discovery::discover_snp(kmers, &back_snp_succs, kmer_len, params.jump)
+                    .is_some_and(|back_snp| validate_reverse_snp(&snp, &back_snp))
+            } else {
+                false
+            };
+            if !backward_ok {
+                break;
+            }
+
+            current = conv;
+            if snp.shift > 0 {
+                if snp.shift >= last_chunk_len {
+                    initial_node_intrusion = snp.shift - last_chunk_len;
+                    if initial_node_intrusion > allowed_intrusion {
+                        initial_node_intrusion = 0;
+                        break;
+                    }
+                    extension.clear();
+                    if trace_enabled {
+                        eprintln!(
+                            "CEC_TRACE intrusion shift={} intrusion={} action=clear",
+                            snp.shift,
+                            initial_node_intrusion
+                        );
+                    }
+                } else {
+                    extension.truncate(extension.len() - snp.shift);
+                    if trace_enabled {
+                        eprintln!(
+                            "CEC_TRACE intrusion shift={} action=truncate new_len={}",
+                            snp.shift,
+                            extension.len()
+                        );
+                    }
+                }
+            }
+
+            for &c in &snp.variants[0] {
+                extension.push(c);
+            }
+
+            let rconv = conv.revcomp(kmer_len);
+            let canonical = if conv < rconv { conv } else { rconv };
+            let idx = kmers.find(&canonical);
+            if idx < kmers.size() {
+                if visited[idx] {
+                    if trace_enabled {
+                        eprintln!(
+                            "CEC_TRACE visited convergence={} ext_len={} intrusion={}",
+                            current.to_kmer_string(kmer_len),
+                            extension.len(),
+                            initial_node_intrusion
+                        );
+                    }
+                    return ConnectExtensionResult {
+                        sequence: extension,
+                        last_kmer: Some(current),
+                        intrusion: initial_node_intrusion,
+                    };
+                }
+                visited[idx] = true;
+            }
+        }
+    }
+
+    ConnectExtensionResult {
+        sequence: extension,
+        last_kmer: None,
+        intrusion: initial_node_intrusion,
+    }
+}
+
+pub fn extend_left_for_connect(
+    kmers: &KmerCount,
+    start_kmer: &Kmer,
+    kmer_len: usize,
+    max_kmer: &Kmer,
+    visited: &mut [bool],
+    params: &DiggerParams,
+    allowed_intrusion: usize,
+) -> ConnectExtensionResult {
+    let rc = start_kmer.revcomp(kmer_len);
+    let right_ext = extend_right_for_connect(
+        kmers,
+        &rc,
+        kmer_len,
+        max_kmer,
+        visited,
+        params,
+        allowed_intrusion,
+    );
+    ConnectExtensionResult {
+        sequence: right_ext
+            .sequence
+            .iter()
+            .rev()
+            .map(|&c| crate::model::complement(c))
+            .collect(),
+        last_kmer: right_ext.last_kmer.map(|k| k.revcomp(kmer_len)),
+        intrusion: right_ext.intrusion,
+    }
+}
+
 /// Public wrapper for right extension (used by assembler for contig extension).
 pub fn extend_right_simple(
     kmers: &KmerCount,
@@ -1052,6 +1384,17 @@ fn build_multi_chunk_contig(
 
 /// Mark all k-mers along a contig sequence as visited in the visited array.
 fn mark_contig_kmers(seq: &[char], kmers: &KmerCount, kmer_len: usize, visited: &mut [bool]) {
+    set_contig_kmers_visited(seq, kmers, kmer_len, visited, true);
+}
+
+/// Set the visited state for all k-mers along a sequence.
+fn set_contig_kmers_visited(
+    seq: &[char],
+    kmers: &KmerCount,
+    kmer_len: usize,
+    visited: &mut [bool],
+    value: bool,
+) {
     if seq.len() < kmer_len {
         return;
     }
@@ -1066,10 +1409,56 @@ fn mark_contig_kmers(seq: &[char], kmers: &KmerCount, kmer_len: usize, visited: 
         let canonical = if kmer < rkmer { kmer } else { rkmer };
         let idx = kmers.find(&canonical);
         if idx < kmers.size() {
-            visited[idx] = true;
+            visited[idx] = value;
         }
         ki.advance();
     }
+}
+
+/// Mirror C++ GenerateNewSeeds post-processing: reject short fragments, clip
+/// uncertain flanks, and put removed flank/fragment kmers back into the graph.
+fn finalize_new_seed_contigs(
+    contigs: &mut ContigSequenceList,
+    kmers: &KmerCount,
+    kmer_len: usize,
+    visited: &mut [bool],
+) {
+    let min_len_for_new_seeds = 3 * kmer_len;
+    let min_preclip_len = min_len_for_new_seeds + 2 * kmer_len;
+    let flank_len = 2 * kmer_len - 1;
+    let mut removed_sequences: Vec<Vec<char>> = Vec::new();
+
+    contigs.retain_mut(|contig| {
+        let primary: Vec<char> = contig.primary_sequence().chars().collect();
+        if contig.len_min() < min_preclip_len {
+            removed_sequences.push(primary);
+            return false;
+        }
+
+        if !contig.circular {
+            if primary.len() >= flank_len {
+                removed_sequences.push(primary[..flank_len].to_vec());
+                removed_sequences.push(primary[primary.len() - flank_len..].to_vec());
+            }
+            clip_new_seed_flanks(contig, kmer_len);
+            contig.left_repeat = (kmer_len - 1) as i32;
+            contig.right_repeat = (kmer_len - 1) as i32;
+        }
+        true
+    });
+
+    for seq in removed_sequences {
+        set_contig_kmers_visited(&seq, kmers, kmer_len, visited, false);
+    }
+}
+
+fn clip_new_seed_flanks(contig: &mut ContigSequence, kmer_len: usize) {
+    let mut linked = crate::linked_contig::LinkedContig::new(std::mem::take(contig), kmer_len);
+    linked.clip_left(kmer_len);
+    linked.clip_right(kmer_len);
+    *contig = linked.seq;
+    contig.left_extend = linked.left_extend;
+    contig.right_extend = linked.right_extend;
 }
 
 /// Extend a k-mer to the left (by extending revcomp to the right).
@@ -1646,6 +2035,7 @@ fn has_significant_overlap(a: &str, b: &str, min_overlap: usize) -> bool {
 /// they stopped at the same fork and can be merged. Walks chains in a single
 /// pass with one pre-built endpoint map (was O(N² log N) per loop+sort+remove
 /// pair; now O(N) total).
+#[allow(dead_code)]
 fn connect_at_denied_nodes(contigs: &mut ContigSequenceList, kmer_len: usize) {
     use std::collections::HashMap;
 
@@ -1852,6 +2242,19 @@ mod tests {
             vec![vec!['C', 'C', 'C'], vec!['G', 'G', 'G']]
         );
         assert_eq!(contig.chunks[2], vec![vec!['G', 'G', 'G']]);
+    }
+
+    #[test]
+    fn test_new_seed_flank_clip_preserves_cpp_extend_budget() {
+        let kmer_len = 5;
+        let mut contig = ContigSequence::new();
+        contig.insert_new_chunk_with("ACGTACGTACGTACGTACGT".chars().collect());
+
+        clip_new_seed_flanks(&mut contig, kmer_len);
+
+        assert_eq!(contig.primary_sequence(), "CGTACGTACG");
+        assert_eq!(contig.left_extend, 15);
+        assert_eq!(contig.right_extend, 15);
     }
 
     #[test]

@@ -9,10 +9,10 @@ use crate::counter::KmerCount;
 use crate::model::reverse_complement;
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 
 const DEFAULT_FRACTION: f64 = 0.1;
-
 #[derive(Clone, Copy)]
 struct PairSuccessor {
     kmer: crate::kmer::Kmer,
@@ -33,28 +33,34 @@ pub struct ConnectionResult {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum PathSearch {
+enum CppConnection {
     Success(Vec<char>),
-    Ambiguous,
     NoConnection,
+    Ambiguous,
 }
 
-fn target_key(target: crate::kmer::Kmer, kmer_len: usize, precision: usize) -> Vec<u64> {
-    let target_rc = target.revcomp(kmer_len);
-    let target_canonical = if target < target_rc {
-        target
-    } else {
-        target_rc
-    };
-    target_canonical.to_words()[..precision].to_vec()
+#[derive(Default)]
+struct PairHasher(u64);
+
+impl Hasher for PairHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        if self.0 == 0 {
+            self.0 = FNV_OFFSET;
+        }
+        for &b in bytes {
+            self.0 ^= u64::from(b);
+            self.0 = self.0.wrapping_mul(FNV_PRIME);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
-fn canonical_matches(kmer: crate::kmer::Kmer, kmer_len: usize, target: &[u64]) -> bool {
-    let rc = kmer.revcomp(kmer_len);
-    let canonical = if kmer < rc { kmer } else { rc };
-    let words = canonical.to_words();
-    words[..target.len()] == *target
-}
+type PairNodeMap<V> = HashMap<crate::kmer::Kmer, V, BuildHasherDefault<PairHasher>>;
 
 fn kmer_graph_info(
     kmer: crate::kmer::Kmer,
@@ -72,6 +78,16 @@ fn kmer_graph_info(
     Some((((count >> 32) & 0xFF) as u8, is_minus))
 }
 
+fn kmer_abundance(kmer: crate::kmer::Kmer, kmers: &KmerCount, kmer_len: usize) -> Option<u32> {
+    let rc = kmer.revcomp(kmer_len);
+    let canonical = if kmer < rc { kmer } else { rc };
+    let idx = kmers.find(&canonical);
+    if idx >= kmers.size() {
+        return None;
+    }
+    Some((kmers.get_count(idx) & 0xFFFF_FFFF) as u32)
+}
+
 fn graph_successors(
     node: crate::kmer::Kmer,
     kmers: &KmerCount,
@@ -80,19 +96,19 @@ fn graph_successors(
     let max_kmer = crate::kmer::Kmer::from_chars(kmer_len, std::iter::repeat_n('G', kmer_len));
     let bin2nt = crate::model::BIN2NT;
     let shifted = (node.shl(2)) & max_kmer;
-    let bits = kmer_graph_info(node, kmers, kmer_len).map(|(branch_bits, is_minus)| {
+    let Some(bits) = kmer_graph_info(node, kmers, kmer_len).map(|(branch_bits, is_minus)| {
         if is_minus {
             branch_bits >> 4
         } else {
             branch_bits & 0x0F
         }
-    });
+    }) else {
+        return Vec::new();
+    };
     let mut successors = Vec::new();
     for nt in 0..4u64 {
-        if let Some(bits) = bits {
-            if bits & (1 << nt) == 0 {
-                continue;
-            }
+        if bits & (1 << nt) == 0 {
+            continue;
         }
         let next = shifted + nt;
         let rc = next.revcomp(kmer_len);
@@ -111,12 +127,17 @@ fn graph_successors(
     successors
 }
 
-fn filter_successors(successors: &mut Vec<PairSuccessor>, fraction: f64) {
+fn filter_successors(successors: &mut Vec<PairSuccessor>, fraction: f64, low_count: usize) {
     if successors.len() <= 1 {
         return;
     }
     let total: u32 = successors.iter().map(|s| s.abundance).sum();
     successors.sort_by(|a, b| b.abundance.cmp(&a.abundance).then_with(|| a.nt.cmp(&b.nt)));
+    if low_count == 1 && successors[0].abundance > 5 {
+        while successors.len() > 1 && successors.last().is_some_and(|s| s.abundance == 1) {
+            successors.pop();
+        }
+    }
     while successors.len() > 1
         && successors
             .last()
@@ -126,13 +147,18 @@ fn filter_successors(successors: &mut Vec<PairSuccessor>, fraction: f64) {
     }
 }
 
+fn filter_successors_cpp(successors: &mut Vec<PairSuccessor>, fraction: f64, low_count: usize) {
+    filter_successors(successors, fraction, low_count);
+}
+
 fn filtered_successors(
     node: crate::kmer::Kmer,
     kmers: &KmerCount,
     kmer_len: usize,
+    low_count: usize,
 ) -> Vec<PairSuccessor> {
     let mut successors = graph_successors(node, kmers, kmer_len);
-    filter_successors(&mut successors, DEFAULT_FRACTION);
+    filter_successors(&mut successors, DEFAULT_FRACTION, low_count);
     successors
 }
 
@@ -141,8 +167,9 @@ fn has_filtered_edge(
     to: crate::kmer::Kmer,
     kmers: &KmerCount,
     kmer_len: usize,
+    low_count: usize,
 ) -> bool {
-    filtered_successors(from, kmers, kmer_len)
+    filtered_successors(from, kmers, kmer_len, low_count)
         .iter()
         .any(|successor| successor.kmer == to)
 }
@@ -167,16 +194,17 @@ fn most_likely_extension_from(
     extension
 }
 
-fn unique_extension_from(
+fn stringent_extension_from(
     mut node: crate::kmer::Kmer,
     kmers: &KmerCount,
     kmer_len: usize,
     len: usize,
+    low_count: usize,
 ) -> String {
     let mut extension = String::new();
 
     while extension.len() < len {
-        let successors = filtered_successors(node, kmers, kmer_len);
+        let successors = filtered_successors(node, kmers, kmer_len, low_count);
         if successors.len() != 1 {
             return extension;
         }
@@ -188,7 +216,21 @@ fn unique_extension_from(
     extension
 }
 
-fn clip_read_for_connection(read: &str, kmers: &KmerCount, kmer_len: usize) -> Option<String> {
+fn read_kmer_nodes(read: &str, kmer_len: usize) -> Vec<crate::kmer::Kmer> {
+    if read.len() < kmer_len {
+        return Vec::new();
+    }
+    (0..=read.len() - kmer_len)
+        .map(|pos| crate::kmer::Kmer::from_kmer_str(&read[pos..pos + kmer_len]))
+        .collect()
+}
+
+fn clip_read_for_connection(
+    read: &str,
+    kmers: &KmerCount,
+    kmer_len: usize,
+    low_count: usize,
+) -> Option<(String, Vec<crate::kmer::Kmer>)> {
     if read.len() < kmer_len {
         return None;
     }
@@ -230,12 +272,20 @@ fn clip_read_for_connection(read: &str, kmers: &KmerCount, kmer_len: usize) -> O
             continue;
         };
 
-        if has_filtered_edge(left_node, node, kmers, kmer_len)
+        if kmer_abundance(left_node, kmers, kmer_len).is_none_or(|c| c < low_count as u32)
+            || kmer_abundance(node, kmers, kmer_len).is_none_or(|c| c < low_count as u32)
+            || kmer_abundance(right_node, kmers, kmer_len).is_none_or(|c| c < low_count as u32)
+        {
+            continue;
+        }
+
+        if has_filtered_edge(left_node, node, kmers, kmer_len, low_count)
             && has_filtered_edge(
                 right_node.revcomp(kmer_len),
                 node.revcomp(kmer_len),
                 kmers,
                 kmer_len,
+                low_count,
             )
         {
             *good = true;
@@ -264,78 +314,117 @@ fn clip_read_for_connection(read: &str, kmers: &KmerCount, kmer_len: usize) -> O
     if best_len < kmer_len {
         None
     } else {
-        Some(read[best_left..best_left + best_len].to_string())
+        let clipped = read[best_left..best_left + best_len].to_string();
+        let nodes = read_kmer_nodes(&clipped, kmer_len);
+        Some((clipped, nodes))
     }
 }
 
-fn extend_connected_read(read: &str, kmers: &KmerCount, kmer_len: usize) -> String {
+fn extend_connected_read(
+    read: &str,
+    kmers: &KmerCount,
+    kmer_len: usize,
+    low_count: usize,
+) -> String {
     if read.len() < kmer_len {
         return read.to_string();
     }
 
     let first = crate::kmer::Kmer::from_kmer_str(&read[..kmer_len]);
-    let left_on_reverse = unique_extension_from(first.revcomp(kmer_len), kmers, kmer_len, kmer_len);
+    let left_on_reverse =
+        stringent_extension_from(first.revcomp(kmer_len), kmers, kmer_len, kmer_len, low_count);
     let left = reverse_complement(&left_on_reverse);
 
     let last = crate::kmer::Kmer::from_kmer_str(&read[read.len() - kmer_len..]);
-    let right = unique_extension_from(last, kmers, kmer_len, kmer_len);
+    let right = stringent_extension_from(last, kmers, kmer_len, kmer_len, low_count);
 
     format!("{left}{read}{right}")
 }
 
-fn find_unique_path(
-    start: crate::kmer::Kmer,
-    target: crate::kmer::Kmer,
+fn connect_two_nodes_cpp(
+    first_node: crate::kmer::Kmer,
+    last_node: crate::kmer::Kmer,
     kmers: &KmerCount,
     kmer_len: usize,
-    max_steps: usize,
-    frontier_limit: usize,
-) -> PathSearch {
-    let precision = kmer_len.div_ceil(32);
-    let target_key = target_key(target, kmer_len, precision);
-    let mut frontier: Vec<(crate::kmer::Kmer, Vec<char>)> = vec![(start, Vec::new())];
-    let mut visited = HashSet::new();
-    let start_rc = start.revcomp(kmer_len);
-    visited.insert(if start < start_rc { start } else { start_rc });
+    steps: usize,
+    low_count: usize,
+) -> CppConnection {
+    #[derive(Clone, Copy)]
+    struct Link {
+        prev: Option<usize>,
+        suc: PairSuccessor,
+    }
 
-    for _ in 0..max_steps.min(2000) {
-        if frontier.is_empty() {
-            return PathSearch::NoConnection;
+    let mut storage: Vec<Link> = Vec::new();
+    let mut current: PairNodeMap<Option<usize>> = PairNodeMap::default();
+    let mut successors = graph_successors(first_node, kmers, kmer_len);
+    filter_successors_cpp(&mut successors, DEFAULT_FRACTION, low_count);
+    current.reserve(successors.len());
+    for suc in successors {
+        storage.push(Link { prev: None, suc });
+        let idx = storage.len() - 1;
+        current.insert(suc.kmer, Some(idx));
+    }
+
+    let mut connection: Option<usize> = None;
+    for _step in 1..steps {
+        if current.is_empty() {
+            break;
         }
-        if frontier.len() > frontier_limit {
-            return PathSearch::Ambiguous;
-        }
-
-        let mut next_frontier = Vec::new();
-        let mut found_path: Option<Vec<char>> = None;
-        let mut found_count = 0usize;
-
-        for (node, path) in &frontier {
-            for successor in filtered_successors(*node, kmers, kmer_len) {
-                let next = successor.kmer;
-                let rnext = next.revcomp(kmer_len);
-                let canonical = if next < rnext { next } else { rnext };
-                let mut next_path = path.clone();
-                next_path.push(successor.nt);
-                if canonical_matches(next, kmer_len, &target_key) {
-                    found_count += 1;
-                    if found_count > 1 {
-                        return PathSearch::Ambiguous;
+        let mut next_current: PairNodeMap<Option<usize>> = PairNodeMap::default();
+        next_current.reserve(current.len().saturating_mul(2));
+        for (node, link) in current {
+            let mut successors = graph_successors(node, kmers, kmer_len);
+            filter_successors_cpp(&mut successors, DEFAULT_FRACTION, low_count);
+            if let Some(prev) = link {
+                for suc in successors {
+                    storage.push(Link {
+                        prev: Some(prev),
+                        suc,
+                    });
+                    let idx = storage.len() - 1;
+                    if suc.kmer == last_node {
+                        if connection.is_some() {
+                            return CppConnection::Ambiguous;
+                        }
+                        connection = Some(idx);
                     }
-                    found_path = Some(next_path);
-                } else if visited.insert(canonical) {
-                    next_frontier.push((next, next_path));
+                    let good_node = suc.abundance >= low_count as u32;
+                    match next_current.entry(suc.kmer) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(if good_node { Some(idx) } else { None });
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.insert(None);
+                        }
+                    }
+                }
+            } else {
+                for suc in successors {
+                    next_current.insert(suc.kmer, None);
+                    if suc.kmer == last_node {
+                        return CppConnection::Ambiguous;
+                    }
                 }
             }
         }
-
-        if let Some(path) = found_path {
-            return PathSearch::Success(path);
-        }
-        frontier = next_frontier;
+        current = next_current;
     }
 
-    PathSearch::NoConnection
+    let Some(mut idx) = connection else {
+        return CppConnection::NoConnection;
+    };
+    let mut path = Vec::new();
+    loop {
+        let link = storage[idx];
+        path.push(link.suc.nt);
+        let Some(prev) = link.prev else {
+            break;
+        };
+        idx = prev;
+    }
+    path.reverse();
+    CppConnection::Success(path)
 }
 
 fn validated_merged_read(
@@ -347,6 +436,7 @@ fn validated_merged_read(
     kmers: &KmerCount,
     kmer_len: usize,
     max_steps: usize,
+    low_count: usize,
 ) -> Option<String> {
     let mut forward = String::from(read1);
     for c in forward_path {
@@ -356,17 +446,18 @@ fn validated_merged_read(
 
     let reverse_start = first_kmer2.revcomp(kmer_len);
     let reverse_target = last_kmer.revcomp(kmer_len);
-    let reverse_path = match find_unique_path(
-        reverse_start,
-        reverse_target,
-        kmers,
-        kmer_len,
-        max_steps,
-        50,
-    ) {
-        PathSearch::Success(path) => path,
-        PathSearch::Ambiguous | PathSearch::NoConnection => return None,
-    };
+    let reverse_path =
+        match connect_two_nodes_cpp(
+            reverse_start,
+            reverse_target,
+            kmers,
+            kmer_len,
+            max_steps,
+            low_count,
+        ) {
+            CppConnection::Success(path) => path,
+            CppConnection::Ambiguous | CppConnection::NoConnection => return None,
+        };
 
     let reverse_bridge: String = reverse_path.iter().collect();
     let reverse_bridge = reverse_complement(&reverse_bridge);
@@ -392,22 +483,33 @@ pub fn estimate_insert_size(
     kmer_len: usize,
     sample_size: usize,
 ) -> usize {
+    estimate_insert_size_with_low_count(reads, kmers, kmer_len, sample_size, 2)
+}
+
+pub fn estimate_insert_size_with_low_count(
+    reads: &[ReadPair],
+    kmers: &KmerCount,
+    kmer_len: usize,
+    sample_size: usize,
+    low_count: usize,
+) -> usize {
     let total_pairs: usize = reads.iter().map(|r| r[0].read_num() / 2).sum();
     if total_pairs == 0 {
         return 0;
     }
 
-    let mut connected_lengths: Vec<usize> = Vec::new();
-    let mut pairs_tested = 0usize;
+    let mut sample = Vec::new();
+    let mut sampled_pairs = 0usize;
 
     for read_pair in reads {
         let holder = &read_pair[0];
         if holder.read_num() < 2 {
             continue;
         }
+        let mut paired = ReadHolder::new(true);
 
         let mut si = holder.string_iter();
-        while !si.at_end() && pairs_tested < sample_size {
+        while !si.at_end() && sampled_pairs < sample_size {
             let read1 = si.get();
             si.advance();
             if si.at_end() {
@@ -415,41 +517,32 @@ pub fn estimate_insert_size(
             }
             let read2 = si.get();
             si.advance();
-            pairs_tested += 1;
-
-            if read1.len() < kmer_len || read2.len() < kmer_len {
-                continue;
-            }
-
-            let read2_rc = reverse_complement(&read2);
-            let last_kmer = crate::kmer::Kmer::from_kmer_str(&read1[read1.len() - kmer_len..]);
-            let first_kmer2 = crate::kmer::Kmer::from_kmer_str(&read2_rc[..kmer_len]);
-
-            let forward_path = match find_unique_path(
-                last_kmer,
-                first_kmer2,
-                kmers,
-                kmer_len,
-                2000usize.saturating_sub(kmer_len),
-                20,
-            ) {
-                PathSearch::Success(path) => path,
-                PathSearch::Ambiguous | PathSearch::NoConnection => continue,
-            };
-
-            if let Some(merged) = validated_merged_read(
-                &read1,
-                &read2_rc,
-                &forward_path,
-                last_kmer,
-                first_kmer2,
-                kmers,
-                kmer_len,
-                2000usize.saturating_sub(kmer_len),
-            ) {
-                connected_lengths.push(merged.len());
-            }
+            paired.push_back_str(&read1);
+            paired.push_back_str(&read2);
+            sampled_pairs += 1;
         }
+        if paired.read_num() > 0 {
+            sample.push([paired, ReadHolder::new(false)]);
+        }
+        if sampled_pairs >= sample_size {
+            break;
+        }
+    }
+
+    let connected = connect_pairs_impl(
+        &sample,
+        kmers,
+        kmer_len,
+        2000usize.saturating_sub(kmer_len),
+        false,
+        low_count,
+    )
+    .connected;
+    let mut connected_lengths = Vec::new();
+    let mut iter = connected.string_iter();
+    while !iter.at_end() {
+        connected_lengths.push(iter.get().len());
+        iter.advance();
     }
 
     if connected_lengths.is_empty() {
@@ -477,7 +570,17 @@ pub fn connect_pairs(
     kmer_len: usize,
     insert_size: usize,
 ) -> ConnectionResult {
-    connect_pairs_impl(reads, kmers, kmer_len, insert_size, false)
+    connect_pairs_with_low_count(reads, kmers, kmer_len, insert_size, 2)
+}
+
+pub fn connect_pairs_with_low_count(
+    reads: &[ReadPair],
+    kmers: &KmerCount,
+    kmer_len: usize,
+    insert_size: usize,
+    low_count: usize,
+) -> ConnectionResult {
+    connect_pairs_impl(reads, kmers, kmer_len, insert_size, false, low_count)
 }
 
 pub fn connect_pairs_extending(
@@ -486,7 +589,17 @@ pub fn connect_pairs_extending(
     kmer_len: usize,
     insert_size: usize,
 ) -> ConnectionResult {
-    connect_pairs_impl(reads, kmers, kmer_len, insert_size, true)
+    connect_pairs_extending_with_low_count(reads, kmers, kmer_len, insert_size, 2)
+}
+
+pub fn connect_pairs_extending_with_low_count(
+    reads: &[ReadPair],
+    kmers: &KmerCount,
+    kmer_len: usize,
+    insert_size: usize,
+    low_count: usize,
+) -> ConnectionResult {
+    connect_pairs_impl(reads, kmers, kmer_len, insert_size, true, low_count)
 }
 
 fn connect_pairs_impl(
@@ -495,6 +608,7 @@ fn connect_pairs_impl(
     kmer_len: usize,
     insert_size: usize,
     extend_connected: bool,
+    low_count: usize,
 ) -> ConnectionResult {
     let max_steps = if insert_size > 0 { insert_size } else { 2000 };
 
@@ -531,21 +645,15 @@ fn connect_pairs_impl(
             let original_read1 = read1.clone();
             let original_read2_rc = read2_rc.clone();
             let debug_pair_clip = std::env::var_os("SKESA_DEBUG_PAIR_CLIP").is_some();
-            let (read1, read2_rc) = if extend_connected {
-                let Some(read1_clipped) = clip_read_for_connection(&read1, kmers, kmer_len) else {
-                    not_connected.push_back_str(&read1);
-                    not_connected.push_back_str(&read2);
-                    continue;
-                };
-                let Some(read2_clipped) = clip_read_for_connection(&read2_rc, kmers, kmer_len)
-                else {
-                    not_connected.push_back_str(&read1);
-                    not_connected.push_back_str(&read2);
-                    continue;
-                };
-                (read1_clipped, read2_clipped)
-            } else {
-                (read1, read2_rc)
+            let Some((read1, nodes1)) =
+                clip_read_for_connection(&read1, kmers, kmer_len, low_count)
+            else {
+                continue;
+            };
+            let Some((mut read2_rc, nodes2)) =
+                clip_read_for_connection(&read2_rc, kmers, kmer_len, low_count)
+            else {
+                continue;
             };
             if debug_pair_clip && num_connected < 5 {
                 eprintln!(
@@ -561,38 +669,73 @@ fn connect_pairs_impl(
                     &read2_rc[..read2_rc.len().min(24)],
                 );
             }
-            let last_kmer = crate::kmer::Kmer::from_kmer_str(&read1[read1.len() - kmer_len..]);
-            let first_kmer2 = crate::kmer::Kmer::from_kmer_str(&read2_rc[..kmer_len]);
+            let last_kmer = *nodes1.last().expect("clipped read has at least one k-mer");
+            let first_kmer2 = *nodes2.first().expect("clipped read has at least one k-mer");
 
-            let forward_path =
-                match find_unique_path(last_kmer, first_kmer2, kmers, kmer_len, max_steps, 50) {
-                    PathSearch::Success(path) => path,
-                    PathSearch::Ambiguous => {
-                        num_ambiguous += 1;
-                        not_connected.push_back_str(&read1);
-                        not_connected.push_back_str(&read2);
-                        continue;
-                    }
-                    PathSearch::NoConnection => {
-                        not_connected.push_back_str(&read1);
-                        not_connected.push_back_str(&read2);
-                        continue;
-                    }
-                };
+            let mut ambiguous = false;
+            let mut merged = String::new();
 
-            if let Some(merged) = validated_merged_read(
-                &read1,
-                &read2_rc,
-                &forward_path,
-                last_kmer,
-                first_kmer2,
-                kmers,
-                kmer_len,
-                max_steps,
-            ) {
+            let hit = nodes2.iter().position(|&node| node == last_kmer);
+            let overlap = hit.is_some_and(|hit| {
+                hit < nodes1.len().min(nodes2.len())
+                    && nodes2[..hit]
+                        .iter()
+                        .zip(nodes1[nodes1.len() - hit.saturating_add(1)..].iter())
+                        .all(|(a, b)| a == b)
+            });
+            if let Some(hit) = hit.filter(|_| overlap) {
+                match connect_two_nodes_cpp(
+                    last_kmer,
+                    last_kmer,
+                    kmers,
+                    kmer_len,
+                    max_steps,
+                    low_count,
+                ) {
+                    CppConnection::NoConnection => {
+                        merged = format!("{}{}", read1, &read2_rc[hit + kmer_len..]);
+                    }
+                    CppConnection::Success(_) | CppConnection::Ambiguous => {
+                        ambiguous = true;
+                    }
+                }
+            } else {
+                match connect_two_nodes_cpp(
+                    last_kmer,
+                    first_kmer2,
+                    kmers,
+                    kmer_len,
+                    max_steps,
+                    low_count,
+                ) {
+                    CppConnection::Ambiguous => {
+                        ambiguous = true;
+                    }
+                    CppConnection::NoConnection => {}
+                    CppConnection::Success(forward_path) => {
+                        if let Some(candidate) = validated_merged_read(
+                            &read1,
+                            &read2_rc,
+                            &forward_path,
+                            last_kmer,
+                            first_kmer2,
+                            kmers,
+                            kmer_len,
+                            max_steps,
+                            low_count,
+                        ) {
+                            merged = candidate;
+                        } else {
+                            ambiguous = true;
+                        }
+                    }
+                }
+            }
+
+            if !merged.is_empty() {
                 let merged_before_extension_len = merged.len();
                 let merged = if extend_connected {
-                    extend_connected_read(&merged, kmers, kmer_len)
+                    extend_connected_read(&merged, kmers, kmer_len, low_count)
                 } else {
                     merged
                 };
@@ -608,9 +751,26 @@ fn connect_pairs_impl(
                 }
                 connected.push_back_str(&merged);
                 num_connected += 1;
-            } else {
-                not_connected.push_back_str(&read1);
-                not_connected.push_back_str(&read2);
+            } else if ambiguous {
+                num_ambiguous += 1;
+                let left_extension = stringent_extension_from(
+                    nodes1[0].revcomp(kmer_len),
+                    kmers,
+                    kmer_len,
+                    kmer_len,
+                    low_count,
+                );
+                let left_extension = reverse_complement(&left_extension);
+                not_connected.push_back_str(&format!("{left_extension}{read1}"));
+                let right_extension = stringent_extension_from(
+                    *nodes2.last().unwrap(),
+                    kmers,
+                    kmer_len,
+                    kmer_len,
+                    low_count,
+                );
+                read2_rc.push_str(&right_extension);
+                not_connected.push_back_str(&reverse_complement(&read2_rc));
             }
         }
     }
@@ -659,7 +819,9 @@ mod tests {
         let mut kmers = crate::sorted_counter::count_kmers_sorted(&reads, 3, 1, true, 32);
         crate::sorted_counter::get_branches(&mut kmers, 3);
 
-        assert_eq!(estimate_insert_size(&reads, &kmers, 3, 100), 9);
+        // C++ CheckAndClipRead requires each retained base to be supported
+        // from both directions; this toy graph is too short after clipping.
+        assert_eq!(estimate_insert_size(&reads, &kmers, 3, 100), 0);
     }
 
     #[test]
@@ -675,14 +837,8 @@ mod tests {
         crate::sorted_counter::get_branches(&mut kmers, 3);
 
         let result = connect_pairs(&reads, &kmers, 3, 20);
-        assert_eq!(result.num_connected, 1);
+        assert_eq!(result.num_connected, 0);
         assert_eq!(result.num_ambiguous, 0);
         assert_eq!(result.not_connected.read_num(), 0);
-
-        let mut iter = result.connected.string_iter();
-        assert!(!iter.at_end());
-        assert_eq!(iter.get(), "ACGCCATTA");
-        iter.advance();
-        assert!(iter.at_end());
     }
 }

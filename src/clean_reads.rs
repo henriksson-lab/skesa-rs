@@ -1,4 +1,5 @@
 use crate::contig::ContigSequence;
+use crate::counter::KmerCount;
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
 /// Read cleaning: remove reads that fully map inside assembled contigs.
@@ -20,6 +21,13 @@ struct KmerPosition {
     contig_idx: usize,
 }
 
+#[derive(Clone, Copy)]
+pub struct CleanupGraphParams<'a> {
+    pub kmers: &'a KmerCount,
+    pub fraction: f64,
+    pub average_count: f64,
+}
+
 pub struct PairConnectionCleanup {
     pub remaining_pairs: Vec<ReadPair>,
     pub internal_reads: ReadHolder,
@@ -30,13 +38,60 @@ pub struct PairConnectionCleanup {
 fn build_kmer_to_contig_map(
     contigs: &[ContigSequence],
     kmer_len: usize,
+    min_contig_len: usize,
     unique_only: bool,
+    graph: Option<CleanupGraphParams<'_>>,
 ) -> HashMap<Vec<u64>, KmerPosition> {
     let precision = kmer_len.div_ceil(32);
     let mut key_counts: HashMap<Vec<u64>, usize> = HashMap::new();
     let mut entries: Vec<(Vec<u64>, KmerPosition)> = Vec::new();
+    let mut eligible_contigs = Vec::new();
 
     for (contig_idx, contig) in contigs.iter().enumerate() {
+        if contig.len() != 1 || contig.len_min() < min_contig_len {
+            continue;
+        }
+        eligible_contigs.push(contig_idx);
+    }
+
+    let mut mult_contig_nodes: HashMap<Vec<u64>, usize> = HashMap::new();
+    if let Some(graph_params) = graph {
+        for &contig_idx in &eligible_contigs {
+            let contig = &contigs[contig_idx];
+            let seq = contig.primary_sequence();
+            if seq.len() < kmer_len {
+                continue;
+            }
+            let mut seen = HashMap::new();
+            let mut rh = ReadHolder::new(false);
+            rh.push_back_str(&seq);
+            let mut ki = rh.kmer_iter(kmer_len);
+            while !ki.at_end() {
+                let kmer = ki.get();
+                let rkmer = kmer.revcomp(kmer_len);
+                let canonical = if kmer < rkmer { kmer } else { rkmer };
+                let idx = graph_params.kmers.find(&canonical);
+                if idx < graph_params.kmers.size() {
+                    let abundance = (graph_params.kmers.get_count(idx) & 0xFFFF_FFFF) as f64;
+                    if abundance * graph_params.fraction > graph_params.average_count {
+                        ki.advance();
+                        continue;
+                    }
+                    let key = canonical.to_words()[..precision].to_vec();
+                    seen.entry(key).or_insert(());
+                }
+                ki.advance();
+            }
+            for key in seen.into_keys() {
+                *mult_contig_nodes.entry(key).or_insert(0) += 1;
+            }
+        }
+    }
+
+    for (contig_idx, contig) in contigs.iter().enumerate() {
+        if !eligible_contigs.contains(&contig_idx) {
+            continue;
+        }
         let seq = contig.primary_sequence();
         if seq.len() < kmer_len {
             continue;
@@ -46,6 +101,8 @@ fn build_kmer_to_contig_map(
         rh.push_back_str(&seq);
         let mut ki = rh.kmer_iter(kmer_len);
         let mut pos = (seq.len() - kmer_len) as i32;
+        let mut contig_entries: Vec<(Vec<u64>, KmerPosition)> = Vec::new();
+        let mut found_repeat = false;
 
         while !ki.at_end() {
             let kmer = ki.get();
@@ -54,8 +111,23 @@ fn build_kmer_to_contig_map(
             let canonical = if is_direct { kmer } else { rkmer };
             let key = canonical.to_words()[..precision].to_vec();
 
-            *key_counts.entry(key.clone()).or_insert(0) += 1;
-            entries.push((
+            if let Some(graph_params) = graph {
+                let idx = graph_params.kmers.find(&canonical);
+                if idx < graph_params.kmers.size() {
+                    let abundance = (graph_params.kmers.get_count(idx) & 0xFFFF_FFFF) as f64;
+                    if abundance * graph_params.fraction > graph_params.average_count {
+                        ki.advance();
+                        pos -= 1;
+                        continue;
+                    }
+                }
+                if mult_contig_nodes.get(&key).is_some_and(|count| *count > 1) {
+                    found_repeat = true;
+                    break;
+                }
+            }
+
+            contig_entries.push((
                 key,
                 KmerPosition {
                     position: pos,
@@ -67,12 +139,19 @@ fn build_kmer_to_contig_map(
             ki.advance();
             pos -= 1;
         }
+
+        if !found_repeat {
+            for (key, pos_info) in contig_entries {
+                *key_counts.entry(key.clone()).or_insert(0) += 1;
+                entries.push((key, pos_info));
+            }
+        }
     }
 
     let mut map = HashMap::new();
     for (key, pos_info) in entries {
         if !unique_only || key_counts.get(&key) == Some(&1usize) {
-            map.entry(key).or_insert(pos_info);
+            map.insert(key, pos_info);
         }
     }
 
@@ -85,6 +164,7 @@ fn find_read_position(
     read_seq: &str,
     kmer_len: usize,
     map: &HashMap<Vec<u64>, KmerPosition>,
+    contigs: &[ContigSequence],
 ) -> Option<(i32, i32, usize)> {
     if read_seq.len() < kmer_len {
         return None;
@@ -116,11 +196,20 @@ fn find_read_position(
             }
 
             let contig_idx = pos_info.contig_idx;
-            let read_pos = if plus > 0 {
+            let contig = &contigs[contig_idx];
+            let contig_len = contig.len_max() as i32;
+            let mut read_pos = if plus > 0 {
                 pos_info.position - knum
             } else {
                 pos_info.position + kmer_len as i32 - 1 + knum
             };
+            if plus > 0 {
+                if read_pos < 0 && contig.circular {
+                    read_pos += contig_len;
+                }
+            } else if read_pos >= contig_len && contig.circular {
+                read_pos -= contig_len;
+            }
 
             return Some((read_pos, plus, contig_idx));
         }
@@ -187,14 +276,16 @@ pub fn clean_reads(
     reads: &[ReadPair],
     contigs: &[ContigSequence],
     kmer_len: usize,
+    min_contig_len: usize,
     margin: usize,
     insert_size: usize,
+    graph: Option<CleanupGraphParams<'_>>,
 ) -> Vec<ReadPair> {
     if contigs.is_empty() {
         return reads.to_vec();
     }
 
-    let map = build_kmer_to_contig_map(contigs, kmer_len, false);
+    let map = build_kmer_to_contig_map(contigs, kmer_len, min_contig_len, false, graph);
     let contig_lens: Vec<usize> = contigs.iter().map(|c| c.len_max()).collect();
     let contig_left_reps: Vec<i32> = contigs.iter().map(|c| c.left_repeat).collect();
     let contig_right_reps: Vec<i32> = contigs.iter().map(|c| c.right_repeat).collect();
@@ -223,8 +314,8 @@ pub fn clean_reads(
                     continue;
                 }
 
-                let pos1 = find_read_position(&read1, kmer_len, &map);
-                let pos2 = find_read_position(&read2, kmer_len, &map);
+                let pos1 = find_read_position(&read1, kmer_len, &map, contigs);
+                let pos2 = find_read_position(&read2, kmer_len, &map, contigs);
                 let m = margin as i32;
                 let span = insert_size.max(read1.len().max(read2.len())) as i32;
 
@@ -270,7 +361,7 @@ pub fn clean_reads(
                     continue;
                 }
 
-                let pos = find_read_position(&read, kmer_len, &map);
+                let pos = find_read_position(&read, kmer_len, &map, contigs);
                 let should_remove = match pos {
                     Some((p, plus, ci)) => {
                         read_is_deep(p, plus, &contigs[ci], margin as i32, read.len() as i32)
@@ -294,8 +385,10 @@ pub fn clean_pair_connection_reads(
     reads: &[ReadPair],
     contigs: &[ContigSequence],
     kmer_len: usize,
+    min_contig_len: usize,
     margin: usize,
     insert_size: usize,
+    graph: Option<CleanupGraphParams<'_>>,
 ) -> PairConnectionCleanup {
     let mut result = PairConnectionCleanup {
         remaining_pairs: Vec::with_capacity(reads.len()),
@@ -306,7 +399,7 @@ pub fn clean_pair_connection_reads(
         return result;
     }
 
-    let map = build_kmer_to_contig_map(contigs, kmer_len, false);
+    let map = build_kmer_to_contig_map(contigs, kmer_len, min_contig_len, false, graph);
     let m = margin as i32;
     let span = insert_size as i32;
 
@@ -329,8 +422,8 @@ pub fn clean_pair_connection_reads(
                     continue;
                 }
 
-                let pos1 = find_read_position(&read1, kmer_len, &map);
-                let pos2 = find_read_position(&read2, kmer_len, &map);
+                let pos1 = find_read_position(&read1, kmer_len, &map, contigs);
+                let pos2 = find_read_position(&read2, kmer_len, &map, contigs);
                 let mut classified = false;
                 if let Some((p1, plus1, ci1)) = pos1 {
                     if pair_span_is_deep(p1, plus1, &contigs[ci1], m, span) {
@@ -391,13 +484,15 @@ pub fn clean_internal_reads(
     reads: &ReadHolder,
     contigs: &[ContigSequence],
     kmer_len: usize,
+    min_contig_len: usize,
     margin: usize,
+    graph: Option<CleanupGraphParams<'_>>,
 ) -> ReadHolder {
     if contigs.is_empty() || reads.read_num() == 0 {
         return reads.clone();
     }
 
-    let map = build_kmer_to_contig_map(contigs, kmer_len, false);
+    let map = build_kmer_to_contig_map(contigs, kmer_len, min_contig_len, false, graph);
     let mut cleaned = ReadHolder::new(false);
     let mut si = reads.string_iter();
     while !si.at_end() {
@@ -406,7 +501,7 @@ pub fn clean_internal_reads(
         if read.len() < kmer_len {
             continue;
         }
-        let pos = find_read_position(&read, kmer_len, &map);
+        let pos = find_read_position(&read, kmer_len, &map, contigs);
         let should_remove = match pos {
             Some((p, plus, ci)) => {
                 let span_p = if plus > 0 { p + 1 } else { p - 1 };
@@ -430,7 +525,7 @@ mod tests {
         let rh = ReadHolder::new(false);
         let reads = vec![[rh.clone(), ReadHolder::new(false)]];
         let contigs: Vec<ContigSequence> = Vec::new();
-        let cleaned = clean_reads(&reads, &contigs, 21, 50, 0);
+        let cleaned = clean_reads(&reads, &contigs, 21, 0, 50, 0, None);
         assert_eq!(cleaned.len(), 1);
     }
 
@@ -439,7 +534,7 @@ mod tests {
         let mut contig = ContigSequence::new();
         contig.insert_new_chunk_with("ACGTACGTACGTACGTACGTACGTAAAA".chars().collect());
         let contigs = vec![contig];
-        let map = build_kmer_to_contig_map(&contigs, 21, false);
+        let map = build_kmer_to_contig_map(&contigs, 21, 0, false, None);
         assert!(!map.is_empty(), "Map should have entries for contig k-mers");
     }
 }

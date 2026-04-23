@@ -13,6 +13,7 @@
 /// 2. **Chain walking**: For non-empty contigs, follow the chain of links via
 ///    RightConnectingNode/LeftConnectingNode, merging with AddToRight/AddToLeft
 use crate::contig::ContigSequence;
+use crate::counter::KmerCount;
 use crate::kmer::Kmer;
 
 /// A contig with link tracking for the ConnectFragments algorithm.
@@ -60,6 +61,58 @@ impl LinkedContig {
         }
     }
 
+    /// Build the final right-extender shape produced by C++
+    /// `SContig(link, 1, takeoff_node, extension, rnode, graph)`.
+    pub fn from_right_extension(
+        parent_idx: usize,
+        takeoff_node: Kmer,
+        extension: &[char],
+        rnode: Option<Kmer>,
+        kmer_len: usize,
+    ) -> Self {
+        let takeoff = takeoff_node.to_kmer_string(kmer_len);
+        let mut seq_chars: Vec<char> = takeoff[1..].chars().collect();
+        seq_chars.extend_from_slice(extension);
+
+        let mut seq = ContigSequence::new();
+        if !seq_chars.is_empty() {
+            seq.insert_new_chunk_with(seq_chars);
+        }
+
+        let mut contig = LinkedContig::new(seq, kmer_len);
+        contig.next_left = Some(takeoff_node);
+        contig.next_right = rnode;
+        contig.left_link = Some(parent_idx);
+        contig.left_shift = 1;
+        contig
+    }
+
+    /// Build the final left-extender shape after the C++ constructor above is
+    /// called with shift -1 and then `ReverseComplement()` is applied.
+    pub fn from_left_extension(
+        parent_idx: usize,
+        front_node: Kmer,
+        extension_left_to_right: &[char],
+        lnode: Option<Kmer>,
+        kmer_len: usize,
+    ) -> Self {
+        let front = front_node.to_kmer_string(kmer_len);
+        let mut seq_chars: Vec<char> = extension_left_to_right.to_vec();
+        seq_chars.extend(front[..kmer_len - 1].chars());
+
+        let mut seq = ContigSequence::new();
+        if !seq_chars.is_empty() {
+            seq.insert_new_chunk_with(seq_chars);
+        }
+
+        let mut contig = LinkedContig::new(seq, kmer_len);
+        contig.next_left = lnode;
+        contig.next_right = Some(front_node);
+        contig.right_link = Some(parent_idx);
+        contig.right_shift = -1;
+        contig
+    }
+
     /// Whether this is an empty linker (just connects two other contigs).
     /// Empty linker = sequence shorter than kmer_len and at most 3 chunks.
     pub fn empty_linker(&self) -> bool {
@@ -88,22 +141,32 @@ impl LinkedContig {
 
     /// Get the first k-mer of the contig
     pub fn front_kmer(&self) -> Option<Kmer> {
-        let seq = self.seq.primary_sequence();
-        if seq.len() >= self.kmer_len {
-            Some(Kmer::from_kmer_str(&seq[..self.kmer_len]))
-        } else {
-            None
+        if self.seq.is_empty()
+            || self.seq.variable_chunk(0)
+            || self.seq.chunk_len_max(0) < self.kmer_len
+        {
+            return None;
         }
+        let first_chunk = &self.seq.chunks[0][0];
+        Some(Kmer::from_kmer_str(
+            &first_chunk[..self.kmer_len].iter().collect::<String>(),
+        ))
     }
 
     /// Get the last k-mer of the contig
     pub fn back_kmer(&self) -> Option<Kmer> {
-        let seq = self.seq.primary_sequence();
-        if seq.len() >= self.kmer_len {
-            Some(Kmer::from_kmer_str(&seq[seq.len() - self.kmer_len..]))
-        } else {
-            None
+        if self.seq.is_empty() {
+            return None;
         }
+        let last_idx = self.seq.len() - 1;
+        if self.seq.variable_chunk(last_idx) || self.seq.chunk_len_max(last_idx) < self.kmer_len {
+            return None;
+        }
+        let last_chunk = &self.seq.chunks[last_idx][0];
+        let start = last_chunk.len() - self.kmer_len;
+        Some(Kmer::from_kmer_str(
+            &last_chunk[start..].iter().collect::<String>(),
+        ))
     }
 
     /// The k-mer used for connecting on the right side.
@@ -123,23 +186,11 @@ impl LinkedContig {
         } else if n >= 3 {
             // SNP at right end — use the kmer from the chunk before the SNP
             if self.seq.chunk_len_max(last_idx - 2) >= self.kmer_len {
-                // Build kmer from end of chunk[last-2] + chunk[last-1] (SNP) + chunk[last]
-                let primary = self.seq.primary_sequence();
-                // Actually, the C++ builds a kmer from the last kmer_len chars of chunk[last-2]
-                // Get the chunk boundaries
-                let mut pos = 0;
-                for i in 0..last_idx - 2 {
-                    pos += self.seq.chunk_len_max(i);
-                }
-                let chunk_end = pos + self.seq.chunk_len_max(last_idx - 2);
-                if chunk_end >= self.kmer_len {
-                    let kmer_start = chunk_end - self.kmer_len;
-                    if kmer_start + self.kmer_len <= primary.len() {
-                        return Some(Kmer::from_kmer_str(
-                            &primary[kmer_start..kmer_start + self.kmer_len],
-                        ));
-                    }
-                }
+                let chunk = &self.seq.chunks[last_idx - 2][0];
+                let start = chunk.len() - self.kmer_len;
+                return Some(Kmer::from_kmer_str(
+                    &chunk[start..].iter().collect::<String>(),
+                ));
             }
         }
         // Empty linker fallback
@@ -151,7 +202,7 @@ impl LinkedContig {
     pub fn left_connecting_kmer(&self) -> Option<Kmer> {
         let n = self.seq.len();
         if n == 0 {
-            return self.next_right.map(|k| k.revcomp(self.kmer_len));
+            return self.next_right;
         }
         if self.seq.chunk_len_max(0) >= self.kmer_len {
             // Normal end
@@ -159,16 +210,14 @@ impl LinkedContig {
         } else if n >= 3 {
             // SNP at left end — use the kmer from chunk[2]
             if self.seq.chunk_len_max(2) >= self.kmer_len {
-                let primary = self.seq.primary_sequence();
-                // Position of chunk[2] start
-                let pos = self.seq.chunk_len_max(0) + self.seq.chunk_len_max(1);
-                if pos + self.kmer_len <= primary.len() {
-                    return Some(Kmer::from_kmer_str(&primary[pos..pos + self.kmer_len]));
-                }
+                let chunk = &self.seq.chunks[2][0];
+                return Some(Kmer::from_kmer_str(
+                    &chunk[..self.kmer_len].iter().collect::<String>(),
+                ));
             }
         }
         // Empty linker fallback
-        self.next_right.map(|k| k.revcomp(self.kmer_len))
+        self.next_right
     }
 
     /// Reverse complement the contig (swaps left/right)
@@ -402,11 +451,11 @@ fn canonical_kmer(kmer: &Kmer, kmer_len: usize) -> Kmer {
     }
 }
 
-/// Key for hash maps — canonical kmer as word vector
-fn kmer_key(kmer: &Kmer, kmer_len: usize) -> Vec<u64> {
+/// Exact oriented k-mer key. C++ `ConnectFragments` stores `Node` keys without
+/// canonicalizing; reverse-complement matching is handled by explicit lookups.
+fn oriented_kmer_key(kmer: &Kmer, kmer_len: usize) -> Vec<u64> {
     let precision = kmer_len.div_ceil(32);
-    let canonical = canonical_kmer(kmer, kmer_len);
-    canonical.to_words()[..precision].to_vec()
+    kmer.to_words()[..precision].to_vec()
 }
 
 /// Connect fragments using denied-node matching and chain walking.
@@ -419,6 +468,20 @@ fn kmer_key(kmer: &Kmer, kmer_len: usize) -> Vec<u64> {
 ///    LeftConnectingNode → denied_right_nodes (also checking reverse complement)
 /// 5. Merge chains via AddToRight/AddToLeft
 pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
+    connect_fragments_impl(contigs, None);
+}
+
+pub fn connect_fragments_with_graph(contigs: &mut Vec<LinkedContig>, kmers: &KmerCount) {
+    connect_fragments_impl(contigs, Some(kmers));
+}
+
+fn kmer_exists_in_graph(kmer: Kmer, kmers: &KmerCount, kmer_len: usize) -> bool {
+    let rc = kmer.revcomp(kmer_len);
+    let canonical = if kmer < rc { kmer } else { rc };
+    kmers.find(&canonical) < kmers.size()
+}
+
+fn connect_fragments_impl(contigs: &mut Vec<LinkedContig>, kmers: Option<&KmerCount>) {
     use std::collections::HashMap;
 
     if contigs.len() < 2 {
@@ -450,7 +513,7 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
 
         // Handle left denied node collision
         if let Some(nl) = contigs[i].next_left {
-            let key = kmer_key(&nl, kmer_len);
+            let key = oriented_kmer_key(&nl, kmer_len);
             if let Some(&other_idx) = denied_left.get(&key) {
                 if !removed[other_idx] {
                     // Collision: both have the same left denied node
@@ -470,7 +533,7 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
                         contigs[i].left_link = contigs[other_idx].left_link;
                         // Remove other from denied_right if present
                         if let Some(nr) = contigs[other_idx].next_right {
-                            let rkey = kmer_key(&nr, kmer_len);
+                            let rkey = oriented_kmer_key(&nr, kmer_len);
                             denied_right.remove(&rkey);
                         }
                         removed[other_idx] = true;
@@ -488,7 +551,7 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
 
         // Handle right denied node collision
         if let Some(nr) = contigs[i].next_right {
-            let key = kmer_key(&nr, kmer_len);
+            let key = oriented_kmer_key(&nr, kmer_len);
             if let Some(&other_idx) = denied_right.get(&key) {
                 if !removed[other_idx] {
                     let has_right_link_i = contigs[i].right_link.is_some();
@@ -499,14 +562,14 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
                     if has_right_link_i && has_left_link_other {
                         contigs[other_idx].right_link = contigs[i].right_link;
                         if let Some(nl) = contigs[i].next_left {
-                            let lkey = kmer_key(&nl, kmer_len);
+                            let lkey = oriented_kmer_key(&nl, kmer_len);
                             denied_left.remove(&lkey);
                         }
                         removed[i] = true;
                     } else if has_right_link_other && has_left_link_i {
                         contigs[i].right_link = contigs[other_idx].right_link;
                         if let Some(nl) = contigs[other_idx].next_left {
-                            let lkey = kmer_key(&nl, kmer_len);
+                            let lkey = oriented_kmer_key(&nl, kmer_len);
                             denied_left.remove(&lkey);
                         }
                         removed[other_idx] = true;
@@ -519,7 +582,7 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
         }
     }
 
-    // Phase 3: Chain walking for non-empty contigs
+    // Phase 3: Pair fragments through denied-node matches.
     // For each non-empty contig, follow the chain via RightConnectingNode/LeftConnectingNode
     for i in 0..contigs.len() {
         if removed[i] || contigs[i].empty_linker() {
@@ -528,11 +591,11 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
 
         // Remove this contig's own entries from maps so we don't self-match
         if let Some(nr) = contigs[i].next_right {
-            let key = kmer_key(&nr, kmer_len);
+            let key = oriented_kmer_key(&nr, kmer_len);
             denied_right.remove(&key);
         }
         if let Some(nl) = contigs[i].next_left {
-            let key = kmer_key(&nl, kmer_len);
+            let key = oriented_kmer_key(&nl, kmer_len);
             denied_left.remove(&key);
         }
 
@@ -542,15 +605,17 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
 
             // Try to extend right
             if contigs[i].next_right.is_some() {
-                if let Some(rnode) = contigs[i].right_connecting_kmer() {
-                    let rkey = kmer_key(&rnode, kmer_len);
+                if let Some(rnode) = contigs[i].right_connecting_kmer().filter(|&kmer| {
+                    kmers.is_none_or(|graph| kmer_exists_in_graph(kmer, graph, kmer_len))
+                }) {
+                    let rkey = oriented_kmer_key(&rnode, kmer_len);
                     // Check denied_left_nodes for a match
                     if let Some(&j) = denied_left.get(&rkey) {
                         if !removed[j] && j != i {
                             keep_doing = true;
                             // Remove j's right entry from map
                             if let Some(nr) = contigs[j].next_right {
-                                denied_right.remove(&kmer_key(&nr, kmer_len));
+                                denied_right.remove(&oriented_kmer_key(&nr, kmer_len));
                             }
                             let other = contigs[j].clone();
                             contigs[i].add_to_right(&other);
@@ -561,12 +626,12 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
                     }
                     // Also check reverse complement in denied_right
                     let rc_rnode = rnode.revcomp(kmer_len);
-                    let rc_key = kmer_key(&rc_rnode, kmer_len);
+                    let rc_key = oriented_kmer_key(&rc_rnode, kmer_len);
                     if let Some(&j) = denied_right.get(&rc_key) {
                         if !removed[j] && j != i {
                             keep_doing = true;
                             if let Some(nl) = contigs[j].next_left {
-                                denied_left.remove(&kmer_key(&nl, kmer_len));
+                                denied_left.remove(&oriented_kmer_key(&nl, kmer_len));
                             }
                             contigs[j].reverse_complement();
                             let other = contigs[j].clone();
@@ -581,14 +646,16 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
 
             // Try to extend left
             if contigs[i].next_left.is_some() {
-                if let Some(lnode) = contigs[i].left_connecting_kmer() {
-                    let lkey = kmer_key(&lnode, kmer_len);
+                if let Some(lnode) = contigs[i].left_connecting_kmer().filter(|&kmer| {
+                    kmers.is_none_or(|graph| kmer_exists_in_graph(kmer, graph, kmer_len))
+                }) {
+                    let lkey = oriented_kmer_key(&lnode, kmer_len);
                     // Check denied_right_nodes for match
                     if let Some(&j) = denied_right.get(&lkey) {
                         if !removed[j] && j != i {
                             keep_doing = true;
                             if let Some(nl) = contigs[j].next_left {
-                                denied_left.remove(&kmer_key(&nl, kmer_len));
+                                denied_left.remove(&oriented_kmer_key(&nl, kmer_len));
                             }
                             let other = contigs[j].clone();
                             contigs[i].add_to_left(&other);
@@ -599,12 +666,12 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
                     }
                     // Also check reverse complement in denied_left
                     let rc_lnode = lnode.revcomp(kmer_len);
-                    let rc_key = kmer_key(&rc_lnode, kmer_len);
+                    let rc_key = oriented_kmer_key(&rc_lnode, kmer_len);
                     if let Some(&j) = denied_left.get(&rc_key) {
                         if !removed[j] && j != i {
                             keep_doing = true;
                             if let Some(nr) = contigs[j].next_right {
-                                denied_right.remove(&kmer_key(&nr, kmer_len));
+                                denied_right.remove(&oriented_kmer_key(&nr, kmer_len));
                             }
                             contigs[j].reverse_complement();
                             let other = contigs[j].clone();
@@ -621,8 +688,8 @@ pub fn connect_fragments(contigs: &mut Vec<LinkedContig>) {
         // Check for circular contigs
         if let (Some(nr), Some(_nl)) = (contigs[i].next_right, contigs[i].next_left) {
             if let Some(lck) = contigs[i].left_connecting_kmer() {
-                let nr_key = kmer_key(&nr, kmer_len);
-                let lc_key = kmer_key(&lck, kmer_len);
+                let nr_key = oriented_kmer_key(&nr, kmer_len);
+                let lc_key = oriented_kmer_key(&lck, kmer_len);
                 if nr_key == lc_key && contigs[i].len_max() >= 2 * kmer_len - 1 {
                     contigs[i].seq.circular = true;
                 }
@@ -847,6 +914,44 @@ mod tests {
     }
 
     #[test]
+    fn test_right_extension_constructor_matches_cpp_shape() {
+        let takeoff = Kmer::from_kmer_str("ACGTACGTACGTACGTACGTA");
+        let rnode = Kmer::from_kmer_str("TTTTTTTTTTTTTTTTTTTTT");
+        let ext = LinkedContig::from_right_extension(
+            7,
+            takeoff,
+            &"GGG".chars().collect::<Vec<_>>(),
+            Some(rnode),
+            21,
+        );
+
+        assert_eq!(ext.seq.primary_sequence(), "CGTACGTACGTACGTACGTAGGG");
+        assert_eq!(ext.left_link, Some(7));
+        assert_eq!(ext.left_shift, 1);
+        assert_eq!(ext.next_left, Some(takeoff));
+        assert_eq!(ext.next_right, Some(rnode));
+    }
+
+    #[test]
+    fn test_left_extension_constructor_matches_post_reverse_cpp_shape() {
+        let front = Kmer::from_kmer_str("ACGTACGTACGTACGTACGTA");
+        let lnode = Kmer::from_kmer_str("CCCCCCCCCCCCCCCCCCCCC");
+        let ext = LinkedContig::from_left_extension(
+            7,
+            front,
+            &"TTT".chars().collect::<Vec<_>>(),
+            Some(lnode),
+            21,
+        );
+
+        assert_eq!(ext.seq.primary_sequence(), "TTTACGTACGTACGTACGTACGT");
+        assert_eq!(ext.right_link, Some(7));
+        assert_eq!(ext.right_shift, -1);
+        assert_eq!(ext.next_left, Some(lnode));
+        assert_eq!(ext.next_right, Some(front));
+    }
+
+    #[test]
     fn test_connect_fragments_two_matching() {
         // Two contigs where lc1's BackKmer matches lc2's next_left (denied node).
         // This means lc2 was denied a kmer that is lc1's last kmer.
@@ -881,11 +986,93 @@ mod tests {
     }
 
     #[test]
+    fn test_connect_fragments_denied_maps_use_oriented_nodes_like_cpp() {
+        let kmer_len = 5;
+        let mut seq1 = ContigSequence::new();
+        seq1.insert_new_chunk_with("CCCCCAAAAA".chars().collect());
+        let mut left_linker = LinkedContig::new(seq1, kmer_len);
+        left_linker.next_left = Some(Kmer::from_kmer_str("AAAAA"));
+        left_linker.left_link = Some(10);
+
+        let mut seq2 = ContigSequence::new();
+        seq2.insert_new_chunk_with("GGGGGTTTTT".chars().collect());
+        let mut right_linker = LinkedContig::new(seq2, kmer_len);
+        right_linker.next_left = Some(Kmer::from_kmer_str("TTTTT"));
+        right_linker.right_link = Some(20);
+
+        let mut contigs = vec![left_linker, right_linker];
+        connect_fragments(&mut contigs);
+
+        assert_eq!(contigs.len(), 2);
+        assert!(contigs.iter().any(|c| c.left_link == Some(10)));
+        assert!(contigs.iter().any(|c| c.right_link == Some(20)));
+    }
+
+    #[test]
     fn test_empty_linker() {
         let mut seq = ContigSequence::new();
         seq.insert_new_chunk_with("ACGT".chars().collect()); // shorter than kmer_len
         let lc = LinkedContig::new(seq, 21);
         assert!(lc.empty_linker());
+    }
+
+    #[test]
+    fn test_empty_linker_left_connecting_node_matches_cpp_next_right() {
+        let mut seq = ContigSequence::new();
+        seq.insert_new_chunk_with("ACGT".chars().collect());
+        let mut lc = LinkedContig::new(seq, 21);
+        let next_right = Kmer::from_kmer_str("ACGTACGTACGTACGTACGTA");
+        lc.next_right = Some(next_right);
+
+        assert_eq!(lc.left_connecting_kmer(), Some(next_right));
+    }
+
+    #[test]
+    fn test_terminal_kmers_reject_variable_terminal_chunks_like_cpp() {
+        let mut seq = ContigSequence::new();
+        seq.insert_new_chunk_with("AAAAA".chars().collect());
+        seq.insert_new_variant_slice(&"CCCCC".chars().collect::<Vec<_>>());
+        seq.insert_new_chunk_with("GGGGG".chars().collect());
+        let lc = LinkedContig::new(seq, 5);
+
+        assert_eq!(lc.front_kmer(), None);
+        assert_eq!(lc.back_kmer().unwrap().to_kmer_string(5), "GGGGG");
+
+        let mut seq = ContigSequence::new();
+        seq.insert_new_chunk_with("AAAAA".chars().collect());
+        seq.insert_new_chunk_with("CCCCC".chars().collect());
+        seq.insert_new_variant_slice(&"GGGGG".chars().collect::<Vec<_>>());
+        let lc = LinkedContig::new(seq, 5);
+
+        assert_eq!(lc.front_kmer().unwrap().to_kmer_string(5), "AAAAA");
+        assert_eq!(lc.back_kmer(), None);
+    }
+
+    #[test]
+    fn test_snp_connecting_kmers_come_from_flanking_chunks_like_cpp() {
+        let mut seq = ContigSequence::new();
+        seq.insert_new_chunk_with("AAAAACCCCC".chars().collect());
+        seq.insert_new_chunk_with("G".chars().collect());
+        seq.insert_new_variant_slice(&"T".chars().collect::<Vec<_>>());
+        seq.insert_new_chunk_with("AA".chars().collect());
+        let lc = LinkedContig::new(seq, 5);
+
+        assert_eq!(
+            lc.right_connecting_kmer().unwrap().to_kmer_string(5),
+            "CCCCC"
+        );
+
+        let mut seq = ContigSequence::new();
+        seq.insert_new_chunk_with("AA".chars().collect());
+        seq.insert_new_chunk_with("G".chars().collect());
+        seq.insert_new_variant_slice(&"T".chars().collect::<Vec<_>>());
+        seq.insert_new_chunk_with("GGGGGTTTTT".chars().collect());
+        let lc = LinkedContig::new(seq, 5);
+
+        assert_eq!(
+            lc.left_connecting_kmer().unwrap().to_kmer_string(5),
+            "GGGGG"
+        );
     }
 
     #[test]

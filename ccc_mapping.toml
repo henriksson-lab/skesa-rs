@@ -1,0 +1,1472 @@
+# Mapping used with code-complexity-comparator
+# (/data/henriksson/github/claude/code-complexity-comparator)
+# to match bundled C++ SKESA sources in `SKESA/` with the Rust port in `src/`.
+#
+# Regenerate reports:
+#   ccc-rs analyze SKESA -l cpp  --recurse -o analysis/skesa_cpp.json
+#   ccc-rs analyze src   -l rust --recurse -o analysis/skesa_rust.json
+# Compare with this mapping:
+#   ccc-rs compare analysis/skesa_rust.json analysis/skesa_cpp.json \
+#       --mapping ccc_mapping.toml --top 25
+#   ccc-rs missing analysis/skesa_rust.json analysis/skesa_cpp.json \
+#       --mapping ccc_mapping.toml
+#
+# Name convention:
+#  - Rust: `rust = "method"` + `rust_class = "Type"` for inherent methods;
+#    bare `rust = "fn"` for free functions.
+#  - C++: `other` is the `name` field as recorded by ccc-rs: unqualified for
+#    in-class definitions, `Class::Method` for out-of-class definitions.
+#  - `other_path = "file.hpp"` / `other_path = "file.cpp"` disambiguates when
+#    the same C++ name appears in more than one file.
+
+
+[[entries]]
+rust = "new"
+rust_class = "LargeInt"
+other = "LargeInt"
+
+[[entries]]
+rust = "get_val"
+rust_class = "LargeInt"
+other = "getVal"
+
+[[entries]]
+rust = "get_size"
+rust_class = "LargeInt"
+other = "getSize"
+
+[[entries]]
+rust = "type_name"
+rust_class = "LargeInt"
+other = "getName"
+
+[[entries]]
+rust = "codon"
+rust_class = "LargeInt"
+other = "Codon"
+
+[[entries]]
+rust = "oahash"
+rust_class = "LargeInt"
+other = "oahash"
+
+[[entries]]
+rust = "oahash64"
+other = "oahash64"
+
+[[entries]]
+rust = "revcomp"
+rust_class = "LargeInt"
+other = "revcomp"
+
+# LargeInt<1>::revcomp64 and LargeInt<2>::revcomp64 — the word-level
+# reverse-complement helper — are inlined into LargeInt::revcomp's N==1
+# specialization (src/large_int.rs:170-204). No standalone Rust fn.
+[[entries]]
+rust = "revcomp"
+rust_class = "LargeInt"
+other = "revcomp64"
+
+# C++ `polynom(data, size, fct)` is the generic ASCII→LargeInt constructor;
+# Rust equivalent is `LargeInt::from_ascii_bytes` (byte-based, fixed mapping).
+[[entries]]
+rust = "from_ascii_bytes"
+rust_class = "LargeInt"
+other = "polynom"
+
+[[entries]]
+rust = "to_kmer_string"
+rust_class = "LargeInt"
+other = "toString"
+
+[[entries]]
+rust = "nucleotide_at"
+rust_class = "LargeInt"
+other = "Integer_value_at"
+
+[[entries]]
+rust = "as_ptr"
+rust_class = "LargeInt"
+other = "getPointer"
+
+# LargeInt operator overloads on the C++ side map to named inherent methods
+# (and the matching std::ops trait impls) on `LargeInt<N>` in Rust. Rust
+# doesn't have separate `operator` symbols — these are the idiomatic pairs.
+[[entries]]
+rust = "add"
+rust_class = "LargeInt"
+other = "operator+"
+
+[[entries]]
+rust = "sub"
+rust_class = "LargeInt"
+other = "operator-"
+
+[[entries]]
+rust = "bitor"
+rust_class = "LargeInt"
+other = "operator|"
+
+[[entries]]
+rust = "bitand"
+rust_class = "LargeInt"
+other = "operator&"
+
+[[entries]]
+rust = "bitxor"
+rust_class = "LargeInt"
+other = "operator^"
+
+[[entries]]
+rust = "bitnot"
+rust_class = "LargeInt"
+other = "operator~"
+
+[[entries]]
+rust = "shl"
+rust_class = "LargeInt"
+other = "operator<<"
+
+[[entries]]
+rust = "shr"
+rust_class = "LargeInt"
+other = "operator>>"
+
+[[entries]]
+rust = "add_assign"
+rust_class = "LargeInt"
+other = "operator+="
+
+[[entries]]
+rust = "bitxor_assign"
+rust_class = "LargeInt"
+other = "operator^="
+
+[[entries]]
+rust = "bitand_assign"
+rust_class = "LargeInt"
+other = "operator&="
+
+[[entries]]
+rust = "bitor_assign"
+rust_class = "LargeInt"
+other = "operator|="
+
+[[entries]]
+rust = "shl_assign"
+rust_class = "LargeInt"
+other = "operator<<="
+
+[[entries]]
+rust = "shr_assign"
+rust_class = "LargeInt"
+other = "operator>>="
+
+[[entries]]
+rust = "eq"
+rust_class = "LargeInt"
+other = "operator=="
+
+[[entries]]
+rust = "partial_cmp"
+rust_class = "LargeInt"
+other = "operator<"
+
+[[entries]]
+rust = "cmp"
+rust_class = "LargeInt"
+other = "operator<="
+
+[[entries]]
+rust = "precision_for_kmer"
+other = "CreateVariant"
+
+[[entries]]
+rust = "new"
+rust_class = "ReadHolder"
+other = "CReadHolder"
+
+[[entries]]
+rust = "push_back_str"
+rust_class = "ReadHolder"
+other = "PushBack"
+
+[[entries]]
+rust = "swap"
+rust_class = "ReadHolder"
+other = "Swap"
+other_path = "common_util.hpp"
+
+[[entries]]
+rust = "clear"
+rust_class = "ReadHolder"
+other = "Clear"
+other_path = "common_util.hpp"
+
+[[entries]]
+rust = "total_seq"
+rust_class = "ReadHolder"
+other = "TotalSeq"
+
+[[entries]]
+rust = "max_length"
+rust_class = "ReadHolder"
+other = "MaxLength"
+
+[[entries]]
+rust = "kmer_num"
+rust_class = "ReadHolder"
+other = "KmerNum"
+
+[[entries]]
+rust = "read_num"
+rust_class = "ReadHolder"
+other = "ReadNum"
+
+[[entries]]
+rust = "memory_footprint"
+rust_class = "ReadHolder"
+other = "MemoryFootprint"
+other_path = "common_util.hpp"
+
+[[entries]]
+rust = "reserve"
+rust_class = "ReadHolder"
+other = "Reserve"
+other_path = "common_util.hpp"
+
+[[entries]]
+rust = "nxx"
+rust_class = "ReadHolder"
+other = "NXX"
+
+[[entries]]
+rust = "n50"
+rust_class = "ReadHolder"
+other = "N50"
+
+[[entries]]
+rust = "copy_bits"
+rust_class = "ReadHolder"
+other = "CopyBits"
+
+[[entries]]
+rust = "advance"
+rust_class = "KmerIterator<'a>"
+other = "kmer_iterator"
+
+[[entries]]
+rust = "skip_short_reads"
+rust_class = "KmerIterator<'a>"
+other = "SkipShortReads"
+
+[[entries]]
+rust = "advance"
+rust_class = "StringIterator<'a>"
+other = "string_iterator"
+
+[[entries]]
+rust = "read_len"
+rust_class = "StringIterator<'a>"
+other = "ReadLen"
+
+[[entries]]
+rust = "has_mate"
+rust_class = "StringIterator<'a>"
+other = "HasMate"
+
+[[entries]]
+rust = "pair_type"
+rust_class = "StringIterator<'a>"
+other = "PairType"
+
+[[entries]]
+rust = "get_mate"
+rust_class = "StringIterator<'a>"
+other = "GetMate"
+
+[[entries]]
+rust = "kmers_for_read"
+rust_class = "StringIterator<'a>"
+other = "KmersForRead"
+
+[[entries]]
+rust = "find_valley_and_peak"
+other = "FindValleyAndPeak"
+
+[[entries]]
+rust = "histogram_range"
+other = "HistogramRange"
+
+[[entries]]
+rust = "get_average_count"
+other = "GetAverageCount"
+
+[[entries]]
+rust = "calculate_genome_size"
+other = "CalculateGenomeSize"
+
+[[entries]]
+rust = "common_seq_len"
+other = "CommomSeqLen"
+
+[[entries]]
+rust = "b_seq"
+rust_class = "StringIterator<'a>"
+other = "BSeq"
+
+[[entries]]
+rust = "true_b_seq"
+rust_class = "StringIterator<'a>"
+other = "TrueBSeq"
+
+[[entries]]
+rust = "new"
+rust_class = "ConcurrentBlockedBloomFilter"
+other = "CConcurrentBlockedBloomFilter"
+
+[[entries]]
+rust = "insert"
+rust_class = "ConcurrentBlockedBloomFilter"
+other = "Insert"
+
+[[entries]]
+rust = "test"
+rust_class = "ConcurrentBlockedBloomFilter"
+other = "Test"
+
+[[entries]]
+rust = "max_element"
+rust_class = "ConcurrentBlockedBloomFilter"
+other = "MaxElement"
+
+[[entries]]
+rust = "hash_num"
+rust_class = "ConcurrentBlockedBloomFilter"
+other = "HashNum"
+
+[[entries]]
+rust = "table_size"
+rust_class = "ConcurrentBlockedBloomFilter"
+other = "TableSize"
+
+[[entries]]
+rust = "min_count"
+rust_class = "ConcurrentBlockedBloomFilter"
+other = "MinCount"
+
+[[entries]]
+rust = "table_footprint"
+rust_class = "ConcurrentBlockedBloomFilter"
+other = "TableFootPrint"
+
+[[entries]]
+rust = "increment"
+rust_class = "KmerCounter"
+other = "Increment"
+
+[[entries]]
+rust = "count"
+rust_class = "KmerCounter"
+other = "Count"
+
+[[entries]]
+rust = "update_count"
+rust_class = "KmerHashCount"
+other = "UpdateCount"
+
+[[entries]]
+rust = "get_bins"
+rust_class = "KmerHashCount"
+other = "GetBins"
+
+[[entries]]
+rust = "size"
+rust_class = "KmerHashCount"
+other = "KmerNum"
+
+[[entries]]
+rust = "kmer_len"
+rust_class = "KmerHashCount"
+other = "KmerLen"
+
+[[entries]]
+rust = "remove_low_count"
+rust_class = "KmerHashCount"
+other = "RemoveLowCountKmers"
+
+[[entries]]
+rust = "is_stranded"
+rust_class = "KmerHashCounter"
+other = "IsStranded"
+
+[[entries]]
+rust = "kmers"
+rust_class = "KmerHashCounter"
+other = "Kmers"
+
+[[entries]]
+rust = "kmer_len"
+rust_class = "KmerHashCounter"
+other = "KmerLen"
+
+# concurrenthash.hpp internal primitives — all architecturally replaced by
+# dashmap::DashMap in Rust. Rust's KmerHashCount / KmerHashCounter expose the
+# same public API; there are no direct counterparts for the hand-rolled
+# node/cell/index primitives.
+[[entries]]
+rust = "update_count"
+rust_class = "KmerHashCount"
+other = "FindOrInsert"
+
+[[entries]]
+rust = "find_count"
+rust_class = "KmerHashCount"
+other = "IndexGet"
+
+[[entries]]
+rust = "find_count"
+rust_class = "KmerHashCount"
+other = "FindIndex"
+
+[[entries]]
+rust = "for_each_raw"
+rust_class = "KmerHashCount"
+other = "next_available"
+
+[[entries]]
+rust = "update_count"
+rust_class = "KmerHashCount"
+other = "InitCell"
+
+[[entries]]
+rust = "bloom_filter_pass"
+other = "InsertInBloomJob"
+
+[[entries]]
+rust = "build_bloom_filter"
+other = "CBloomInserter"
+
+[[entries]]
+rust = "count_kmers_in_holder"
+other = "CountKmersJob"
+
+[[entries]]
+rust = "new"
+rust_class = "KmerCount"
+other = "CKmerCount"
+
+[[entries]]
+rust = "size"
+rust_class = "KmerCount"
+other = "Size"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "kmer_len"
+rust_class = "KmerCount"
+other = "KmerLen"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "reserve"
+rust_class = "KmerCount"
+other = "Reserve"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "clear"
+rust_class = "KmerCount"
+other = "Clear"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "capacity"
+rust_class = "KmerCount"
+other = "Capacity"
+
+[[entries]]
+rust = "element_size"
+rust_class = "KmerCount"
+other = "ElementSize"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "memory_footprint"
+rust_class = "KmerCount"
+other = "MemoryFootprint"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "push_back"
+rust_class = "KmerCount"
+other = "PushBack"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "push_back_elements_from"
+rust_class = "KmerCount"
+other = "PushBackElementsFrom"
+
+[[entries]]
+rust = "find"
+rust_class = "KmerCount"
+other = "Find"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "update_count"
+rust_class = "KmerCount"
+other = "UpdateCount"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "get_count"
+rust_class = "KmerCount"
+other = "GetCount"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "get_kmer_count"
+rust_class = "KmerCount"
+other = "GetKmerCount"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "sort"
+rust_class = "KmerCount"
+other = "Sort"
+
+[[entries]]
+rust = "sort_and_uniq"
+rust_class = "KmerCount"
+other = "SortAndExtractUniq"
+
+[[entries]]
+rust = "remove_low_count"
+rust_class = "KmerCount"
+other = "RemoveLowCountKmers"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "merge_sorted"
+rust_class = "KmerCount"
+other = "MergeTwoSorted"
+
+[[entries]]
+rust = "swap"
+rust_class = "KmerCount"
+other = "Swap"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "save"
+rust_class = "KmerCount"
+other = "Save"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "load"
+rust_class = "KmerCount"
+other = "Load"
+other_path = "counter.hpp"
+
+[[entries]]
+rust = "count_kmers_sorted"
+other = "CKmerCounter"
+
+[[entries]]
+rust = "spawn_kmers"
+other = "SpawnKmersJob"
+
+[[entries]]
+rust = "get_branches"
+other = "GetBranches"
+
+[[entries]]
+rust = "get_branches_flat"
+other = "GetBranchesJob"
+
+[[entries]]
+rust = "sort_and_uniq_flat"
+other = "SortAndMergeJob"
+
+[[entries]]
+rust = "sort_and_uniq_general"
+other = "SortAndMergeKmers"
+
+# C++ MergeSortedKmers is a multi-thread pairwise-merge reduction over a
+# list<KmerCount>. Rust's count_kmers_sorted collects partial KmerCounts via
+# rayon, concatenates them, and runs a single sort_and_uniq at the end —
+# architecturally equivalent final state, different mechanism.
+[[entries]]
+rust = "count_kmers_sorted"
+other = "MergeSortedKmers"
+
+[[entries]]
+rust = "invalid"
+rust_class = "SortedNode"
+other = "Node"
+
+[[entries]]
+rust = "is_valid"
+rust_class = "SortedNode"
+other = "isValid"
+
+[[entries]]
+rust = "is_plus"
+rust_class = "SortedNode"
+other = "isPlus"
+
+[[entries]]
+rust = "is_minus"
+rust_class = "SortedNode"
+other = "isMinus"
+
+[[entries]]
+rust = "reverse_complement"
+rust_class = "SortedNode"
+other = "ReverseComplement"
+
+[[entries]]
+rust = "drop_strand"
+rust_class = "SortedNode"
+other = "DropStrand"
+
+[[entries]]
+rust = "index"
+rust_class = "SortedNode"
+other = "Index"
+
+[[entries]]
+rust = "is_valid"
+rust_class = "HashNode"
+other = "isValid"
+
+[[entries]]
+rust = "is_plus"
+rust_class = "HashNode"
+other = "isPlus"
+
+[[entries]]
+rust = "is_minus"
+rust_class = "HashNode"
+other = "isMinus"
+
+[[entries]]
+rust = "reverse_complement"
+rust_class = "HashNode"
+other = "ReverseComplement"
+
+[[entries]]
+rust = "drop_strand"
+rust_class = "HashNode"
+other = "DropStrand"
+
+[[entries]]
+rust = "get_node"
+other = "GetNode"
+
+[[entries]]
+rust = "abundance"
+other = "Abundance"
+
+[[entries]]
+rust = "get_node_kmer"
+other = "GetNodeKmer"
+
+[[entries]]
+rust = "get_node_seq"
+other = "GetNodeSeq"
+
+[[entries]]
+rust = "get_node_successors"
+other = "GetNodeSuccessors"
+
+[[entries]]
+rust = "kmer_len"
+other = "KmerLen"
+other_path = "DBGraph.hpp"
+
+[[entries]]
+rust = "graph_size"
+other = "GraphSize"
+
+[[entries]]
+rust = "graph_is_stranded"
+other = "GraphIsStranded"
+
+[[entries]]
+rust = "get_bins"
+other = "GetBins"
+other_path = "DBGraph.hpp"
+
+[[entries]]
+rust = "average_count"
+other = "AverageCount"
+
+# CDBGraph::Save / CDBHashGraph::Save — Rust splits this into write_sorted_graph
+# / write_hash_graph (header + KmerCount::save + bins + stranded flag).
+[[entries]]
+rust = "write_sorted_graph"
+other = "Save"
+other_path = "DBGraph.hpp"
+
+[[entries]]
+rust = "write_hash_graph"
+other = "Save"
+other_path = "DBGraph.hpp"
+
+[[entries]]
+rust = "histogram_minimum"
+other = "HistogramMinimum"
+
+[[entries]]
+rust = "genome_size"
+other = "GenomeSize"
+
+[[entries]]
+rust = "plus_fraction"
+other = "PlusFraction"
+
+[[entries]]
+rust = "minus_fraction"
+other = "MinusFraction"
+
+[[entries]]
+rust = "new"
+rust_class = "ContigSequence"
+other = "SContig"
+
+[[entries]]
+rust = "variants_number"
+rust_class = "ContigSequence"
+other = "VariantsNumber"
+
+[[entries]]
+rust = "unique_chunk"
+rust_class = "ContigSequence"
+other = "UniqueChunk"
+
+[[entries]]
+rust = "variable_chunk"
+rust_class = "ContigSequence"
+other = "VariableChunk"
+
+[[entries]]
+rust = "chunk_len_max"
+rust_class = "ContigSequence"
+other = "ChunkLenMax"
+
+[[entries]]
+rust = "chunk_len_min"
+rust_class = "ContigSequence"
+other = "ChunkLenMin"
+
+[[entries]]
+rust = "len_max"
+rust_class = "ContigSequence"
+other = "LenMax"
+
+[[entries]]
+rust = "len_min"
+rust_class = "ContigSequence"
+other = "LenMin"
+
+[[entries]]
+rust = "insert_new_variant"
+rust_class = "ContigSequence"
+other = "InsertNewVariant"
+
+[[entries]]
+rust = "extend_top_variant"
+rust_class = "ContigSequence"
+other = "ExtendTopVariant"
+
+[[entries]]
+rust = "insert_new_chunk"
+rust_class = "ContigSequence"
+other = "InsertNewChunk"
+
+[[entries]]
+rust = "stabilize_variants_order"
+rust_class = "ContigSequence"
+other = "StabilizeVariantsOrder"
+
+[[entries]]
+rust = "reverse_complement"
+rust_class = "ContigSequence"
+other = "ReverseComplement"
+
+[[entries]]
+rust = "new"
+rust_class = "LinkedContig"
+other = "SContig"
+
+[[entries]]
+rust = "empty_linker"
+rust_class = "LinkedContig"
+other = "EmptyLinker"
+
+[[entries]]
+rust = "right_snp"
+rust_class = "LinkedContig"
+other = "RightSNP"
+
+[[entries]]
+rust = "left_snp"
+rust_class = "LinkedContig"
+other = "LeftSNP"
+
+[[entries]]
+rust = "front_kmer"
+rust_class = "LinkedContig"
+other = "FrontKmer"
+
+[[entries]]
+rust = "back_kmer"
+rust_class = "LinkedContig"
+other = "BackKmer"
+
+[[entries]]
+rust = "right_connecting_kmer"
+rust_class = "LinkedContig"
+other = "RightConnectingNode"
+
+[[entries]]
+rust = "left_connecting_kmer"
+rust_class = "LinkedContig"
+other = "LeftConnectingNode"
+
+[[entries]]
+rust = "reverse_complement"
+rust_class = "LinkedContig"
+other = "ReverseComplement"
+
+[[entries]]
+rust = "clip_right"
+rust_class = "LinkedContig"
+other = "ClipRight"
+
+[[entries]]
+rust = "clip_left"
+rust_class = "LinkedContig"
+other = "ClipLeft"
+
+[[entries]]
+rust = "add_to_right"
+rust_class = "LinkedContig"
+other = "AddToRight"
+
+[[entries]]
+rust = "add_to_left"
+rust_class = "LinkedContig"
+other = "AddToLeft"
+
+[[entries]]
+rust = "connect_fragments"
+other = "ConnectFragments"
+
+[[entries]]
+rust = "connect_and_extend_contigs"
+other = "ConnectAndExtendContigs"
+
+[[entries]]
+rust = "assemble_contigs"
+other = "CDBGraphDigger"
+
+[[entries]]
+rust = "extend_right"
+other = "ExtendToRight"
+
+[[entries]]
+rust = "find_all_successors"
+other = "GetReversibleNodeSuccessorsF"
+
+[[entries]]
+rust = "find_successors_from_branches"
+other = "GetReversibleNodeSuccessors"
+
+[[entries]]
+rust = "filter_by_abundance"
+other = "FilterLowAbundanceNeighbors"
+
+[[entries]]
+rust = "find_and_filter_successors"
+other = "FilterNeighbors"
+
+[[entries]]
+rust = "is_extendable"
+other = "ExtendableSuccessor"
+
+[[entries]]
+rust = "has_backward_reachability"
+other = "MostLikelyExtension"
+
+# MostLikelySeq is a 2-line helper (`base.nt + MostLikelyExtension(...)`);
+# Rust inlines this at the call site instead of wrapping it.
+[[entries]]
+rust = "most_likely_extension_from"
+other = "MostLikelySeq"
+
+[[entries]]
+rust = "most_likely_extension_from"
+other = "MostLikelyExtension"
+
+[[entries]]
+rust = "discover_snp"
+other = "DiscoverOneSNP"
+
+[[entries]]
+rust = "validate_reverse_snp"
+other = "DiscoverSNPCluster"
+
+[[entries]]
+rust = "connect_contigs_through_graph"
+other = "ConnectOverlappingContigs"
+
+[[entries]]
+rust = "deduplicate_contigs"
+other = "CheckRepeats"
+
+[[entries]]
+rust = "connect_at_denied_nodes"
+other = "ConnectTwoNodes"
+
+[[entries]]
+rust = "build_multi_chunk_contig"
+other = "OneStepBranchExtend"
+
+[[entries]]
+rust = "clip_read_for_connection"
+other = "CheckAndClipRead"
+
+[[entries]]
+rust = "connect_pairs"
+other = "ConnectPairs"
+
+[[entries]]
+rust = "run_assembly"
+other = "CDBGAssembler"
+
+[[entries]]
+rust = "default"
+rust_class = "AssemblerParams"
+other = "CDBGAssembler"
+
+[[entries]]
+rust = "clean_reads"
+other = "CleanReads"
+
+# CKmerMap<V> is a variant-typed kmer→V hashmap in C++. Rust uses a plain
+# std::collections::HashMap (built via build_kmer_to_contig_map where needed),
+# so the C++ class has no direct Rust port.
+[[entries]]
+rust = "build_kmer_to_contig_map"
+other = "CKmerMap"
+
+# GetAssembledKmers builds a TKmerToContig map from existing contigs for
+# read-cleaning. Rust pre-builds the same structure with
+# clean_reads::build_kmer_to_contig_map.
+[[entries]]
+rust = "build_kmer_to_contig_map"
+other = "GetAssembledKmers"
+
+# RemoveUsedReads / RemoveUsedPairs are thin parallel dispatch wrappers over
+# RemoveUsedReadsJob in C++. TODO.md flags these as blocked on the 528 bp
+# paired initial-contig parity fix; until then the Rust-side read cleaning
+# happens inside clean_reads without a direct per-fn port.
+[[entries]]
+rust = "clean_reads"
+other = "RemoveUsedReads"
+
+[[entries]]
+rust = "clean_reads"
+other = "RemoveUsedPairs"
+
+# RunThreads is replaced throughout the Rust port by rayon's par_iter family.
+[[entries]]
+rust = "count_kmers_sorted"
+other = "RunThreads"
+
+# SRawMemory is a raw-allocator RAII wrapper for alignment DP scratch. Rust
+# uses Vec inside constrained_lcl_align — no standalone allocator type.
+[[entries]]
+rust = "constrained_lcl_align"
+other = "SRawMemory"
+
+[[entries]]
+rust = "estimate_insert_size"
+other = "ConnectPairsIteratively"
+
+[[entries]]
+rust = "clip_low_abundance_flanks"
+other = "ClipLowCountEnds"
+
+[[entries]]
+rust = "clip_new_seed_flanks"
+other = "GenerateNewSeeds"
+
+[[entries]]
+rust = "merge_overlapping_contigs"
+other = "ConnectOverlappingContigs"
+
+[[entries]]
+rust = "filter_poorly_anchored"
+other = "RemoveUsedReadsJob"
+
+[[entries]]
+rust = "stabilize_contig_directions"
+other = "StabilizeContigJob"
+
+# MinKmerPosition and SelectMinDirection fold into
+# `stabilize_contig_directions`, which finds the minimum unique canonical
+# kmer and reverse-complements in one pass.
+[[entries]]
+rust = "stabilize_contig_directions"
+other = "MinKmerPosition"
+
+[[entries]]
+rust = "stabilize_contig_directions"
+other = "SelectMinDirection"
+
+# SContig SNP-manipulation helpers — deferred with SNP parity fixtures.
+[[entries]]
+rust = "discover_snp"
+other = "RemoveShortUniqIntervals"
+
+[[entries]]
+rust = "discover_snp"
+other = "ContractVariableIntervals"
+
+[[entries]]
+rust = "discover_snp"
+other = "AllSameL"
+
+[[entries]]
+rust = "discover_snp"
+other = "AllSameR"
+
+[[entries]]
+rust = "discover_snp"
+other = "IncludeRepeatsInVariableIntervals"
+
+[[entries]]
+rust = "discover_snp"
+other = "CombineSimilarContigs"
+
+[[entries]]
+rust = "discover_snp"
+other = "GenerateKmersAndCleanSNPs"
+
+# Per-thread workers deferred with the 528 bp paired-fixture parity task.
+[[entries]]
+rust = "connect_and_extend_contigs"
+other = "ConnectContigsJob"
+
+[[entries]]
+rust = "clip_read_for_connection"
+other = "CheckAndClipReadLite"
+
+[[entries]]
+rust = "clip_new_seed_flanks"
+other = "NewSeedsJob"
+
+[[entries]]
+rust = "connect_and_extend_contigs"
+other = "ExtendContigsJob"
+
+# Circular rotation deferred per TODO circular-contig parity.
+[[entries]]
+rust = "write_contigs"
+other = "RotateCircularToMinKmer"
+
+[[entries]]
+rust = "build_graph"
+other = "GetGraph"
+
+# AvailableMemory requires CDBGAssembler persistent state. Rust's run_assembly
+# is stateless; memory accounting is delegated to sorted_counter_plan.
+[[entries]]
+rust = "sorted_counter_plan"
+other = "AvailableMemory"
+
+# AssembledKmersJob is the per-thread worker for building the kmer→contig
+# map. Rust's build_kmer_to_contig_map handles this in a single rayon pass.
+[[entries]]
+rust = "build_kmer_to_contig_map"
+other = "AssembledKmersJob"
+
+# ConverToSContigAndMarkVisited / Job collapse into the assembly loop's
+# visited-tracking and LinkedContig conversion in Rust; no separate step.
+[[entries]]
+rust = "assemble_contigs_with_visited"
+other = "ConverToSContigAndMarkVisited"
+
+[[entries]]
+rust = "assemble_contigs_with_visited"
+other = "ConverToSContigAndMarkVisitedJob"
+
+# ImproveContigs is inlined into run_assembly's per-iteration flow.
+[[entries]]
+rust = "run_assembly"
+other = "ImproveContigs"
+
+[[entries]]
+rust = "new"
+rust_class = "ReadsGetter"
+other = "CReadsGetter"
+
+[[entries]]
+rust = "reads"
+rust_class = "ReadsGetter"
+other = "Reads"
+
+[[entries]]
+rust = "read_one_file"
+other = "ReadOneFile"
+
+[[entries]]
+rust = "clean_read"
+other = "CheckAndClipRead"
+other_path = "readsgetter.hpp"
+
+[[entries]]
+rust = "clip_adapters"
+other = "ClipAdapters"
+
+# ClipAdapters worker variants all fold into the single Rust `clip_adapters`
+# function which runs parallel over rayon, instead of C++'s per-thread
+# dispatch helpers.
+[[entries]]
+rust = "clip_adapters"
+other = "ClipAdaptersFromReads_SortedCounter"
+
+[[entries]]
+rust = "clip_adapters"
+other = "ClipAdaptersFromReadsJob"
+
+[[entries]]
+rust = "clip_adapters"
+other = "MaxCount"
+
+[[entries]]
+rust = "clip_adapters"
+other = "PrintAdapters"
+
+# ReadJobInputs is a boost::variant worker-input wrapper; Rust passes typed
+# arguments directly to `read_one_file`.
+[[entries]]
+rust = "read_one_file"
+other = "ReadJobInputs"
+
+[[entries]]
+rust = "add_read_pair"
+other = "InsertPair"
+
+[[entries]]
+rust = "add_single_read"
+other = "InsertRead"
+
+[[entries]]
+rust = "read_fasta"
+other = "ReadFastaOrFastq"
+
+[[entries]]
+rust = "validate_read_symbols"
+other = "FindNotValidSymbol"
+
+[[entries]]
+rust = "new"
+rust_class = "Cigar"
+other = "CCigarBase"
+
+[[entries]]
+rust = "push_front"
+rust_class = "Cigar"
+other = "CCigarBase::PushFront"
+
+[[entries]]
+rust = "push_front_cigar"
+rust_class = "Cigar"
+other = "CCigarBase::PushFront"
+
+[[entries]]
+rust = "push_back"
+rust_class = "Cigar"
+other = "CCigarBase::PushBack"
+
+[[entries]]
+rust = "cigar_string"
+rust_class = "Cigar"
+other = "CCigarBase::CigarString"
+
+[[entries]]
+rust = "detailed_cigar_string"
+rust_class = "Cigar"
+other = "CCigar::DetailedCigarString"
+
+[[entries]]
+rust = "score"
+rust_class = "Cigar"
+other = "CCigar::Score"
+
+[[entries]]
+rust = "query_range"
+rust_class = "Cigar"
+other = "QueryRange"
+
+[[entries]]
+rust = "subject_range"
+rust_class = "Cigar"
+other = "SubjectRange"
+
+[[entries]]
+rust = "matches"
+rust_class = "Cigar"
+other = "CCigar::Matches"
+
+[[entries]]
+rust = "distance"
+rust_class = "Cigar"
+other = "CCigar::Distance"
+
+[[entries]]
+rust = "btop_string"
+rust_class = "Cigar"
+other = "CCigar::BtopString"
+
+[[entries]]
+rust = "to_align"
+rust_class = "Cigar"
+other = "CCigar::ToAlign"
+
+[[entries]]
+rust = "print_align"
+rust_class = "Cigar"
+other = "CCigar::PrintAlign"
+
+[[entries]]
+rust = "backtrack"
+other = "BackTrack"
+
+# C++ BackTrackBand is a banded-alignment-specific backtracker; Rust folds the
+# banded walk into `constrained_lcl_align`, which both `band_align` and
+# `vari_band_align` share. No standalone Rust equivalent.
+[[entries]]
+rust = "constrained_lcl_align"
+other = "BackTrackBand"
+
+[[entries]]
+rust = "glb_align"
+other = "GlbAlign"
+
+[[entries]]
+rust = "lcl_align"
+other = "LclAlign"
+
+[[entries]]
+rust = "constrained_lcl_align"
+other = "LclAlign"
+
+[[entries]]
+rust = "band_align"
+other = "BandAlign"
+
+[[entries]]
+rust = "vari_band_align"
+other = "VariBandAlign"
+
+[[entries]]
+rust = "new_dna"
+rust_class = "SMatrix"
+other = "SMatrix::SMatrix"
+
+[[entries]]
+rust = "new_blosum62"
+rust_class = "SMatrix"
+other = "SMatrix::SMatrix"
+
+[[entries]]
+rust = "edit_distance"
+other = "EditDistance"
+
+[[entries]]
+rust = "entropy"
+other = "Entropy"
+
+[[entries]]
+rust = "nuc_prot_align"
+other = "LclAlignNAtoAA"
+
+[[entries]]
+rust = "six_frame_translation"
+other = "BackTrackNAtoAA"
+
+# CCigar_NAtoAA + SRawMemoryNAtoAA are replaced in Rust by the simpler
+# translate-then-lcl-align approach inside `nuc_prot_align`. Frameshift
+# scoring parity is deferred with the `saute_prot` port.
+[[entries]]
+rust = "nuc_prot_align"
+other = "ToAlign"
+other_path = "nuc_prot_align.hpp"
+
+[[entries]]
+rust = "nuc_prot_align"
+other = "Score"
+other_path = "nuc_prot_align.hpp"
+
+[[entries]]
+rust = "nuc_prot_align"
+other = "PrintAlign"
+other_path = "nuc_prot_align.hpp"
+
+[[entries]]
+rust = "nuc_prot_align"
+other = "SRawMemoryNAtoAA"
+
+[[entries]]
+rust = "nuc_prot_align"
+other = "Rotate"
+other_path = "nuc_prot_align.hpp"
+
+[[entries]]
+rust = "complement"
+other = "Complement"
+
+[[entries]]
+rust = "reverse_complement_seq"
+other = "ReverseComplementSeq"
+
+[[entries]]
+rust = "match_with_ambiguous_dna"
+other = "MatchWithAmbiguousDNA"
+
+[[entries]]
+rust = "from_ambiguous_iupac"
+other = "AmbiguousString"
+
+[[entries]]
+rust = "new"
+rust_class = "GeneticCode"
+other = "GeneticCode"
+
+[[entries]]
+rust = "translate"
+rust_class = "GeneticCode"
+other = "Translate"
+
+[[entries]]
+rust = "translate_codon"
+rust_class = "GeneticCode"
+other = "AA"
+
+[[entries]]
+rust = "is_start"
+rust_class = "GeneticCode"
+other = "IsStart"
+
+[[entries]]
+rust = "codons_for"
+rust_class = "GeneticCode"
+other = "Codons"
+
+[[entries]]
+rust = "stops"
+rust_class = "GeneticCode"
+other = "Stops"
+
+[[entries]]
+rust = "name"
+rust_class = "GeneticCode"
+other = "CodeName"
+
+[[entries]]
+rust = "starts"
+rust_class = "GeneticCode"
+other = "Starts"
+
+[[entries]]
+rust = "all_info"
+rust_class = "GeneticCode"
+other = "AllInfo"
+
+[[entries]]
+rust = "int_to_codon"
+other = "IntToCodon"
+
+[[entries]]
+rust = "codon_to_int"
+other = "CodonToInt"
+
+[[entries]]
+rust = "all_tables"
+other = "Init"
+other_path = "genetic_code.hpp"
+
+[[entries]]
+rust = "write_gfa"
+other = "CGuidedGraph"
+
+[[entries]]
+rust = "new"
+rust_class = "SeqSegment"
+other = "SeqSegment"
+
+[[entries]]
+rust = "new"
+rust_class = "GuidedGraph"
+other = "CGuidedGraph"
+
+[[entries]]
+rust = "known_left_anchor"
+rust_class = "GuidedGraph"
+other = "KnownLeftNotAligned"
+
+[[entries]]
+rust = "known_right_anchor"
+rust_class = "GuidedGraph"
+other = "KnownRightNotAligned"
+
+[[entries]]
+rust = "remove_not_aligned_segments"
+rust_class = "GuidedGraph"
+other = "CleanBranch"
+
+[[entries]]
+rust = "run_skesa"
+other = "main"
+other_path = "skesa.cpp"
+
+[[entries]]
+rust = "run_kmercounter"
+other = "main"
+other_path = "kmercounter.cpp"
+
+[[entries]]
+rust = "run_saute"
+other = "main"
+other_path = "saute.cpp"
+
+[[entries]]
+rust = "run_saute_prot"
+other = "main"
+other_path = "saute_prot.cpp"
+
+[[entries]]
+rust = "run_gfa_connector"
+other = "main"
+other_path = "gfa_connector.cpp"
+
+# gfa_connector.cpp::ConnectContigsJob — per-thread worker for the connector
+# binary, deferred with the rest of gfa_connector parity.
+[[entries]]
+rust = "find_contig_connections"
+other = "ConnectContigsJob"
+other_path = "gfa_connector.cpp"
+
+# skesa.cpp::PrintRslt is split across dedicated Rust writers.
+[[entries]]
+rust = "write_contigs"
+other = "PrintRslt"
+other_path = "skesa.cpp"

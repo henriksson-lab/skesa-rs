@@ -662,7 +662,7 @@ mod tests {
         let rg = ReadsGetter::new(&[fasta.to_str().unwrap().to_string()], false).unwrap();
         let reads = rg.reads().to_vec();
 
-        let mut kmers = sorted_counter::count_kmers_sorted(&reads, 21, 2, true, 32);
+        let mut kmers = sorted_counter::count_kmers_sorted(&reads, 21, 2, 32);
         sorted_counter::get_branches(&mut kmers, 21);
 
         // Use first read as "target" — get it via string iterator on the unpaired holder
@@ -686,7 +686,7 @@ mod tests {
         let rg = ReadsGetter::new(&[fasta.to_str().unwrap().to_string()], false).unwrap();
         let reads = rg.reads().to_vec();
 
-        let mut kmers = sorted_counter::count_kmers_sorted(&reads, 21, 2, true, 32);
+        let mut kmers = sorted_counter::count_kmers_sorted(&reads, 21, 2, 32);
         sorted_counter::get_branches(&mut kmers, 21);
         kmers.build_hash_index();
 

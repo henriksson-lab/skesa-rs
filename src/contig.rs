@@ -40,6 +40,12 @@ pub struct ContigSequence {
     pub left_endpoint: Option<Vec<u64>>,
     /// Canonical k-mer key of the denied node at the right end
     pub right_endpoint: Option<Vec<u64>>,
+    /// Seed-only oriented denied node key for the left end, matching C++
+    /// `m_next_left` semantics used by `ConnectFragments`.
+    pub left_endpoint_oriented: Option<Vec<u64>>,
+    /// Seed-only oriented denied node key for the right end, matching C++
+    /// `m_next_right` semantics used by `ConnectFragments`.
+    pub right_endpoint_oriented: Option<Vec<u64>>,
     /// Number of newly assembled bases on the left end that could be clipped.
     /// Mirrors C++ `SContig::m_left_extend` (graphdigger.hpp:54). Initialised
     /// to the contig length on creation; ConnectAndExtendContigs / iteration
@@ -58,6 +64,8 @@ impl ContigSequence {
             circular: false,
             left_endpoint: None,
             right_endpoint: None,
+            left_endpoint_oriented: None,
+            right_endpoint_oriented: None,
             left_extend: 0,
             right_extend: 0,
         }

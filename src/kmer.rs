@@ -206,6 +206,15 @@ macro_rules! define_kmer_enum {
                 }
             }
 
+            /// Borrow the kmer's internal word array. Avoids the alloc
+            /// `to_words` performs — useful for hot paths that just need
+            /// the bytes for a HashMap lookup or hash.
+            pub fn as_words(&self) -> &[u64] {
+                match self {
+                    $(Kmer::$variant(v) => &v.value,)+
+                }
+            }
+
             /// Copy words from a slice into this kmer (safe)
             pub fn copy_words_from(&mut self, src: &[u64]) {
                 match self {

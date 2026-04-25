@@ -917,7 +917,6 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
             reads_ref,
             args.kmer as usize,
             args.min_count as usize,
-            true,
             32,
         );
         skesa_rs::sorted_counter::get_branches(&mut sorted_kmers, args.kmer as usize);
@@ -951,6 +950,11 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
 }
 
 fn main() {
+    // Honor SKESA_RS_RLIMIT_GB before any allocation-heavy work, so a tight
+    // cap fires early during dev/testing instead of after we've already
+    // grabbed memory.
+    skesa_rs::rlimit::apply_from_env();
+
     let cli = Cli::parse();
 
     // Set rayon thread pool based on --cores if available

@@ -652,7 +652,7 @@ AACTT
         let rg = ReadsGetter::new(&[fasta.to_str().unwrap().to_string()], false).unwrap();
         let reads = rg.reads().to_vec();
 
-        let kmers = sorted_counter::count_kmers_sorted(&reads, 21, 2, true, 32);
+        let kmers = sorted_counter::count_kmers_sorted(&reads, 21, 2, 32);
 
         // Pick a sequence that exists in the data
         let (first_kmer, _first_count) = kmers.get_kmer_count(0);

@@ -10,6 +10,7 @@
 /// - Visited state management
 use crate::histogram::Bins;
 use crate::kmer::Kmer;
+use crate::model::BIN2NT;
 
 /// Node in the sorted-counter de Bruijn graph (CDBGraph).
 /// Even numbers = plus strand, odd = minus strand, 0 = invalid.
@@ -167,9 +168,140 @@ pub trait DBGraph {
     }
 }
 
+pub struct SortedDbGraph<'a> {
+    kmers: &'a crate::counter::KmerCount,
+    bins: &'a Bins,
+    is_stranded: bool,
+    average_count: f64,
+    max_kmer: Kmer,
+}
+
+impl<'a> SortedDbGraph<'a> {
+    pub fn new(
+        kmers: &'a crate::counter::KmerCount,
+        bins: &'a Bins,
+        is_stranded: bool,
+        average_count: f64,
+    ) -> Self {
+        let kmer_len = kmers.kmer_len();
+        Self {
+            kmers,
+            bins,
+            is_stranded,
+            average_count,
+            max_kmer: Kmer::from_chars(kmer_len, std::iter::repeat_n('G', kmer_len)),
+        }
+    }
+}
+
+impl DBGraph for SortedDbGraph<'_> {
+    type Node = SortedNode;
+
+    fn get_node(&self, kmer: &Kmer) -> Self::Node {
+        let rkmer = kmer.revcomp(self.kmers.kmer_len());
+        if *kmer < rkmer {
+            let idx = self.kmers.find(kmer);
+            if idx == self.kmers.size() {
+                SortedNode::invalid()
+            } else {
+                SortedNode(2 * (idx + 1))
+            }
+        } else {
+            let idx = self.kmers.find(&rkmer);
+            if idx == self.kmers.size() {
+                SortedNode::invalid()
+            } else {
+                SortedNode(2 * (idx + 1) + 1)
+            }
+        }
+    }
+
+    fn abundance(&self, node: &Self::Node) -> i32 {
+        if !node.is_valid() {
+            0
+        } else {
+            (self.kmers.get_count(node.index()) & 0xFFFF_FFFF) as i32
+        }
+    }
+
+    fn get_node_kmer(&self, node: &Self::Node) -> Kmer {
+        let (kmer, _) = self.kmers.get_kmer_count(node.index());
+        if node.is_plus() {
+            kmer
+        } else {
+            kmer.revcomp(self.kmers.kmer_len())
+        }
+    }
+
+    fn get_node_seq(&self, node: &Self::Node) -> String {
+        self.get_node_kmer(node).to_kmer_string(self.kmers.kmer_len())
+    }
+
+    fn get_node_successors(&self, node: &Self::Node) -> Vec<Successor<Self::Node>> {
+        if !node.is_valid() {
+            return Vec::new();
+        }
+        let branch_bits = ((self.kmers.get_count(node.index()) >> 32) & 0xFF) as u8;
+        let bits = if node.is_minus() {
+            branch_bits >> 4
+        } else {
+            branch_bits & 0x0F
+        };
+        let shifted = (self.get_node_kmer(node).shl(2)) & self.max_kmer;
+        let mut successors = Vec::new();
+        for nt in 0..4u64 {
+            if bits & (1 << nt) == 0 {
+                continue;
+            }
+            let next_kmer = shifted + nt;
+            let next_node = self.get_node(&next_kmer);
+            if next_node.is_valid() {
+                successors.push(Successor {
+                    node: next_node,
+                    nt: BIN2NT[nt as usize],
+                });
+            }
+        }
+        successors
+    }
+
+    fn kmer_len(&self) -> usize {
+        self.kmers.kmer_len()
+    }
+
+    fn graph_size(&self) -> usize {
+        self.kmers.size()
+    }
+
+    fn graph_is_stranded(&self) -> bool {
+        self.is_stranded
+    }
+
+    fn get_bins(&self) -> &Bins {
+        self.bins
+    }
+
+    fn average_count(&self) -> f64 {
+        self.average_count
+    }
+
+    fn plus_fraction(&self, node: &Self::Node) -> f64 {
+        if !self.is_stranded || !node.is_valid() {
+            return 0.5;
+        }
+        let mut plusf =
+            ((self.kmers.get_count(node.index()) >> 48) as u16) as f64 / u16::MAX as f64;
+        if node.is_minus() {
+            plusf = 1.0 - plusf;
+        }
+        plusf
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::counter::KmerCount;
 
     #[test]
     fn test_sorted_node() {
@@ -206,5 +338,22 @@ mod tests {
 
         let rc2 = rc.reverse_complement();
         assert_eq!(rc2, n);
+    }
+
+    #[test]
+    fn test_sorted_db_graph_get_node_and_successors() {
+        let mut kmers = KmerCount::new(3);
+        kmers.push_back(&Kmer::from_kmer_str("AAA"), 0b0001_0010u64 << 32 | 5);
+        kmers.push_back(&Kmer::from_kmer_str("AAC"), 3);
+        kmers.sort();
+        kmers.build_hash_index();
+        let bins = vec![(1, 1usize)];
+        let graph = SortedDbGraph::new(&kmers, &bins, true, 1.0);
+
+        let node = graph.get_node(&Kmer::from_kmer_str("AAA"));
+        assert!(node.is_valid());
+        assert_eq!(graph.abundance(&node), 5);
+        let succs = graph.get_node_successors(&node);
+        assert!(!succs.is_empty());
     }
 }

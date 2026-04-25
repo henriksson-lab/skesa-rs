@@ -74,12 +74,18 @@ pub fn sorted_counter_plan(
 ///
 /// Returns a KmerCount with all unique k-mers above min_count,
 /// sorted by canonical k-mer value.
+///
+/// Mirrors C++ `CKmerCounter` (counter.hpp:289-347): when memory is tight, the
+/// raw k-mer set is partitioned into `cycles * jobs` hash buckets and each
+/// cycle processes only `jobs` of them, capping per-cycle memory at
+/// `mem_needed / cycles`. Each bucket is sort/uniq'd independently with
+/// min_count filtering, and the final per-bucket vectors are merged into one
+/// globally sorted KmerCount.
 pub fn count_kmers_sorted(
     reads: &[ReadPair],
     kmer_len: usize,
     min_count: usize,
-    _is_stranded: bool,
-    _mem_available_gb: usize,
+    mem_available_gb: usize,
 ) -> KmerCount {
     eprintln!("\nKmer len: {}", kmer_len);
 
@@ -87,7 +93,7 @@ pub fn count_kmers_sorted(
     for read_pair in reads {
         raw_kmer_num += read_pair[0].kmer_num(kmer_len) + read_pair[1].kmer_num(kmer_len);
     }
-    let plan = sorted_counter_plan(raw_kmer_num, reads.len(), kmer_len, _mem_available_gb)
+    let plan = sorted_counter_plan(raw_kmer_num, reads.len(), kmer_len, mem_available_gb)
         .unwrap_or_else(|e| panic!("{e}"));
     eprintln!(
         "Raw kmers: {} Memory needed (GB): {} Memory available (GB): {} {} cycle(s) will be performed",
@@ -97,10 +103,24 @@ pub fn count_kmers_sorted(
         plan.cycles
     );
 
-    // Parallel k-mer extraction: each read pair produces its own KmerCount,
-    // then we merge them. This parallelizes the extraction across read files.
+    // Single-pass path: when memory is plentiful (cycles <= 1) keep the
+    // simpler high-throughput path. The chunked path adds bucket-routing
+    // overhead per kmer so we only use it when necessary to fit memory.
+    if plan.cycles <= 1 {
+        return count_single_pass(reads, kmer_len, min_count, raw_kmer_num);
+    }
+
+    count_chunked(reads, kmer_len, min_count, &plan)
+}
+
+/// Single-pass counting (former default path). Used when memory is plentiful.
+fn count_single_pass(
+    reads: &[ReadPair],
+    kmer_len: usize,
+    min_count: usize,
+    raw_kmer_num: usize,
+) -> KmerCount {
     if reads.len() > 1 && kmer_len <= 32 {
-        // Parallel path: extract from each ReadPair independently
         let partial_counts: Vec<KmerCount> = reads
             .par_iter()
             .map(|read_pair| {
@@ -123,7 +143,6 @@ pub fn count_kmers_sorted(
         eprintln!("Distinct kmers: {}", all_kmers.size());
         all_kmers
     } else {
-        // Sequential path
         let mut all_kmers = KmerCount::new(kmer_len);
         all_kmers.reserve(raw_kmer_num);
         for read_pair in reads {
@@ -137,6 +156,98 @@ pub fn count_kmers_sorted(
     }
 }
 
+/// Multi-cycle bucket counting. Mirrors C++ `CKmerCounter::CKmerCounter` loop
+/// at counter.hpp:316-335. Per cycle we route k-mers into `jobs` hash buckets,
+/// sort/uniq each bucket, and append to a global list. After all cycles the
+/// per-bucket sorted vectors are merged into one globally sorted KmerCount.
+fn count_chunked(
+    reads: &[ReadPair],
+    kmer_len: usize,
+    min_count: usize,
+    plan: &SortedCounterPlan,
+) -> KmerCount {
+    let cycles = plan.cycles;
+    let njobs = plan.jobs;
+    let total_buckets = plan.kmer_buckets;
+    let mut all_sorted_buckets: Vec<KmerCount> = Vec::with_capacity(cycles * njobs);
+
+    for cycl in 0..cycles {
+        let bucket_start = cycl * njobs;
+        let bucket_end = (bucket_start + njobs).min(total_buckets);
+        let active = bucket_end - bucket_start;
+        if active == 0 {
+            continue;
+        }
+
+        // Per ReadPair, route k-mers in this cycle's bucket range into `active`
+        // sub-counters (one per bucket). Different ReadPairs run in parallel.
+        let raw: Vec<Vec<KmerCount>> = reads
+            .par_iter()
+            .map(|read_pair| {
+                let total = read_pair[0].kmer_num(kmer_len) + read_pair[1].kmer_num(kmer_len);
+                // Reserve 1.1× the expected per-bucket share to avoid most reallocs.
+                let reserve_per_bucket =
+                    ((1.1 * total as f64) / total_buckets as f64).ceil() as usize + 1;
+                let mut buckets: Vec<KmerCount> = (0..active)
+                    .map(|_| {
+                        let mut kc = KmerCount::new(kmer_len);
+                        kc.reserve(reserve_per_bucket);
+                        kc
+                    })
+                    .collect();
+                for holder_idx in 0..2 {
+                    spawn_kmers_into_buckets(
+                        &read_pair[holder_idx],
+                        kmer_len,
+                        total_buckets,
+                        bucket_start,
+                        &mut buckets,
+                    );
+                }
+                buckets
+            })
+            .collect();
+
+        // For each bucket index in this cycle's range, merge the per-ReadPair
+        // contributions, sort, and uniq. Buckets in this cycle process in
+        // parallel — they're independent.
+        let cycle_uniq: Vec<KmerCount> = (0..active)
+            .into_par_iter()
+            .map(|bucket_offset| {
+                let mut merged = KmerCount::new(kmer_len);
+                let total: usize = raw.iter().map(|p| p[bucket_offset].size()).sum();
+                merged.reserve(total);
+                for partial in &raw {
+                    merged.push_back_elements_from(&partial[bucket_offset]);
+                }
+                merged.sort_and_uniq(min_count as u32);
+                merged
+            })
+            .collect();
+
+        // raw drops here, freeing the cycle's raw-kmer memory before the next
+        // cycle allocates its own batch.
+        drop(raw);
+
+        all_sorted_buckets.extend(cycle_uniq);
+    }
+
+    let total_unique: usize = all_sorted_buckets.iter().map(|b| b.size()).sum();
+    eprintln!("Distinct kmers: {}", total_unique);
+
+    // Final merge: kmers from different hash buckets are disjoint, so we can
+    // concatenate (in any order) and sort. Peak memory ≈ total_unique + sort
+    // scratch — same order as a hierarchical pairwise merge.
+    let mut final_count = KmerCount::new(kmer_len);
+    final_count.reserve(total_unique);
+    for bucket in all_sorted_buckets.drain(..) {
+        final_count.push_back_elements_from(&bucket);
+        // bucket drops here, freeing its memory before the next iteration.
+    }
+    final_count.sort();
+    final_count
+}
+
 /// Extract k-mers from a ReadHolder into the counter.
 /// Only the canonical k-mer (min of kmer and revcomp) is stored.
 /// Count encoding: lower 32 bits = 1, upper 32 bits = 1 if plus strand (kmer < revcomp).
@@ -146,6 +257,61 @@ fn spawn_kmers(holder: &ReadHolder, kmer_len: usize, output: &mut KmerCount) {
         spawn_kmers_fast_p1(holder, kmer_len, output);
     } else {
         spawn_kmers_generic(holder, kmer_len, output);
+    }
+}
+
+/// Bucket-routed k-mer extraction. For each k-mer, computes
+/// `oahash() % total_buckets`; if the bucket falls in
+/// `[bucket_start, bucket_start + buckets.len())` the k-mer is pushed into
+/// `buckets[bucket - bucket_start]`. K-mers outside the active range are
+/// dropped (they belong to a different cycle).
+///
+/// Mirrors C++ `CKmerCounter::SpawnKmersJob` (counter.hpp:402-435).
+fn spawn_kmers_into_buckets(
+    holder: &ReadHolder,
+    kmer_len: usize,
+    total_buckets: usize,
+    bucket_start: usize,
+    buckets: &mut [KmerCount],
+) {
+    let active = buckets.len();
+    let mut ki = holder.kmer_iter(kmer_len);
+    if kmer_len <= 32 {
+        while !ki.at_end() {
+            let kmer = ki.get();
+            let val = kmer.get_val();
+            let large = LargeInt::<1>::new(val);
+            let rc_val = large.revcomp(kmer_len).get_val();
+
+            let (canonical_val, count, hash) = if val < rc_val {
+                (val, 1u64 + (1u64 << 32), large.oahash())
+            } else {
+                (rc_val, 1u64, LargeInt::<1>::new(rc_val).oahash())
+            };
+
+            let bucket = (hash as usize) % total_buckets;
+            if bucket >= bucket_start && bucket < bucket_start + active {
+                buckets[bucket - bucket_start].push_flat(canonical_val, count);
+            }
+            ki.advance();
+        }
+    } else {
+        while !ki.at_end() {
+            let kmer = ki.get();
+            let rkmer = kmer.revcomp(kmer_len);
+
+            let (canonical, count) = if kmer < rkmer {
+                (kmer, 1u64 + (1u64 << 32))
+            } else {
+                (rkmer, 1u64)
+            };
+
+            let bucket = (canonical.oahash() as usize) % total_buckets;
+            if bucket >= bucket_start && bucket < bucket_start + active {
+                buckets[bucket - bucket_start].push_back(&canonical, count);
+            }
+            ki.advance();
+        }
     }
 }
 
@@ -440,7 +606,7 @@ mod tests {
     #[test]
     fn test_sorted_counter_basic() {
         let reads = make_test_reads();
-        let kmers = count_kmers_sorted(&reads, 21, 2, true, 32);
+        let kmers = count_kmers_sorted(&reads, 21, 2, 32);
         // Should produce a similar number of k-mers to the hash counter
         assert!(
             kmers.size() > 3000 && kmers.size() < 5000,
@@ -450,11 +616,43 @@ mod tests {
     }
 
     #[test]
+    fn test_chunked_counter_matches_single_pass() {
+        // Force cycles > 1 by handing count_chunked a manual plan with the
+        // smallest non-trivial bucket layout. This exercises the bucket-routing
+        // and final-merge paths that single_pass tests skip.
+        let reads = make_test_reads();
+        let single = count_kmers_sorted(&reads, 21, 2, 32);
+
+        let mut raw_kmer_num: usize = 0;
+        for read_pair in &reads {
+            raw_kmer_num += read_pair[0].kmer_num(21) + read_pair[1].kmer_num(21);
+        }
+        let plan = SortedCounterPlan {
+            raw_kmer_num,
+            element_size: KmerCount::new(21).element_size(),
+            memory_needed_bytes: 0,
+            memory_available_after_buffer_bytes: 0,
+            cycles: 3,
+            jobs: 4,
+            kmer_buckets: 12,
+        };
+        let chunked = count_chunked(&reads, 21, 2, &plan);
+
+        assert_eq!(single.size(), chunked.size());
+        for i in 0..single.size() {
+            let (a_kmer, a_count) = single.get_kmer_count(i);
+            let (b_kmer, b_count) = chunked.get_kmer_count(i);
+            assert_eq!(a_kmer, b_kmer, "kmer at index {i} differs");
+            assert_eq!(a_count, b_count, "count at index {i} differs");
+        }
+    }
+
+    #[test]
     fn test_sorted_counter_matches_hash_counter() {
         let reads = make_test_reads();
 
         // Sorted counter
-        let sorted = count_kmers_sorted(&reads, 21, 2, true, 32);
+        let sorted = count_kmers_sorted(&reads, 21, 2, 32);
 
         // Hash counter
         let hash = crate::kmer_counter::count_kmers(&reads, 21, 2, 100_000_000, true, false);
@@ -485,7 +683,7 @@ mod tests {
     #[test]
     fn test_sorted_histogram_matches_golden() {
         let reads = make_test_reads();
-        let kmers = count_kmers_sorted(&reads, 21, 2, true, 32);
+        let kmers = count_kmers_sorted(&reads, 21, 2, 32);
         let bins = get_bins(&kmers);
 
         let mut output = Vec::new();
@@ -505,7 +703,7 @@ mod tests {
     #[test]
     fn test_get_branches() {
         let reads = make_test_reads();
-        let mut kmers = count_kmers_sorted(&reads, 21, 2, true, 32);
+        let mut kmers = count_kmers_sorted(&reads, 21, 2, 32);
         get_branches(&mut kmers, 21);
 
         // After branching, counts should have branch info in bits 32-39

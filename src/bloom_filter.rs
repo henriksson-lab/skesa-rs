@@ -97,7 +97,10 @@ impl ConcurrentBlockedBloomFilter {
 
         let mut min_count = self.max_element;
 
-        for _ in 0..self.hash_num {
+        // Mirror C++ `for(int h = 1; h < m_hash_num; ++h)` at
+        // concurrenthash.hpp:77: probe `hash_num - 1` positions, not
+        // `hash_num`. The first hash position is implicitly the block index.
+        for _ in 1..self.hash_num {
             hashp = hashp.wrapping_add(hashm);
             let position =
                 ((hashp as usize) & (self.elements_in_block - 1)) * self.counter_bit_size;
@@ -142,7 +145,8 @@ impl ConcurrentBlockedBloomFilter {
 
         let mut min_count = self.max_element;
 
-        for _ in 0..self.hash_num {
+        // Same off-by-one as in `insert` — probe `hash_num - 1` positions.
+        for _ in 1..self.hash_num {
             hashp = hashp.wrapping_add(hashm);
             let position =
                 ((hashp as usize) & (self.elements_in_block - 1)) * self.counter_bit_size;

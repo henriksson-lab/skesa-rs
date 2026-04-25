@@ -929,9 +929,10 @@ other = "ConnectOverlappingContigs"
 rust = "deduplicate_contigs"
 other = "CheckRepeats"
 
-[[entries]]
-rust = "connect_at_denied_nodes"
-other = "ConnectTwoNodes"
+# `connect_at_denied_nodes` (graph_digger.rs:2514) is a Rust-only factor-out
+# of part of C++'s ConnectFragments / ConnectAndExtendContigs chain (see
+# TODO.md "three contig-merge passes"). No 1:1 C++ counterpart — leave
+# unmapped until those C++ functions land in Rust as named ports.
 
 [[entries]]
 rust = "build_multi_chunk_contig"
@@ -940,10 +941,37 @@ other = "OneStepBranchExtend"
 [[entries]]
 rust = "clip_read_for_connection"
 other = "CheckAndClipRead"
+other_path = "graphdigger.hpp"
 
 [[entries]]
 rust = "connect_pairs"
 other = "ConnectPairs"
+
+# Per-pair worker — Rust runs serially where C++ dispatches via RunThreads.
+[[entries]]
+rust = "connect_pairs_impl"
+other = "ConnectPairsJob"
+
+# BFS pair connector mirroring graphdigger.hpp:2055 (with check_extension=false
+# filtering, matching every C++ caller in the paired-reads path).
+[[entries]]
+rust = "connect_two_nodes_cpp"
+other = "ConnectTwoNodes"
+
+# Subset of FilterNeighbors corresponding to the check_extension=false code
+# path used by the paired-reads filters; the not-extendable-fork branch
+# (gated on check_extension=true) is not ported here because no paired-reads
+# call site uses it.
+[[entries]]
+rust = "filter_successors_connect_two_nodes"
+other = "FilterNeighbors"
+
+# Basic abundance filter — mirrors the abundance-only first stage of
+# FilterLowAbundanceNeighbors. The GGT sub-filter inside the C++ function
+# is folded into filter_successors_connect_two_nodes above.
+[[entries]]
+rust = "filter_successors"
+other = "FilterLowAbundanceNeighbors"
 
 [[entries]]
 rust = "run_assembly"
@@ -995,9 +1023,11 @@ other = "RunThreads"
 rust = "constrained_lcl_align"
 other = "SRawMemory"
 
-[[entries]]
-rust = "estimate_insert_size"
-other = "ConnectPairsIteratively"
+# `estimate_insert_size{,_with_low_count,_full}` (paired_reads.rs:711-739)
+# corresponds to the inline insert-size block in C++ Assemble (assembler.hpp:199-256).
+# No standalone C++ function name to map against. The long-iteration loop at
+# `assembler.rs:497-525` is the actual Rust counterpart of `ConnectPairsIteratively`
+# (assembler.hpp:328) — Rust performs it inline rather than as a named function.
 
 [[entries]]
 rust = "clip_low_abundance_flanks"
@@ -1064,8 +1094,11 @@ other = "GenerateKmersAndCleanSNPs"
 rust = "connect_and_extend_contigs"
 other = "ConnectContigsJob"
 
+# CheckAndClipReadLite (graphdigger.hpp:3260) is a separate lighter-weight
+# variant of CheckAndClipRead with no forward/backward edge verification.
+# Ported as `check_and_clip_read_lite` in src/clean_reads.rs.
 [[entries]]
-rust = "clip_read_for_connection"
+rust = "check_and_clip_read_lite"
 other = "CheckAndClipReadLite"
 
 [[entries]]

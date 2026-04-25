@@ -2,6 +2,7 @@ use crate::contig::ContigSequence;
 use crate::counter::KmerCount;
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
+use crate::assembler::{build_same_k_node_state, NODE_STATE_MULTI_CONTIG};
 /// Read cleaning: remove reads that fully map inside assembled contigs.
 ///
 /// Port of SKESA's CleanReads / RemoveUsedReadsJob from assembler.hpp.
@@ -10,6 +11,7 @@ use crate::reads_getter::ReadPair;
 /// from the read set. This improves subsequent iteration quality by focusing
 /// on reads that extend beyond current contigs.
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 /// Information about where a k-mer appears in a contig
 struct KmerPosition {
@@ -33,10 +35,126 @@ pub struct PairConnectionCleanup {
     pub internal_reads: ReadHolder,
 }
 
+fn canonical_kmer_key(kmer: crate::kmer::Kmer, kmer_len: usize) -> Vec<u64> {
+    let precision = kmer_len.div_ceil(32);
+    let rkmer = kmer.revcomp(kmer_len);
+    let canonical = if kmer < rkmer { kmer } else { rkmer };
+    // `as_words()` borrows the kmer's internal array; one Vec alloc here
+    // instead of `to_words().to_vec()` which double-allocates.
+    canonical.as_words()[..precision].to_vec()
+}
+
+fn collect_sequence_kmers(seq: &[char], kmer_len: usize, out: &mut HashSet<Vec<u64>>) {
+    if seq.len() < kmer_len {
+        return;
+    }
+    let mut rh = ReadHolder::new(false);
+    let text: String = seq.iter().collect();
+    rh.push_back_str(&text);
+    let mut ki = rh.kmer_iter(kmer_len);
+    while !ki.at_end() {
+        out.insert(canonical_kmer_key(ki.get(), kmer_len));
+        ki.advance();
+    }
+}
+
+fn remove_short_uniq_intervals_for_seed_cleanup(contig: &mut ContigSequence, min_uniq_len: usize) {
+    if contig.len() < 5 {
+        if !(contig.circular
+            && contig.len() >= 5
+            && contig.chunk_len_max(0) + contig.chunk_len_max(contig.len() - 1) < min_uniq_len)
+        {
+            return;
+        }
+    }
+    let mut i = 2usize;
+    while i + 2 < contig.len() {
+        if contig.chunk_len_max(i) < min_uniq_len {
+            let mid = contig.chunk(i)[0].clone();
+            let left_vars = contig.chunk(i - 1).clone();
+            let right_vars = contig.chunk(i + 1).clone();
+            let mut new_chunk = Vec::new();
+            for var1 in &left_vars {
+                for var2 in &right_vars {
+                    let mut seq = var1.clone();
+                    seq.extend(mid.iter().copied());
+                    seq.extend(var2.iter().copied());
+                    new_chunk.push(seq);
+                }
+            }
+            contig.chunks.insert(i + 2, new_chunk);
+            contig.chunks.drain(i - 1..=i + 1);
+        } else {
+            i += 2;
+        }
+    }
+
+    if contig.circular
+        && contig.len() >= 5
+        && contig.chunk_len_max(0) + contig.chunk_len_max(contig.len() - 1) < min_uniq_len
+    {
+        let first = contig.chunk(0)[0].clone();
+        if let Some(last) = contig.chunks.last_mut().and_then(|chunk| chunk.first_mut()) {
+            last.extend(first.iter().copied());
+        }
+        contig.chunks.remove(0);
+        contig.chunks.rotate_left(1);
+        let seq0 = contig.chunk(0)[0].clone();
+        contig.insert_new_chunk();
+        contig.extend_top_variant(seq0[0]);
+        if let Some(first_chunk) = contig.chunks.first_mut().and_then(|chunk| chunk.first_mut()) {
+            first_chunk.remove(0);
+        }
+        remove_short_uniq_intervals_for_seed_cleanup(contig, min_uniq_len);
+    }
+}
+
+fn build_seed_kmer_set(contigs: &[ContigSequence], kmer_len: usize) -> HashSet<Vec<u64>> {
+    let mut seed_kmers = HashSet::new();
+    for mut seed in contigs.iter().cloned() {
+        if seed.len_min() < kmer_len {
+            continue;
+        }
+        remove_short_uniq_intervals_for_seed_cleanup(&mut seed, kmer_len);
+        if seed.len() == 1 {
+            collect_sequence_kmers(&seed.chunk(0)[0], kmer_len, &mut seed_kmers);
+            continue;
+        }
+
+        for i in (0..seed.len()).rev().step_by(2) {
+            if i == seed.len() - 1 {
+                if seed.chunk_len_max(i) >= kmer_len {
+                    collect_sequence_kmers(&seed.chunk(i)[0], kmer_len, &mut seed_kmers);
+                }
+            } else {
+                if seed.chunk_len_max(i) >= kmer_len {
+                    collect_sequence_kmers(&seed.chunk(i)[0], kmer_len, &mut seed_kmers);
+                }
+                for variant in seed.chunk(i + 1) {
+                    let left = seed.chunk_len_max(i).min(kmer_len.saturating_sub(1));
+                    let right = seed.chunk_len_max(i + 2).min(kmer_len.saturating_sub(1));
+                    let mut seq = Vec::new();
+                    if left > 0 {
+                        let chunk = &seed.chunk(i)[0];
+                        seq.extend_from_slice(&chunk[chunk.len() - left..]);
+                    }
+                    seq.extend_from_slice(variant);
+                    if right > 0 {
+                        seq.extend_from_slice(&seed.chunk(i + 2)[0][..right]);
+                    }
+                    collect_sequence_kmers(&seq, kmer_len, &mut seed_kmers);
+                }
+            }
+        }
+    }
+    seed_kmers
+}
+
 /// Build a k-mer → contig position map from assembled contigs.
 /// Each k-mer maps to its position in the first contig it appears in.
 fn build_kmer_to_contig_map(
     contigs: &[ContigSequence],
+    seed_contigs: &[ContigSequence],
     kmer_len: usize,
     min_contig_len: usize,
     unique_only: bool,
@@ -46,6 +164,7 @@ fn build_kmer_to_contig_map(
     let mut key_counts: HashMap<Vec<u64>, usize> = HashMap::new();
     let mut entries: Vec<(Vec<u64>, KmerPosition)> = Vec::new();
     let mut eligible_contigs = Vec::new();
+    let seed_kmers = build_seed_kmer_set(seed_contigs, kmer_len);
 
     for (contig_idx, contig) in contigs.iter().enumerate() {
         if contig.len() != 1 || contig.len_min() < min_contig_len {
@@ -54,45 +173,22 @@ fn build_kmer_to_contig_map(
         eligible_contigs.push(contig_idx);
     }
 
-    let mut mult_contig_nodes: HashMap<Vec<u64>, usize> = HashMap::new();
-    if let Some(graph_params) = graph {
-        for &contig_idx in &eligible_contigs {
-            let contig = &contigs[contig_idx];
-            let seq = contig.primary_sequence();
-            if seq.len() < kmer_len {
-                continue;
-            }
-            let mut seen = HashMap::new();
-            let mut rh = ReadHolder::new(false);
-            rh.push_back_str(&seq);
-            let mut ki = rh.kmer_iter(kmer_len);
-            while !ki.at_end() {
-                let kmer = ki.get();
-                let rkmer = kmer.revcomp(kmer_len);
-                let canonical = if kmer < rkmer { kmer } else { rkmer };
-                let idx = graph_params.kmers.find(&canonical);
-                if idx < graph_params.kmers.size() {
-                    let abundance = (graph_params.kmers.get_count(idx) & 0xFFFF_FFFF) as f64;
-                    if abundance * graph_params.fraction > graph_params.average_count {
-                        ki.advance();
-                        continue;
-                    }
-                    let key = canonical.to_words()[..precision].to_vec();
-                    seen.entry(key).or_insert(());
-                }
-                ki.advance();
-            }
-            for key in seen.into_keys() {
-                *mult_contig_nodes.entry(key).or_insert(0) += 1;
-            }
-        }
-    }
+    let graph_multicontig_state = graph.map(|graph_params| {
+        build_same_k_node_state(contigs, graph_params.kmers, kmer_len)
+    });
 
     for (contig_idx, contig) in contigs.iter().enumerate() {
         if !eligible_contigs.contains(&contig_idx) {
             continue;
         }
-        let seq = contig.primary_sequence();
+        let base_seq = contig.primary_sequence();
+        let seq = if contig.circular && base_seq.len() >= kmer_len {
+            let mut extended = base_seq.clone();
+            extended.push_str(&base_seq[..kmer_len - 1]);
+            extended
+        } else {
+            base_seq
+        };
         if seq.len() < kmer_len {
             continue;
         }
@@ -100,7 +196,11 @@ fn build_kmer_to_contig_map(
         let mut rh = ReadHolder::new(false);
         rh.push_back_str(&seq);
         let mut ki = rh.kmer_iter(kmer_len);
-        let mut pos = (seq.len() - kmer_len) as i32;
+        let mut pos = if contig.circular {
+            contig.chunk_len_max(0) as i32 - 1
+        } else {
+            (seq.len() - kmer_len) as i32
+        };
         let mut contig_entries: Vec<(Vec<u64>, KmerPosition)> = Vec::new();
         let mut found_repeat = false;
 
@@ -109,7 +209,7 @@ fn build_kmer_to_contig_map(
             let rkmer = kmer.revcomp(kmer_len);
             let is_direct = kmer <= rkmer;
             let canonical = if is_direct { kmer } else { rkmer };
-            let key = canonical.to_words()[..precision].to_vec();
+            let key = canonical.as_words()[..precision].to_vec();
 
             if let Some(graph_params) = graph {
                 let idx = graph_params.kmers.find(&canonical);
@@ -121,9 +221,11 @@ fn build_kmer_to_contig_map(
                         continue;
                     }
                 }
-                if mult_contig_nodes.get(&key).is_some_and(|count| *count > 1) {
-                    found_repeat = true;
-                    break;
+                if let Some(node_state) = &graph_multicontig_state {
+                    if idx < node_state.len() && node_state[idx] == NODE_STATE_MULTI_CONTIG {
+                        found_repeat = true;
+                        break;
+                    }
                 }
             }
 
@@ -142,6 +244,9 @@ fn build_kmer_to_contig_map(
 
         if !found_repeat {
             for (key, pos_info) in contig_entries {
+                if seed_kmers.contains(&key) {
+                    continue;
+                }
                 *key_counts.entry(key.clone()).or_insert(0) += 1;
                 entries.push((key, pos_info));
             }
@@ -175,16 +280,21 @@ fn find_read_position(
     rh.push_back_str(read_seq);
     let mut ki = rh.kmer_iter(kmer_len);
     let num_kmers = read_seq.len() - kmer_len + 1;
+    // Mirrors C++'s for-loop post-decrement at assembler.hpp:498-537: at the
+    // point pos is computed, knum equals num_kmers - N (N = iteration count).
     let mut knum = num_kmers as i32;
 
     while !ki.at_end() {
+        knum -= 1;
         let kmer = ki.get();
         let rkmer = kmer.revcomp(kmer_len);
         let is_direct = kmer <= rkmer;
         let canonical = if is_direct { kmer } else { rkmer };
-        let key = canonical.to_words()[..precision].to_vec();
+        // HashMap<Vec<u64>, _>::get accepts `&[u64]` via Borrow<[u64]>;
+        // skip the per-kmer Vec alloc that the build-side path needs.
+        let key = &canonical.as_words()[..precision];
 
-        if let Some(pos_info) = map.get(&key) {
+        if let Some(pos_info) = map.get(key) {
             if pos_info.position < 0 {
                 ki.advance();
                 continue;
@@ -215,10 +325,88 @@ fn find_read_position(
         }
 
         ki.advance();
-        knum -= 1;
     }
 
     None
+}
+
+/// Port of `CDBGraphDigger::CheckAndClipReadLite` (graphdigger.hpp:3260-3312).
+///
+/// Strips read parts not supported by the graph: marks every base position
+/// covered by *any* good kmer (valid + abundance ≥ low_count), then keeps
+/// the longest run of consecutive good positions. Returns `None` if no run
+/// of length ≥ kmer_len exists.
+///
+/// Lighter than [`super::clip_read_for_connection`] (the heavy
+/// `CheckAndClipRead`): no left/right `MostLikelyExtension` of the read,
+/// no forward/backward edge verification — just direct kmer-coverage
+/// marking.
+///
+/// The C++ form additionally returns a `uint8_t` color (OR of node colors
+/// in the retained range), used by GFA Connector's read-tagging. The Rust
+/// port doesn't track per-node colors yet, so this returns just the
+/// clipped read.
+pub fn check_and_clip_read_lite(
+    read: &str,
+    kmers: &KmerCount,
+    kmer_len: usize,
+    low_count: usize,
+) -> Option<String> {
+    if read.len() < kmer_len {
+        return None;
+    }
+
+    let num_kmers = read.len() - kmer_len + 1;
+    let mut good_node_at: Vec<bool> = Vec::with_capacity(num_kmers);
+    for ek in 0..num_kmers {
+        let kmer = crate::kmer::Kmer::from_kmer_str(&read[ek..ek + kmer_len]);
+        let rkmer = kmer.revcomp(kmer_len);
+        let canonical = if kmer < rkmer { kmer } else { rkmer };
+        let idx = kmers.find(&canonical);
+        let good = if idx >= kmers.size() {
+            false
+        } else {
+            let abundance = (kmers.get_count(idx) & 0xFFFF_FFFF) as u32;
+            abundance >= low_count as u32
+        };
+        good_node_at.push(good);
+    }
+
+    // Mark every base position spanned by any good kmer.
+    let mut bases = vec![false; read.len()];
+    for ek in 0..good_node_at.len() {
+        if good_node_at[ek] {
+            for p in ek..ek + kmer_len {
+                bases[p] = true;
+            }
+        }
+    }
+
+    // Longest run of consecutive good positions.
+    let mut left = 0usize;
+    let mut len = 0usize;
+    let mut k = 0usize;
+    while k < read.len() {
+        while k < read.len() && !bases[k] {
+            k += 1;
+        }
+        let current_left = k;
+        let mut current_len = 0usize;
+        while k < read.len() && bases[k] {
+            k += 1;
+            current_len += 1;
+        }
+        if current_len > len {
+            left = current_left;
+            len = current_len;
+        }
+    }
+
+    if len < kmer_len {
+        None
+    } else {
+        Some(read[left..left + len].to_string())
+    }
 }
 
 fn pair_span_is_deep(pos: i32, plus: i32, contig: &ContigSequence, margin: i32, span: i32) -> bool {
@@ -275,6 +463,7 @@ fn internal_pair_span(
 pub fn clean_reads(
     reads: &[ReadPair],
     contigs: &[ContigSequence],
+    seed_contigs: &[ContigSequence],
     kmer_len: usize,
     min_contig_len: usize,
     margin: usize,
@@ -285,7 +474,14 @@ pub fn clean_reads(
         return reads.to_vec();
     }
 
-    let map = build_kmer_to_contig_map(contigs, kmer_len, min_contig_len, false, graph);
+    let map = build_kmer_to_contig_map(
+        contigs,
+        seed_contigs,
+        kmer_len,
+        min_contig_len,
+        false,
+        graph,
+    );
     let contig_lens: Vec<usize> = contigs.iter().map(|c| c.len_max()).collect();
     let contig_left_reps: Vec<i32> = contigs.iter().map(|c| c.left_repeat).collect();
     let contig_right_reps: Vec<i32> = contigs.iter().map(|c| c.right_repeat).collect();
@@ -308,9 +504,11 @@ pub fn clean_reads(
                 let read2 = si.get();
                 si.advance();
 
+                // C++ pushes short-mate pairs into raw_reads[1] hoping they'd
+                // be reused as unpaired (assembler.hpp:564-566), but the
+                // unpaired loop's `if(rlen < kmer_len) continue;` immediately
+                // drops them on the way out. Effective behavior: dropped.
                 if read1.len() < kmer_len || read2.len() < kmer_len {
-                    cleaned_unpaired.push_back_str(&read1);
-                    cleaned_unpaired.push_back_str(&read2);
                     continue;
                 }
 
@@ -384,6 +582,7 @@ pub fn clean_reads(
 pub fn clean_pair_connection_reads(
     reads: &[ReadPair],
     contigs: &[ContigSequence],
+    seed_contigs: &[ContigSequence],
     kmer_len: usize,
     min_contig_len: usize,
     margin: usize,
@@ -399,7 +598,14 @@ pub fn clean_pair_connection_reads(
         return result;
     }
 
-    let map = build_kmer_to_contig_map(contigs, kmer_len, min_contig_len, false, graph);
+    let map = build_kmer_to_contig_map(
+        contigs,
+        seed_contigs,
+        kmer_len,
+        min_contig_len,
+        false,
+        graph,
+    );
     let m = margin as i32;
     let span = insert_size as i32;
 
@@ -434,20 +640,22 @@ pub fn clean_pair_connection_reads(
                             continue;
                         }
                         if ci1 == ci2 && plus1 != plus2 {
+                            // C++ assembler.hpp:599-617 uses pos1/pos2 directly
+                            // (no shift). An older version added ±1 shifts to
+                            // compensate for an off-by-one in find_read_position;
+                            // that is now fixed at the source.
                             let contig = &contigs[ci1];
                             let clen = contig.len_max() as i32;
                             let lr = contig.left_repeat;
                             let rr = contig.right_repeat;
-                            let span_p1 = if plus1 > 0 { p1 + 1 } else { p1 - 1 };
-                            let span_p2 = if plus2 > 0 { p2 + 1 } else { p2 - 1 };
                             let is_deep_inside =
-                                (plus1 > 0 && span_p1 >= m + lr && span_p2 < clen - m - rr)
-                                    || (plus1 < 0 && span_p2 >= m + lr && span_p1 < clen - m - rr);
+                                (plus1 > 0 && p1 >= m + lr && p2 < clen - m - rr)
+                                    || (plus1 < 0 && p2 >= m + lr && p1 < clen - m - rr);
                             if is_deep_inside {
                                 continue;
                             }
                             if let Some((a, b, seq)) =
-                                internal_pair_span(span_p1, plus1, span_p2, contig)
+                                internal_pair_span(p1, plus1, p2, contig)
                             {
                                 let _ = (a, b);
                                 result.internal_reads.push_back_str(&seq);
@@ -483,6 +691,7 @@ pub fn clean_pair_connection_reads(
 pub fn clean_internal_reads(
     reads: &ReadHolder,
     contigs: &[ContigSequence],
+    seed_contigs: &[ContigSequence],
     kmer_len: usize,
     min_contig_len: usize,
     margin: usize,
@@ -492,7 +701,14 @@ pub fn clean_internal_reads(
         return reads.clone();
     }
 
-    let map = build_kmer_to_contig_map(contigs, kmer_len, min_contig_len, false, graph);
+    let map = build_kmer_to_contig_map(
+        contigs,
+        seed_contigs,
+        kmer_len,
+        min_contig_len,
+        false,
+        graph,
+    );
     let mut cleaned = ReadHolder::new(false);
     let mut si = reads.string_iter();
     while !si.at_end() {
@@ -504,8 +720,7 @@ pub fn clean_internal_reads(
         let pos = find_read_position(&read, kmer_len, &map, contigs);
         let should_remove = match pos {
             Some((p, plus, ci)) => {
-                let span_p = if plus > 0 { p + 1 } else { p - 1 };
-                read_is_deep(span_p, plus, &contigs[ci], margin as i32, read.len() as i32)
+                read_is_deep(p, plus, &contigs[ci], margin as i32, read.len() as i32)
             }
             None => false,
         };
@@ -525,7 +740,7 @@ mod tests {
         let rh = ReadHolder::new(false);
         let reads = vec![[rh.clone(), ReadHolder::new(false)]];
         let contigs: Vec<ContigSequence> = Vec::new();
-        let cleaned = clean_reads(&reads, &contigs, 21, 0, 50, 0, None);
+        let cleaned = clean_reads(&reads, &contigs, &[], 21, 0, 50, 0, None);
         assert_eq!(cleaned.len(), 1);
     }
 
@@ -534,7 +749,188 @@ mod tests {
         let mut contig = ContigSequence::new();
         contig.insert_new_chunk_with("ACGTACGTACGTACGTACGTACGTAAAA".chars().collect());
         let contigs = vec![contig];
-        let map = build_kmer_to_contig_map(&contigs, 21, 0, false, None);
+        let map = build_kmer_to_contig_map(&contigs, &[], 21, 0, false, None);
         assert!(!map.is_empty(), "Map should have entries for contig k-mers");
+    }
+
+    #[test]
+    fn test_seed_kmers_are_excluded_from_cleanup_map() {
+        let mut seed = ContigSequence::new();
+        seed.insert_new_chunk_with("ACGTACGTACGTACGTACGTACGTAAAA".chars().collect());
+        let mut contig = ContigSequence::new();
+        contig.insert_new_chunk_with("ACGTACGTACGTACGTACGTACGTAAAA".chars().collect());
+        let map = build_kmer_to_contig_map(&[contig], &[seed], 21, 0, false, None);
+        assert!(map.is_empty(), "seed kmers should not be indexed for cleanup");
+    }
+
+    #[test]
+    fn test_build_seed_kmer_set_removes_short_uniq_intervals_first() {
+        let mut seed = ContigSequence::new();
+        seed.chunks = vec![
+            vec![vec!['A', 'A']],
+            vec![vec!['C'], vec!['G']],
+            vec![vec!['T']],
+            vec![vec!['A'], vec!['G']],
+            vec![vec!['C', 'C']],
+        ];
+
+        let seed_kmers = build_seed_kmer_set(&[seed], 3);
+        let merged = canonical_kmer_key(crate::kmer::Kmer::from_kmer_str("CTA"), 3);
+
+        assert!(seed_kmers.contains(&merged));
+    }
+
+    #[test]
+    fn test_build_seed_kmer_set_handles_circular_short_uniq_rotation() {
+        let mut seed = ContigSequence::new();
+        seed.chunks = vec![
+            vec![vec!['A']],
+            vec![vec!['C'], vec!['G']],
+            vec![vec!['T', 'T']],
+            vec![vec!['A'], vec!['G']],
+            vec![vec!['C']],
+        ];
+        seed.circular = true;
+
+        let seed_kmers = build_seed_kmer_set(&[seed], 3);
+        let wrapped = canonical_kmer_key(crate::kmer::Kmer::from_kmer_str("TAC"), 3);
+
+        assert!(seed_kmers.contains(&wrapped));
+    }
+
+    #[test]
+    fn test_build_kmer_map_circular_uses_wraparound_positioning() {
+        let mut contig = ContigSequence::new();
+        contig.insert_new_chunk_with("ACGTA".chars().collect());
+        contig.circular = true;
+
+        let map = build_kmer_to_contig_map(&[contig], &[], 3, 0, false, None);
+        let key = canonical_kmer_key(crate::kmer::Kmer::from_kmer_str("AAC"), 3);
+        let wrapped = map.get(&key).expect("wraparound kmer should be indexed");
+
+        assert_eq!(wrapped.position, 4);
+    }
+
+    #[test]
+    fn test_find_read_position_matches_cpp_knum_semantics() {
+        // Read "AAC" is exactly one kmer (rlen=3, kmer_len=3, num_kmers=1).
+        // C++ FindMatchForRead's for-loop post-decrements knum after the
+        // body where rsltp gets set, so by the time pos is computed,
+        // knum = 0 and pos = c - knum = 2 - 0 = 2 (assembler.hpp:498-537).
+        let mut contig = ContigSequence::new();
+        contig.insert_new_chunk_with("AACTT".chars().collect());
+        let contigs = vec![contig];
+        let mut map = HashMap::new();
+        let key = canonical_kmer_key(crate::kmer::Kmer::from_kmer_str("AAC"), 3);
+        map.insert(
+            key,
+            KmerPosition {
+                position: 2,
+                is_direct: true,
+                contig_idx: 0,
+            },
+        );
+
+        let pos = find_read_position("AAC", 3, &map, &contigs).expect("read should map");
+        // C++ for-loop post-decrement: after iter 1 sets rsltp, --knum runs
+        // → knum=0 → pos = 2 - 0 = 2. Verified against bundled C++ binary
+        // via SKESA_DEBUG_FIND_READ_POS instrumentation.
+        assert_eq!(pos.0, 2);
+        assert_eq!(pos.1, 1);
+        assert_eq!(pos.2, 0);
+    }
+
+    #[test]
+    fn test_build_kmer_map_uses_graph_multicontig_state_from_variant_contigs() {
+        let mut left = ReadHolder::new(false);
+        left.push_back_str("AAACCC");
+        left.push_back_str("AAAGCC");
+        let reads = vec![[left, ReadHolder::new(false)]];
+        let mut kmers = crate::sorted_counter::count_kmers_sorted(&reads, 3, 1, 32);
+        crate::sorted_counter::get_branches(&mut kmers, 3);
+        kmers.build_hash_index();
+        let graph = CleanupGraphParams {
+            kmers: &kmers,
+            fraction: 0.1,
+            average_count: 1000.0,
+        };
+
+        let mut single = ContigSequence::new();
+        single.insert_new_chunk_with("AAACCC".chars().collect());
+        let mut variant = ContigSequence::new();
+        variant.chunks = vec![
+            vec![vec!['A', 'A', 'A']],
+            vec![vec!['C'], vec!['G']],
+            vec![vec!['C', 'C']],
+        ];
+
+        let map = build_kmer_to_contig_map(&[single, variant], &[], 3, 0, false, Some(graph));
+        let shared = canonical_kmer_key(crate::kmer::Kmer::from_kmer_str("AAA"), 3);
+        assert!(
+            !map.contains_key(&shared),
+            "cleanup map should reject kmers that are mult-contig via graph state"
+        );
+    }
+
+    fn push_canonical_count_for_lite(kmers: &mut crate::counter::KmerCount, sequence: &str) {
+        let kmer = crate::kmer::Kmer::from_kmer_str(sequence);
+        let rkmer = kmer.revcomp(sequence.len());
+        let canonical = if kmer < rkmer { kmer } else { rkmer };
+        kmers.push_back(&canonical, 1);
+    }
+
+    #[test]
+    fn test_check_and_clip_read_lite_too_short() {
+        let kmers = crate::counter::KmerCount::new(5);
+        assert!(check_and_clip_read_lite("AC", &kmers, 5, 1).is_none());
+    }
+
+    #[test]
+    fn test_check_and_clip_read_lite_no_good_kmers() {
+        let kmers = crate::counter::KmerCount::new(3);
+        assert!(check_and_clip_read_lite("ACGTACGT", &kmers, 3, 1).is_none());
+    }
+
+    #[test]
+    fn test_check_and_clip_read_lite_keeps_longest_run() {
+        let mut kmers = crate::counter::KmerCount::new(3);
+        push_canonical_count_for_lite(&mut kmers, "ACG");
+        push_canonical_count_for_lite(&mut kmers, "CGT");
+        kmers.sort_and_uniq(0);
+        // ACG covers positions 0..3, CGT covers 1..4 → bases [0,1,2,3] good.
+        // Position 4 starts kmer "GTA" (not in graph) → bases[4..]=false.
+        let result = check_and_clip_read_lite("ACGTAA", &kmers, 3, 1);
+        assert_eq!(result.as_deref(), Some("ACGT"));
+    }
+
+    #[test]
+    fn test_check_and_clip_read_lite_picks_longer_of_two_runs() {
+        let mut kmers = crate::counter::KmerCount::new(3);
+        // Two disjoint good regions: GCT/CTA at the start, and AAC/ACG/CGT at end.
+        for k in ["GCT", "CTA", "AAC", "ACG", "CGT"] {
+            push_canonical_count_for_lite(&mut kmers, k);
+        }
+        kmers.sort_and_uniq(0);
+        // Read: "GCTANNAACGT" — positions 0..4 covered (run len 4),
+        // positions 6..11 covered (run len 5). Longer run wins.
+        let result = check_and_clip_read_lite("GCTANNAACGT", &kmers, 3, 1);
+        assert_eq!(result.as_deref(), Some("AACGT"));
+    }
+
+    #[test]
+    fn test_check_and_clip_read_lite_low_abundance_threshold() {
+        let mut kmers = crate::counter::KmerCount::new(3);
+        // AAA and CCC have distinct canonicals (CCC ≠ revcomp(AAA)).
+        // Push AAA once (low) and CCC three times (high). With low_count=2,
+        // only CCC is good.
+        push_canonical_count_for_lite(&mut kmers, "AAA");
+        for _ in 0..3 {
+            push_canonical_count_for_lite(&mut kmers, "CCC");
+        }
+        kmers.sort_and_uniq(0);
+        // Read AAAAACCCCC: AAA at ek=0..2 is below threshold; CCC at
+        // ek=5..7 is good and covers positions 5..10.
+        let result = check_and_clip_read_lite("AAAAACCCCC", &kmers, 3, 2);
+        assert_eq!(result.as_deref(), Some("CCCCC"));
     }
 }

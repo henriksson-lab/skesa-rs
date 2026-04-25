@@ -393,8 +393,13 @@ fn cpp_kmercounter_real_world_mgenitalium_hist_matches_rust() {
             "2",
             "--vector_percent",
             "1.0",
+            // The 5000-read MGenitalium subset has under 1M unique k-mers;
+            // pass 1 (= 1 million via the *MB CLI scale) so the bloom filter
+            // sizes in line with C++. Earlier 200000 (= 200 G estimated)
+            // produced a multi-hundred-GB bloom alloc — exactly the OOM that
+            // motivated the chunked counter and SKESA_RS_RLIMIT_GB safety net.
             "--estimated_kmers",
-            "200000",
+            "1",
             "--cores",
             "1",
             "--hist",
@@ -419,7 +424,7 @@ fn cpp_kmercounter_real_world_mgenitalium_hist_matches_rust() {
             "--vector_percent",
             "1.0",
             "--estimated_kmers",
-            "200000",
+            "1",
             "--cores",
             "1",
             "--hist",
@@ -440,6 +445,139 @@ fn cpp_kmercounter_real_world_mgenitalium_hist_matches_rust() {
     );
 
     let _ = std::fs::remove_file(&rust_hist);
+    let _ = std::fs::remove_file(&cpp_hist);
+}
+
+#[test]
+#[ignore = "requires downloaded external real-world fixture and bundled C++ SKESA/skesa binary"]
+fn cpp_skesa_real_world_readme_example_multi_iteration_matches_rust_subset() {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cpp = manifest.join("SKESA/skesa");
+    assert!(
+        cpp.exists(),
+        "missing bundled C++ skesa at {}",
+        cpp.display()
+    );
+
+    let (_fixture_dir, read1) =
+        external_fixture_file("srr1703350_skesa_readme_example", "subset_1.fastq");
+    let (_fixture_dir, read2) =
+        external_fixture_file("srr1703350_skesa_readme_example", "subset_2.fastq");
+    let rust_bin = cargo_bin();
+
+    let rust_contigs = unique_temp_path("rust_srr1703350_multi_iter_contigs", "fasta");
+    let rust_all = unique_temp_path("rust_srr1703350_multi_iter_all", "fasta");
+    let rust_hist = unique_temp_path("rust_srr1703350_multi_iter_hist", "txt");
+    let cpp_contigs = unique_temp_path("cpp_srr1703350_multi_iter_contigs", "fasta");
+    let cpp_all = unique_temp_path("cpp_srr1703350_multi_iter_all", "fasta");
+    let cpp_hist = unique_temp_path("cpp_srr1703350_multi_iter_hist", "txt");
+
+    let common_args = [
+        "--reads",
+        &format!("{read1},{read2}"),
+        "--kmer",
+        "21",
+        "--max-kmer",
+        "35",
+        "--steps",
+        "2",
+        "--min-count",
+        "2",
+        "--vector-percent",
+        "1.0",
+        "--estimated-kmers",
+        "100000",
+        "--cores",
+        "1",
+        "--min-contig",
+        "1",
+    ];
+
+    let rust_output = Command::new(&rust_bin)
+        .arg("skesa")
+        .args(common_args)
+        .args([
+            "--contigs-out",
+            rust_contigs.to_str().unwrap(),
+            "--all",
+            rust_all.to_str().unwrap(),
+            "--hist",
+            rust_hist.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run Rust skesa on README real-world subset");
+    assert!(
+        rust_output.status.success(),
+        "Rust skesa failed: {}",
+        String::from_utf8_lossy(&rust_output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&rust_output.stderr).contains("WARNING: iterations are disabled"),
+        "Rust run did not reach multi-iteration path: {}",
+        String::from_utf8_lossy(&rust_output.stderr)
+    );
+
+    let cpp_output = Command::new(&cpp)
+        .args([
+            "--reads",
+            &format!("{read1},{read2}"),
+            "--kmer",
+            "21",
+            "--max_kmer",
+            "35",
+            "--steps",
+            "2",
+            "--min_count",
+            "2",
+            "--vector_percent",
+            "1.0",
+            "--estimated_kmers",
+            "100000",
+            "--cores",
+            "1",
+            "--min_contig",
+            "1",
+            "--contigs_out",
+            cpp_contigs.to_str().unwrap(),
+            "--all",
+            cpp_all.to_str().unwrap(),
+            "--hist",
+            cpp_hist.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run bundled C++ skesa on README real-world subset");
+    assert!(
+        cpp_output.status.success(),
+        "C++ skesa failed: {}",
+        String::from_utf8_lossy(&cpp_output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&cpp_output.stderr).contains("WARNING: iterations are disabled"),
+        "C++ run did not reach multi-iteration path: {}",
+        String::from_utf8_lossy(&cpp_output.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&rust_contigs).expect("failed to read Rust contigs"),
+        std::fs::read_to_string(&cpp_contigs).expect("failed to read C++ contigs"),
+        "real-world README example contigs mismatch for SRR1703350 subset"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rust_all).expect("failed to read Rust all output"),
+        std::fs::read_to_string(&cpp_all).expect("failed to read C++ all output"),
+        "real-world README example --all mismatch for SRR1703350 subset"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&rust_hist).expect("failed to read Rust hist"),
+        std::fs::read_to_string(&cpp_hist).expect("failed to read C++ hist"),
+        "real-world README example histogram mismatch for SRR1703350 subset"
+    );
+
+    let _ = std::fs::remove_file(&rust_contigs);
+    let _ = std::fs::remove_file(&rust_all);
+    let _ = std::fs::remove_file(&rust_hist);
+    let _ = std::fs::remove_file(&cpp_contigs);
+    let _ = std::fs::remove_file(&cpp_all);
     let _ = std::fs::remove_file(&cpp_hist);
 }
 
@@ -3130,6 +3268,10 @@ fn skesa_indel_non_converged_fixture_matches_cpp_final_outputs() {
     let _ = std::fs::remove_file(&tmp_hist);
 }
 
+// adjacent_snp parity coverage now lives in
+// `skesa_snp_indel_fixture_outputs_match_cpp_goldens` below, which checks
+// contigs + histograms across all six SNP/indel fixtures.
+
 #[test]
 fn skesa_repeat_adjacent_snp_fixture_matches_cpp_final_outputs() {
     let bin = cargo_bin();
@@ -3190,7 +3332,7 @@ fn skesa_repeat_adjacent_snp_fixture_matches_cpp_final_outputs() {
 }
 
 #[test]
-fn skesa_snp_indel_fixture_histograms_match_cpp_goldens() {
+fn skesa_snp_indel_fixture_outputs_match_cpp_goldens() {
     let bin = cargo_bin();
     let data = test_data_dir();
     let fixtures = [
@@ -3204,8 +3346,9 @@ fn skesa_snp_indel_fixture_histograms_match_cpp_goldens() {
 
     for fixture in fixtures {
         let input = data.join(format!("{fixture}_reads.fasta"));
+        let expected_contigs = data.join(format!("expected_{fixture}_allow_snps_contigs.fasta"));
         let expected_hist = data.join(format!("expected_{fixture}_allow_snps_hist.txt"));
-        let tmp_contigs = unique_temp_path(&format!("rust_{fixture}_hist_contigs"), "fasta");
+        let tmp_contigs = unique_temp_path(&format!("rust_{fixture}_contigs"), "fasta");
         let tmp_hist = unique_temp_path(&format!("rust_{fixture}_hist"), "txt");
 
         let output = Command::new(&bin)
@@ -3242,6 +3385,11 @@ fn skesa_snp_indel_fixture_histograms_match_cpp_goldens() {
             output.status.success(),
             "skesa failed for {fixture}: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&tmp_contigs).expect("failed to read contigs"),
+            std::fs::read_to_string(&expected_contigs).expect("failed to read expected contigs"),
+            "contigs mismatch for {fixture}"
         );
         assert_eq!(
             std::fs::read_to_string(&tmp_hist).expect("failed to read hist"),

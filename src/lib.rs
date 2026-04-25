@@ -23,14 +23,13 @@
 //!
 //! // Count k-mers
 //! let mut kmers = sorted_counter::count_kmers_sorted(
-//!     rg.reads(), 21, 2, true, 32,
+//!     rg.reads(), 21, 2, 32,
 //! );
 //! sorted_counter::get_branches(&mut kmers, 21);
 //!
 //! // Assemble
-//! let bins = sorted_counter::get_bins(&kmers);
 //! let contigs = graph_digger::assemble_contigs(
-//!     &mut kmers, &bins, 21, true, &DiggerParams::default(),
+//!     &mut kmers, 21, &DiggerParams::default(),
 //! );
 //! ```
 
@@ -74,6 +73,7 @@ pub mod spider_graph;
 pub mod assembler;
 pub mod graph_digger;
 pub mod kmer_counter;
+pub mod rlimit;
 pub mod sorted_counter;
 
 // Panic-stub skeletons for C++ functions not yet ported.

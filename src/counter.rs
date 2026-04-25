@@ -17,10 +17,10 @@
 /// exceed `u32::MAX` per k-mer; spilling out of the low 32 bits would carry into
 /// the plus-strand/branching field just as it does in C++.
 use crate::kmer::Kmer;
+use crate::large_int::oahash64;
 
 use rayon::slice::ParallelSliceMut;
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{Read, Write};
 
 /// Internal storage — flat for precision=1, general for precision>1.
@@ -32,19 +32,19 @@ enum Storage {
 #[derive(Default)]
 struct U64Hasher(u64);
 
-impl Hasher for U64Hasher {
+impl std::hash::Hasher for U64Hasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         let mut value = 0u64;
         for (shift, byte) in bytes.iter().copied().enumerate().take(8) {
             value |= u64::from(byte) << (shift * 8);
         }
-        self.0 = value;
+        self.0 = oahash64(value);
     }
 
     #[inline]
     fn write_u64(&mut self, i: u64) {
-        self.0 = i;
+        self.0 = oahash64(i);
     }
 
     #[inline]
@@ -54,7 +54,7 @@ impl Hasher for U64Hasher {
 }
 
 enum HashIndex {
-    Flat(HashMap<u64, usize, BuildHasherDefault<U64Hasher>>),
+    Flat(HashMap<u64, usize, std::hash::BuildHasherDefault<U64Hasher>>),
     General(HashMap<u64, Vec<usize>>),
 }
 
@@ -156,8 +156,11 @@ impl KmerCount {
         match &mut self.storage {
             Storage::Flat(v) => v.push((kmer.get_val(), count)),
             Storage::General(v) => {
-                let words = kmer.to_words();
-                v.push((words[..self.precision].to_vec(), count));
+                // Borrow the kmer's internal words and copy only the
+                // `precision` prefix into the storage Vec — one alloc per
+                // push instead of two (was: to_words() then to_vec() of
+                // the slice).
+                v.push((kmer.as_words()[..self.precision].to_vec(), count));
             }
         }
         self.hash_index = None;
@@ -185,8 +188,8 @@ impl KmerCount {
     pub fn build_hash_index(&mut self) {
         match &self.storage {
             Storage::Flat(v) => {
-                let mut index: HashMap<u64, usize, BuildHasherDefault<U64Hasher>> =
-                    HashMap::with_capacity_and_hasher(v.len(), BuildHasherDefault::default());
+                let mut index: HashMap<u64, usize, std::hash::BuildHasherDefault<U64Hasher>> =
+                    HashMap::with_capacity_and_hasher(v.len(), std::hash::BuildHasherDefault::default());
                 for (i, (val, _)) in v.iter().enumerate() {
                     index.insert(*val, i);
                 }
@@ -244,6 +247,7 @@ impl KmerCount {
         }
     }
 
+
     /// Update count at index
     pub fn update_count(&mut self, count: u64, index: usize) {
         match &mut self.storage {
@@ -259,6 +263,7 @@ impl KmerCount {
             Storage::General(v) => v[index].1,
         }
     }
+
 
     /// Get kmer and count at index
     pub fn get_kmer_count(&self, index: usize) -> (Kmer, u64) {

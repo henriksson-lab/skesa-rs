@@ -720,12 +720,12 @@ pub mod graphdigger_hpp {
     // `most_likely_extension_from` (src/paired_reads.rs:150) prepend the base
     // nucleotide at the call site rather than wrap it in a helper.
 
-    // CheckAndClipReadLite (graphdigger.hpp:2988) is a lightweight variant
-    // of CheckAndClipRead used by the pair-connection iterative pass. Rust's
-    // `clip_read_for_connection` (src/paired_reads.rs:191) covers the
-    // core check-and-clip behavior; the "lite" variant's distinct semantics
-    // are part of the pending paired-fixture parity work.
-    //
+    // CheckAndClipReadLite (graphdigger.hpp:3260) ported as
+    // clean_reads::check_and_clip_read_lite. The C++ form additionally
+    // returns a uint8_t color (OR of node colors in the retained range)
+    // used by GFA Connector's read-tagging; the Rust port returns just
+    // the clipped read because per-node colors aren't tracked yet.
+
     // NewSeedsJob (graphdigger.hpp:3208) / ExtendContigsJob (graphdigger.hpp:3226)
     // are per-thread workers for GenerateNewSeeds and ConnectAndExtendContigs.
     // TODO.md's 528 bp paired-fixture gap flags both as part of the C++

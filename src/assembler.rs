@@ -13,7 +13,6 @@ use crate::linked_contig::LinkedContig;
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
 use crate::sorted_counter;
-use std::collections::HashSet;
 
 fn debug_connect_extend_enabled() -> bool {
     std::env::var_os("SKESA_DEBUG_CONNECT_EXTEND").is_some()
@@ -673,36 +672,12 @@ Connecting mate pairs using kmer length: {}",
     // `merge_overlapping_contigs` below already covers. The BFS variant
     // over-extends through graph paths C++ would not bridge.
 
-    // Final low-abundance flank clip — Rust-only pass.
-    //
-    // Investigation (this session): the seeded test depends on this pass
-    // clipping *exactly* 10 bases per side off a specific 74-bp Rust contig
-    // to bring it to the 54-bp shape C++ produces. The contig in question
-    // never enters `clip_connect_and_extend_flanks` (its chain_clipped flag
-    // stays false), so the chain-pass-vs-final-pass theory doesn't apply.
-    // C++ produces the 54-bp form via a different path entirely
-    // (likely intrusion handling in ExtendToRight that Rust doesn't fully
-    // mirror); the Rust contig comes out 20 bases longer.
-    //
-    // Threshold `> 6` (vs C++'s `> 5`) is an empirical clipping budget on
-    // this fixture: at `> 6` all 10 flank kmers (count ≤ 6) trigger clipping
-    // and the loop hits its 10-iteration cap, removing exactly 10 bases per
-    // side. At `> 5` the loop stops earlier. The "right" fix is in the
-    // upstream extension logic, not in this pass — see TODO.md "Multi-
-    // iteration assembly parity" / paired-extension over-extension notes.
-    let apply_final_low_abundance_clip =
-        !params.allow_snps && (iterations_enabled || !seeds.is_empty());
-    if apply_final_low_abundance_clip {
-        if let Some((_, ref graph)) = graphs.first() {
-            let protected_seeds: HashSet<String> = seeds.iter().cloned().collect();
-            clip_low_abundance_flanks(
-                &mut current_contigs,
-                graph,
-                params.min_kmer,
-                &protected_seeds,
-            );
-        }
-    }
+    // Final low-abundance flank clip removed: `graph_digger::clip_new_seed_flanks`
+    // now does the abundance loop *before* the kmer_len clip, mirroring C++
+    // ConnectContigsJob (graphdigger.hpp:1714-1736). Previous pipeline-tail
+    // pass with threshold `> 6` was an empirical clip-budget compensation
+    // for the wrong-order check; the structural fix in clip_new_seed_flanks
+    // makes it unnecessary.
     stabilize_contig_directions(&mut current_contigs, params.min_kmer);
 
     // Sort final contigs
@@ -2180,71 +2155,6 @@ fn clip_connect_and_extend_flanks(
     if contig.right_extend > 0 {
         contig.seq.right_repeat =
             (kmer_len as i32 - 1).min(contig.right_extend + contig.seq.right_repeat);
-    }
-}
-
-/// Final-pass low-abundance flank clip. Rust-only — see the call site for
-/// why this exists and why the threshold is `> 6` (empirical, not the C++
-/// value).
-fn clip_low_abundance_flanks(
-    contigs: &mut ContigSequenceList,
-    kmers: &KmerCount,
-    kmer_len: usize,
-    protected_seqs: &HashSet<String>,
-) {
-    for contig in contigs.iter_mut() {
-        let seq = contig.primary_sequence();
-        if protected_seqs.contains(&seq) {
-            continue;
-        }
-        if seq.len() < kmer_len * 2 {
-            continue;
-        }
-
-        let mut left_clip = 0;
-        for clip in 0..10.min(seq.len().saturating_sub(kmer_len)) {
-            if seq.len() - clip < kmer_len {
-                break;
-            }
-            let kmer_str = &seq[clip..clip + kmer_len];
-            let kmer = crate::kmer::Kmer::from_kmer_str(kmer_str);
-            let rkmer = kmer.revcomp(kmer_len);
-            let canonical = if kmer < rkmer { kmer } else { rkmer };
-            let idx = kmers.find(&canonical);
-            if idx < kmers.size() {
-                let count = (kmers.get_count(idx) & 0xFFFFFFFF) as u32;
-                if count > 6 {
-                    break;
-                }
-            }
-            left_clip = clip + 1;
-        }
-
-        let mut right_clip = 0;
-        for clip in 0..10.min(seq.len().saturating_sub(kmer_len)) {
-            let pos = seq.len() - kmer_len - clip;
-            if pos + kmer_len > seq.len() {
-                break;
-            }
-            let kmer_str = &seq[pos..pos + kmer_len];
-            let kmer = crate::kmer::Kmer::from_kmer_str(kmer_str);
-            let rkmer = kmer.revcomp(kmer_len);
-            let canonical = if kmer < rkmer { kmer } else { rkmer };
-            let idx = kmers.find(&canonical);
-            if idx < kmers.size() {
-                let count = (kmers.get_count(idx) & 0xFFFFFFFF) as u32;
-                if count > 6 {
-                    break;
-                }
-            }
-            right_clip = clip + 1;
-        }
-
-        if (left_clip > 0 || right_clip > 0) && left_clip + right_clip < seq.len() {
-            let new_seq: Vec<char> = seq[left_clip..seq.len() - right_clip].chars().collect();
-            *contig = ContigSequence::new();
-            contig.insert_new_chunk_with(new_seq);
-        }
     }
 }
 

@@ -663,28 +663,20 @@ fn kmercounter_text_sorted_matches_golden() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Compare sorted kmer+count (ignoring plus_count column which may differ in order)
+    // Compare sorted full text-output rows (kmer, total_count, plus_count).
+    // C++ writes hash-table iteration order so we sort both sides before
+    // diffing. All three columns must match — earlier comments here claimed
+    // plus_count "may differ", but empirically Rust and C++ agree on every
+    // column for this fixture.
     let actual = std::fs::read_to_string(&tmp_out).expect("failed to read output");
     let expected = std::fs::read_to_string(&expected_path).expect("failed to read expected");
 
-    let mut actual_sorted: Vec<(String, String)> = actual
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            let parts: Vec<&str> = l.split('\t').collect();
-            (parts[0].to_string(), parts[1].to_string())
-        })
-        .collect();
+    let mut actual_sorted: Vec<&str> =
+        actual.lines().filter(|l| !l.is_empty()).collect();
     actual_sorted.sort();
 
-    let mut expected_sorted: Vec<(String, String)> = expected
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| {
-            let parts: Vec<&str> = l.split('\t').collect();
-            (parts[0].to_string(), parts[1].to_string())
-        })
-        .collect();
+    let mut expected_sorted: Vec<&str> =
+        expected.lines().filter(|l| !l.is_empty()).collect();
     expected_sorted.sort();
 
     assert_eq!(

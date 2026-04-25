@@ -1878,7 +1878,7 @@ fn finalize_new_seed_contigs(
                 removed_sequences.push(first_chunk[..flank_len].to_vec());
                 removed_sequences.push(first_chunk[first_chunk.len() - flank_len..].to_vec());
             }
-            clip_new_seed_flanks(contig, kmer_len);
+            clip_new_seed_flanks(contig, kmers, kmer_len);
             contig.left_repeat = (kmer_len - 1) as i32;
             contig.right_repeat = (kmer_len - 1) as i32;
         }
@@ -1890,8 +1890,53 @@ fn finalize_new_seed_contigs(
     }
 }
 
-fn clip_new_seed_flanks(contig: &mut ContigSequence, kmer_len: usize) {
+fn clip_new_seed_flanks(contig: &mut ContigSequence, kmers: &KmerCount, kmer_len: usize) {
     let mut linked = crate::linked_contig::LinkedContig::new(std::mem::take(contig), kmer_len);
+    // Mirror C++ ConnectContigsJob (graphdigger.hpp:1714-1736): run the
+    // up-to-10 abundance loop *before* the kmer_len clip, so the abundance
+    // check consults raw-position 0..9 kmers (matching C++) instead of
+    // post-clip kmers. This is what makes the eventual final-pass clip
+    // unnecessary for the seeded fixture.
+    for _ in 0..10 {
+        if linked.left_extend <= 0 {
+            break;
+        }
+        let Some(front) = linked.front_kmer() else {
+            break;
+        };
+        let canonical = {
+            let rc = front.revcomp(kmer_len);
+            if front < rc { front } else { rc }
+        };
+        let idx = kmers.find(&canonical);
+        if idx >= kmers.size() {
+            break;
+        }
+        if (kmers.get_count(idx) & 0xFFFF_FFFF) as u32 > 5 {
+            break;
+        }
+        linked.clip_left(1);
+    }
+    for _ in 0..10 {
+        if linked.right_extend <= 0 {
+            break;
+        }
+        let Some(back) = linked.back_kmer() else {
+            break;
+        };
+        let canonical = {
+            let rc = back.revcomp(kmer_len);
+            if back < rc { back } else { rc }
+        };
+        let idx = kmers.find(&canonical);
+        if idx >= kmers.size() {
+            break;
+        }
+        if (kmers.get_count(idx) & 0xFFFF_FFFF) as u32 > 5 {
+            break;
+        }
+        linked.clip_right(1);
+    }
     linked.clip_left(kmer_len);
     linked.clip_right(kmer_len);
     *contig = linked.seq;
@@ -2868,8 +2913,12 @@ mod tests {
         let kmer_len = 5;
         let mut contig = ContigSequence::new();
         contig.insert_new_chunk_with("ACGTACGTACGTACGTACGT".chars().collect());
+        // Empty kmer table — abundance loop will not find any flank kmer
+        // so it does nothing, leaving only the kmer_len-side clips. This
+        // exercises the original budget invariant.
+        let kmers = KmerCount::new(kmer_len);
 
-        clip_new_seed_flanks(&mut contig, kmer_len);
+        clip_new_seed_flanks(&mut contig, &kmers, kmer_len);
 
         assert_eq!(contig.primary_sequence(), "CGTACGTACG");
         assert_eq!(contig.left_extend, 15);

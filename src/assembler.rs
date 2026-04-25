@@ -35,6 +35,26 @@ pub struct AssemblerParams {
     pub memory_gb: usize,
 }
 
+impl Clone for AssemblerParams {
+    fn clone(&self) -> Self {
+        AssemblerParams {
+            min_kmer: self.min_kmer,
+            max_kmer: self.max_kmer,
+            steps: self.steps,
+            fraction: self.fraction,
+            max_snp_len: self.max_snp_len,
+            min_count: self.min_count,
+            estimate_min_count: self.estimate_min_count,
+            max_kmer_count: self.max_kmer_count,
+            force_single_reads: self.force_single_reads,
+            insert_size: self.insert_size,
+            allow_snps: self.allow_snps,
+            ncores: self.ncores,
+            memory_gb: self.memory_gb,
+        }
+    }
+}
+
 impl Default for AssemblerParams {
     fn default() -> Self {
         AssemblerParams {
@@ -78,6 +98,9 @@ pub fn run_assembly(
     params: &AssemblerParams,
     seeds: &[String],
 ) -> AssemblyResult {
+    // Local mutable copy: auto-estimation may raise min_count / max_kmer_count.
+    let mut params = params.clone();
+
     let mut all_iterations = Vec::new();
     let mut graphs: Vec<(usize, KmerCount)> = Vec::new();
 
@@ -99,7 +122,7 @@ pub fn run_assembly(
             .iter()
             .any(|r| r[0].read_num() > 0 && r[0].contains_paired());
     // Build graph at min_kmer
-    let (mut kmers, average_count) = build_graph(
+    let (mut kmers, mut average_count) = build_graph(
         reads,
         params.min_kmer,
         params.min_count,
@@ -110,6 +133,33 @@ pub fn run_assembly(
 
     eprintln!("\nAverage read length: {}", read_len);
     eprintln!("Genome size estimate: {}\n", genome_size);
+
+    // Auto-estimate min_count / max_kmer_count from coverage.
+    // Mirrors C++ CDBGAssembler::GetGraph (assembler.hpp:963-981): when
+    // total_seq > 0 and the data has higher coverage than the user's
+    // min_count handles, raise both thresholds and prune low-count kmers.
+    if params.estimate_min_count && total_seq > 0.0 && genome_size > 0 {
+        let coverage = total_seq / genome_size as f64;
+        let new_min_count = (coverage / 50.0 + 0.5) as usize;
+        if new_min_count > params.min_count {
+            let new_max_kmer_count = (coverage / 10.0 + 0.5) as usize;
+            let new_max_kmer_count = new_max_kmer_count.max(10);
+            eprintln!(
+                "WARNING: --min_count changed from {} to {} because of high coverage for genome size {}",
+                params.min_count, new_min_count, genome_size
+            );
+            eprintln!(
+                "WARNING: --max_kmer_count {} to {} because of high coverage for genome size {}",
+                params.max_kmer_count, new_max_kmer_count, genome_size
+            );
+            params.min_count = new_min_count;
+            params.max_kmer_count = new_max_kmer_count;
+            kmers.remove_low_count(new_min_count as u32);
+            // Recompute average count on the pruned graph.
+            let pruned_bins = sorted_counter::get_bins(&kmers);
+            average_count = histogram::get_average_count(&pruned_bins);
+        }
+    }
 
     // First iteration at min_kmer
     let digger_params = DiggerParams {

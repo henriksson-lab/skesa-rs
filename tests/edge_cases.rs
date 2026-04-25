@@ -1369,3 +1369,64 @@ fn skesa_uses_seed_fasta() {
 
     let _ = std::fs::remove_file(&contigs);
 }
+
+#[test]
+fn skesa_auto_estimates_min_count_on_high_coverage_input() {
+    use std::io::Write;
+    // Synthesize a small high-coverage fixture: 1000-bp genome, 200x coverage,
+    // 100-bp reads. Without --min-count, Rust should auto-raise the threshold
+    // to match C++'s WARNING in CDBGAssembler::GetGraph (assembler.hpp:971).
+    let mut genome = String::new();
+    let mut x: u32 = 0xC0FFEE;
+    for _ in 0..1000 {
+        x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+        genome.push(b"ACGT"[((x >> 24) & 0x3) as usize] as char);
+    }
+    let tmp_reads = std::env::temp_dir().join("skesa_rs_auto_min_count_reads.fasta");
+    let mut f = std::fs::File::create(&tmp_reads).unwrap();
+    for i in 0..2000usize {
+        let pos = (i * 137 + 41) % 900;
+        writeln!(f, ">read_{i}\n{}", &genome[pos..pos + 100]).unwrap();
+    }
+    drop(f);
+
+    let bin = cargo_bin();
+    let contigs = std::env::temp_dir().join("skesa_rs_auto_min_count_contigs.fasta");
+    let output = Command::new(&bin)
+        .args([
+            "skesa",
+            "--reads",
+            tmp_reads.to_str().unwrap(),
+            "--kmer",
+            "21",
+            "--max-kmer",
+            "21",
+            "--steps",
+            "1",
+            "--vector-percent",
+            "1.0",
+            "--estimated-kmers",
+            "1",
+            "--cores",
+            "1",
+            "--min-contig",
+            "1",
+            "--contigs-out",
+            contigs.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run skesa");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("WARNING: --min_count changed from"),
+        "expected auto-estimation warning, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("WARNING: --max_kmer_count"),
+        "expected max_kmer_count warning, stderr: {stderr}"
+    );
+
+    let _ = std::fs::remove_file(&tmp_reads);
+    let _ = std::fs::remove_file(&contigs);
+}

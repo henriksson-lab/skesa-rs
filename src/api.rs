@@ -61,7 +61,8 @@
 //! # let _ = result;
 //! ```
 
-use crate::assembler::{run_assembly, AssemblerParams, AssemblyResult};
+use crate::assembler::{run_assembly, run_assembly_with_output, AssemblerParams, AssemblyResult};
+use crate::output::RunOutput;
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
 
@@ -178,6 +179,16 @@ impl Assembler {
     /// Run the assembly pipeline. `seeds` may be empty.
     pub fn assemble(&self, reads: Vec<ReadPair>, seeds: &[String]) -> AssemblyResult {
         run_assembly(&reads, &self.params, seeds)
+    }
+
+    /// Run the assembly pipeline and send progress output to a caller-provided sink.
+    pub fn assemble_with_output(
+        &self,
+        reads: Vec<ReadPair>,
+        seeds: &[String],
+        output: &dyn RunOutput,
+    ) -> AssemblyResult {
+        run_assembly_with_output(&reads, &self.params, seeds, output)
     }
 }
 

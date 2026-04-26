@@ -9,6 +9,7 @@ use crate::counter::KmerCount;
 use crate::db_graph::{DBGraph, SortedDbGraph};
 use crate::histogram::Bins;
 use crate::model::reverse_complement;
+use crate::output::{RunOutput, StdioOutput};
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
 use std::collections::HashMap;
@@ -54,6 +55,14 @@ impl MinstdRand0 {
 #[derive(Clone, Copy)]
 struct PairSuccessor {
     kmer: crate::kmer::Kmer,
+    nt: char,
+    abundance: u32,
+    plus_fraction: f64,
+}
+
+#[derive(Clone, Copy)]
+struct FlatSuccessor {
+    kmer: u64,
     nt: char,
     abundance: u32,
     plus_fraction: f64,
@@ -143,6 +152,7 @@ impl PairHasher {
 }
 
 type PairNodeMap<V> = HashMap<crate::kmer::Kmer, V, BuildHasherDefault<PairHasher>>;
+type FlatPairNodeMap<V> = HashMap<u64, V, BuildHasherDefault<PairHasher>>;
 
 fn pair_graph<'a>(kmers: &'a KmerCount, is_stranded: bool) -> SortedDbGraph<'a> {
     static EMPTY_BINS: Bins = Vec::new();
@@ -351,6 +361,73 @@ fn fill_graph_successors_flat(
     }
 }
 
+#[inline]
+fn fill_flat_successors(
+    node: u64,
+    kmers: &[(u64, u64)],
+    kmer_len: usize,
+    is_stranded: bool,
+    out: &mut Vec<FlatSuccessor>,
+) {
+    out.clear();
+    let node_rc = revcomp_val(node, kmer_len);
+    let is_minus = node_rc < node;
+    let canonical = if is_minus { node_rc } else { node };
+    let node_idx = crate::counter::find_val_in(kmers, canonical);
+    if node_idx >= kmers.len() {
+        return;
+    }
+    let count_word = kmers[node_idx].1;
+    let branch_info = (count_word >> 32) as u8;
+    let bits = if is_minus {
+        branch_info >> 4
+    } else {
+        branch_info & 0x0F
+    };
+    if bits == 0 {
+        return;
+    }
+    let mask = if kmer_len == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * kmer_len)) - 1
+    };
+    let shifted = (node << 2) & mask;
+    const BIN2NT: [char; 4] = ['A', 'C', 'T', 'G'];
+    for nt in 0..4u64 {
+        if bits & (1 << nt) == 0 {
+            continue;
+        }
+        let next_kmer = shifted + nt;
+        let next_rc = revcomp_val(next_kmer, kmer_len);
+        let next_canonical = if next_rc < next_kmer {
+            next_rc
+        } else {
+            next_kmer
+        };
+        let next_idx = crate::counter::find_val_in(kmers, next_canonical);
+        if next_idx >= kmers.len() {
+            continue;
+        }
+        let next_count = kmers[next_idx].1;
+        let total_count = (next_count & 0xFFFF_FFFF) as u32;
+        let mut plus_fraction = if is_stranded {
+            ((next_count >> 48) as u16) as f64 / u16::MAX as f64
+        } else {
+            0.5
+        };
+        if next_rc < next_kmer {
+            plus_fraction = 1.0 - plus_fraction;
+        }
+        out.push(FlatSuccessor {
+            kmer: next_kmer,
+            nt: BIN2NT[nt as usize],
+            abundance: total_count,
+            plus_fraction,
+        });
+    }
+}
+
 fn filter_successors(successors: &mut Vec<PairSuccessor>, fraction: f64, low_count: usize) {
     if successors.len() <= 1 {
         return;
@@ -379,6 +456,11 @@ fn kmer_ends_with_ggt(kmer: crate::kmer::Kmer) -> bool {
     kmer.codon(0) == (2 | (3 << 2) | (3 << 4))
 }
 
+#[inline]
+fn kmer_val_ends_with_ggt(kmer: u64) -> bool {
+    (kmer & 0x3F) == (2 | (3 << 2) | (3 << 4))
+}
+
 fn most_likely_extension_matches(
     mut node: crate::kmer::Kmer,
     kmers: &KmerCount,
@@ -386,9 +468,41 @@ fn most_likely_extension_matches(
     pattern: &[char],
     is_stranded: bool,
 ) -> bool {
+    if kmer_len <= 32 {
+        return most_likely_extension_matches_flat(
+            node.get_val(),
+            kmers.flat_entries(),
+            kmer_len,
+            pattern,
+            is_stranded,
+        );
+    }
     let mut successors = Vec::with_capacity(4);
     for &expected in pattern {
         fill_graph_successors(node, kmers, kmer_len, is_stranded, &mut successors);
+        if successors.is_empty() {
+            return false;
+        }
+        successors.sort_by(|a, b| b.abundance.cmp(&a.abundance).then_with(|| a.nt.cmp(&b.nt)));
+        let successor = successors[0];
+        if successor.nt != expected {
+            return false;
+        }
+        node = successor.kmer;
+    }
+    true
+}
+
+fn most_likely_extension_matches_flat(
+    mut node: u64,
+    kmers: &[(u64, u64)],
+    kmer_len: usize,
+    pattern: &[char],
+    is_stranded: bool,
+) -> bool {
+    let mut successors = Vec::with_capacity(4);
+    for &expected in pattern {
+        fill_flat_successors(node, kmers, kmer_len, is_stranded, &mut successors);
         if successors.is_empty() {
             return false;
         }
@@ -473,6 +587,83 @@ fn filter_successors_connect_two_nodes(
     }
 }
 
+fn filter_flat_successors_connect_two_nodes(
+    successors: &mut Vec<FlatSuccessor>,
+    kmers: &[(u64, u64)],
+    kmer_len: usize,
+    fraction: f64,
+    low_count: usize,
+    is_stranded: bool,
+) {
+    const FACTOR: f64 = 0.1;
+    if successors.len() <= 1 {
+        return;
+    }
+    let total: u32 = successors.iter().map(|s| s.abundance).sum();
+    successors.sort_by(|a, b| b.abundance.cmp(&a.abundance).then_with(|| a.nt.cmp(&b.nt)));
+    if low_count == 1 && successors[0].abundance > 5 {
+        while successors.len() > 1 && successors.last().is_some_and(|s| s.abundance == 1) {
+            successors.pop();
+        }
+    }
+    while successors.len() > 1
+        && successors
+            .last()
+            .is_some_and(|s| (s.abundance as f64) <= fraction * total as f64)
+    {
+        successors.pop();
+    }
+
+    if successors.len() <= 1 || !is_stranded {
+        return;
+    }
+
+    let stranded_fraction = FACTOR * fraction;
+    let target = successors
+        .iter()
+        .position(|s| kmer_val_ends_with_ggt(s.kmer));
+    if let Some(target) = target {
+        let abundance = successors[target].abundance;
+        if abundance > 5 {
+            let am = abundance as f64 * (1.0 - successors[target].plus_fraction);
+            successors
+                .retain(|s| s.abundance as f64 * (1.0 - s.plus_fraction) >= stranded_fraction * am);
+        }
+    }
+    if successors.len() <= 1 {
+        return;
+    }
+
+    let target = successors.iter().position(|s| {
+        s.nt == 'A'
+            && most_likely_extension_matches_flat(s.kmer, kmers, kmer_len, &['C', 'C'], is_stranded)
+    });
+    if let Some(target) = target {
+        let abundance = successors[target].abundance;
+        if abundance > 5 {
+            let ap = abundance as f64 * successors[target].plus_fraction;
+            successors.retain(|s| s.abundance as f64 * s.plus_fraction >= stranded_fraction * ap);
+        }
+    }
+    if successors.len() <= 1 {
+        return;
+    }
+
+    let strand_balance_fraction = 0.1 * fraction;
+    let has_both = successors.iter().any(|s| {
+        let plusf = s.plus_fraction;
+        let minusf = 1.0 - plusf;
+        s.abundance >= low_count as u32 && plusf.min(minusf) > 0.25
+    });
+    if has_both {
+        successors.retain(|s| {
+            let plusf = s.plus_fraction;
+            let minusf = 1.0 - plusf;
+            s.abundance <= 1 || plusf.min(minusf) >= strand_balance_fraction * plusf.max(minusf)
+        });
+    }
+}
+
 fn filtered_successors(
     node: crate::kmer::Kmer,
     kmers: &KmerCount,
@@ -500,6 +691,28 @@ fn has_filtered_edge(
         .any(|successor| successor.kmer == to)
 }
 
+fn has_filtered_edge_flat(
+    from: u64,
+    to: u64,
+    kmers: &[(u64, u64)],
+    kmer_len: usize,
+    fraction: f64,
+    low_count: usize,
+    is_stranded: bool,
+) -> bool {
+    let mut successors = Vec::with_capacity(4);
+    fill_flat_successors(from, kmers, kmer_len, is_stranded, &mut successors);
+    filter_flat_successors_connect_two_nodes(
+        &mut successors,
+        kmers,
+        kmer_len,
+        fraction,
+        low_count,
+        is_stranded,
+    );
+    successors.iter().any(|successor| successor.kmer == to)
+}
+
 fn most_likely_extension_from(
     mut node: crate::kmer::Kmer,
     kmers: &KmerCount,
@@ -507,6 +720,15 @@ fn most_likely_extension_from(
     len: usize,
     is_stranded: bool,
 ) -> String {
+    if kmer_len <= 32 {
+        return most_likely_extension_from_flat(
+            node.get_val(),
+            kmers.flat_entries(),
+            kmer_len,
+            len,
+            is_stranded,
+        );
+    }
     let mut extension = String::new();
     while extension.len() < len {
         let mut successors = graph_successors(node, kmers, kmer_len, is_stranded);
@@ -517,6 +739,28 @@ fn most_likely_extension_from(
         // (graphdigger.hpp:1782-1788). Without the secondary key, Rust would
         // pick whichever entry the underlying graph iteration happens to put
         // first.
+        successors.sort_by(|a, b| b.abundance.cmp(&a.abundance).then_with(|| a.nt.cmp(&b.nt)));
+        let successor = successors[0];
+        extension.push(successor.nt);
+        node = successor.kmer;
+    }
+    extension
+}
+
+fn most_likely_extension_from_flat(
+    mut node: u64,
+    kmers: &[(u64, u64)],
+    kmer_len: usize,
+    len: usize,
+    is_stranded: bool,
+) -> String {
+    let mut extension = String::new();
+    let mut successors = Vec::with_capacity(4);
+    while extension.len() < len {
+        fill_flat_successors(node, kmers, kmer_len, is_stranded, &mut successors);
+        if successors.is_empty() {
+            return extension;
+        }
         successors.sort_by(|a, b| b.abundance.cmp(&a.abundance).then_with(|| a.nt.cmp(&b.nt)));
         let successor = successors[0];
         extension.push(successor.nt);
@@ -601,17 +845,30 @@ fn clip_read_for_connection(
             if graph.abundance(left_graph_node) >= low_count as i32
                 && graph.abundance(graph_node) >= low_count as i32
             {
-                let left_node = graph.get_node_kmer(left_graph_node);
-                let node = graph.get_node_kmer(graph_node);
-                if has_filtered_edge(
-                    left_node,
-                    node,
-                    kmers,
-                    kmer_len,
-                    fraction,
-                    low_count,
-                    is_stranded,
-                ) {
+                let forward_edge = if kmer_len <= 32 {
+                    has_filtered_edge_flat(
+                        graph.get_node_kmer(left_graph_node).get_val(),
+                        graph.get_node_kmer(graph_node).get_val(),
+                        kmers.flat_entries(),
+                        kmer_len,
+                        fraction,
+                        low_count,
+                        is_stranded,
+                    )
+                } else {
+                    let left_node = graph.get_node_kmer(left_graph_node);
+                    let node = graph.get_node_kmer(graph_node);
+                    has_filtered_edge(
+                        left_node,
+                        node,
+                        kmers,
+                        kmer_len,
+                        fraction,
+                        low_count,
+                        is_stranded,
+                    )
+                };
+                if forward_edge {
                     let right_graph_node = &extended_nodes[left_len + read_pos + 1];
                     let reverse_graph_node = &extended_nodes[left_len + read_pos];
                     if right_graph_node.is_valid()
@@ -619,18 +876,38 @@ fn clip_read_for_connection(
                         && graph.abundance(right_graph_node) >= low_count as i32
                         && graph.abundance(reverse_graph_node) >= low_count as i32
                     {
-                        let right_node = graph.get_node_kmer(right_graph_node).revcomp(kmer_len);
-                        let reverse_node =
-                            graph.get_node_kmer(reverse_graph_node).revcomp(kmer_len);
-                        if has_filtered_edge(
-                            right_node,
-                            reverse_node,
-                            kmers,
-                            kmer_len,
-                            fraction,
-                            low_count,
-                            is_stranded,
-                        ) {
+                        let reverse_edge = if kmer_len <= 32 {
+                            has_filtered_edge_flat(
+                                revcomp_val(
+                                    graph.get_node_kmer(right_graph_node).get_val(),
+                                    kmer_len,
+                                ),
+                                revcomp_val(
+                                    graph.get_node_kmer(reverse_graph_node).get_val(),
+                                    kmer_len,
+                                ),
+                                kmers.flat_entries(),
+                                kmer_len,
+                                fraction,
+                                low_count,
+                                is_stranded,
+                            )
+                        } else {
+                            let right_node =
+                                graph.get_node_kmer(right_graph_node).revcomp(kmer_len);
+                            let reverse_node =
+                                graph.get_node_kmer(reverse_graph_node).revcomp(kmer_len);
+                            has_filtered_edge(
+                                right_node,
+                                reverse_node,
+                                kmers,
+                                kmer_len,
+                                fraction,
+                                low_count,
+                                is_stranded,
+                            )
+                        };
+                        if reverse_edge {
                             bases[read_pos] = true;
                         }
                     }
@@ -726,6 +1003,19 @@ fn connect_two_nodes_cpp(
     low_count: usize,
     is_stranded: bool,
 ) -> CppConnection {
+    if kmer_len <= 32 {
+        return connect_two_nodes_cpp_flat(
+            first_node.get_val(),
+            last_node.get_val(),
+            kmers.flat_entries(),
+            kmer_len,
+            steps,
+            fraction,
+            low_count,
+            is_stranded,
+        );
+    }
+
     #[derive(Clone, Copy)]
     struct Link {
         prev: Option<usize>,
@@ -888,6 +1178,114 @@ fn connect_two_nodes_cpp(
     CppConnection::Success(path)
 }
 
+fn connect_two_nodes_cpp_flat(
+    first_node: u64,
+    last_node: u64,
+    kmers: &[(u64, u64)],
+    kmer_len: usize,
+    steps: usize,
+    fraction: f64,
+    low_count: usize,
+    is_stranded: bool,
+) -> CppConnection {
+    #[derive(Clone, Copy)]
+    struct Link {
+        prev: Option<usize>,
+        suc: FlatSuccessor,
+    }
+
+    let mut storage: Vec<Link> = Vec::new();
+    let mut current: FlatPairNodeMap<Option<usize>> = FlatPairNodeMap::default();
+    let mut successors: Vec<FlatSuccessor> = Vec::with_capacity(4);
+    fill_flat_successors(first_node, kmers, kmer_len, is_stranded, &mut successors);
+    filter_flat_successors_connect_two_nodes(
+        &mut successors,
+        kmers,
+        kmer_len,
+        fraction,
+        low_count,
+        is_stranded,
+    );
+    current.reserve(successors.len());
+    for suc in &successors {
+        storage.push(Link {
+            prev: None,
+            suc: *suc,
+        });
+        current.insert(suc.kmer, Some(storage.len() - 1));
+    }
+
+    let mut connection: Option<usize> = None;
+    for _step in 1..steps {
+        if current.is_empty() {
+            break;
+        }
+        let mut next_current: FlatPairNodeMap<Option<usize>> = FlatPairNodeMap::default();
+        next_current.reserve(current.len().saturating_mul(2));
+        for (node, link) in current {
+            fill_flat_successors(node, kmers, kmer_len, is_stranded, &mut successors);
+            filter_flat_successors_connect_two_nodes(
+                &mut successors,
+                kmers,
+                kmer_len,
+                fraction,
+                low_count,
+                is_stranded,
+            );
+            if let Some(prev) = link {
+                for suc in &successors {
+                    storage.push(Link {
+                        prev: Some(prev),
+                        suc: *suc,
+                    });
+                    let idx = storage.len() - 1;
+                    if suc.kmer == last_node {
+                        if connection.is_some() {
+                            return CppConnection::Ambiguous;
+                        }
+                        connection = Some(idx);
+                    }
+                    let good_node = suc.abundance >= low_count as u32;
+                    match next_current.entry(suc.kmer) {
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            entry.insert(if good_node { Some(idx) } else { None });
+                        }
+                        std::collections::hash_map::Entry::Occupied(mut entry) => {
+                            entry.insert(None);
+                        }
+                    }
+                }
+            } else {
+                for suc in &successors {
+                    next_current.insert(suc.kmer, None);
+                    if suc.kmer == last_node {
+                        return CppConnection::Ambiguous;
+                    }
+                }
+            }
+        }
+        current = next_current;
+        if current.len() > MAX_PAIR_BRANCH {
+            return CppConnection::NoConnection;
+        }
+    }
+
+    let Some(mut idx) = connection else {
+        return CppConnection::NoConnection;
+    };
+    let mut path = Vec::new();
+    loop {
+        let link = storage[idx];
+        path.push(link.suc.nt);
+        let Some(prev) = link.prev else {
+            break;
+        };
+        idx = prev;
+    }
+    path.reverse();
+    CppConnection::Success(path)
+}
+
 fn validated_merged_read(
     read1: &str,
     read2_rc: &str,
@@ -974,6 +1372,31 @@ pub fn estimate_insert_size_full(
     low_count: usize,
     is_stranded: bool,
 ) -> usize {
+    let output = StdioOutput;
+    estimate_insert_size_full_with_output(
+        reads,
+        kmers,
+        kmer_len,
+        sample_size,
+        ncores,
+        fraction,
+        low_count,
+        is_stranded,
+        &output,
+    )
+}
+
+pub fn estimate_insert_size_full_with_output(
+    reads: &[ReadPair],
+    kmers: &KmerCount,
+    kmer_len: usize,
+    sample_size: usize,
+    ncores: usize,
+    fraction: f64,
+    low_count: usize,
+    is_stranded: bool,
+    output: &dyn RunOutput,
+) -> usize {
     let total_pairs: usize = reads.iter().map(|r| r[0].read_num() / 2).sum();
     if total_pairs == 0 {
         return 0;
@@ -1041,6 +1464,7 @@ pub fn estimate_insert_size_full(
         fraction,
         low_count,
         is_stranded,
+        output,
     )
     .connected;
     let mut connected_lengths = Vec::new();
@@ -1091,6 +1515,7 @@ pub fn connect_pairs_with_low_count(
     insert_size: usize,
     low_count: usize,
 ) -> ConnectionResult {
+    let output = StdioOutput;
     connect_pairs_impl(
         reads,
         kmers,
@@ -1100,6 +1525,7 @@ pub fn connect_pairs_with_low_count(
         0.1,
         low_count,
         true,
+        &output,
     )
 }
 
@@ -1112,6 +1538,29 @@ pub fn connect_pairs_full(
     low_count: usize,
     is_stranded: bool,
 ) -> ConnectionResult {
+    let output = StdioOutput;
+    connect_pairs_full_with_output(
+        reads,
+        kmers,
+        kmer_len,
+        insert_size,
+        fraction,
+        low_count,
+        is_stranded,
+        &output,
+    )
+}
+
+pub fn connect_pairs_full_with_output(
+    reads: &[ReadPair],
+    kmers: &KmerCount,
+    kmer_len: usize,
+    insert_size: usize,
+    fraction: f64,
+    low_count: usize,
+    is_stranded: bool,
+    output: &dyn RunOutput,
+) -> ConnectionResult {
     connect_pairs_impl(
         reads,
         kmers,
@@ -1121,6 +1570,7 @@ pub fn connect_pairs_full(
         fraction,
         low_count,
         is_stranded,
+        output,
     )
 }
 
@@ -1140,6 +1590,7 @@ pub fn connect_pairs_extending_with_low_count(
     insert_size: usize,
     low_count: usize,
 ) -> ConnectionResult {
+    let output = StdioOutput;
     connect_pairs_impl(
         reads,
         kmers,
@@ -1149,6 +1600,7 @@ pub fn connect_pairs_extending_with_low_count(
         0.1,
         low_count,
         true,
+        &output,
     )
 }
 
@@ -1161,6 +1613,29 @@ pub fn connect_pairs_extending_full(
     low_count: usize,
     is_stranded: bool,
 ) -> ConnectionResult {
+    let output = StdioOutput;
+    connect_pairs_extending_full_with_output(
+        reads,
+        kmers,
+        kmer_len,
+        insert_size,
+        fraction,
+        low_count,
+        is_stranded,
+        &output,
+    )
+}
+
+pub fn connect_pairs_extending_full_with_output(
+    reads: &[ReadPair],
+    kmers: &KmerCount,
+    kmer_len: usize,
+    insert_size: usize,
+    fraction: f64,
+    low_count: usize,
+    is_stranded: bool,
+    output: &dyn RunOutput,
+) -> ConnectionResult {
     connect_pairs_impl(
         reads,
         kmers,
@@ -1170,6 +1645,7 @@ pub fn connect_pairs_extending_full(
         fraction,
         low_count,
         is_stranded,
+        output,
     )
 }
 
@@ -1186,7 +1662,14 @@ fn connect_pairs_impl(
     fraction: f64,
     low_count: usize,
     is_stranded: bool,
+    output: &dyn RunOutput,
 ) -> ConnectionResult {
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {
+            crate::output::err(output, format_args!($($arg)*))
+        };
+    }
+
     use rayon::prelude::*;
     let max_steps = insert_size;
     let debug_pair_job = debug_pair_job_enabled();

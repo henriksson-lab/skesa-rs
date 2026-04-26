@@ -460,6 +460,9 @@ impl<'a> StringIterator<'a> {
     /// Dereference: extract the read as a string
     pub fn get(&self) -> String {
         let read_length = self.holder.read_length[self.read] as usize;
+        if read_length == 0 {
+            return String::new();
+        }
         let mut read = String::with_capacity(read_length);
         // Stored in reverse, so read from high position backward
         let mut position = self.position + 2 * (read_length - 1);

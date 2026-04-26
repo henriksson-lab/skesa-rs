@@ -2,9 +2,10 @@
 
 Pure Rust port of NCBI's [SKESA](https://github.com/ncbi/SKESA) (Strategic K-mer Extension for Scrupulous Assemblies) — a de-novo sequence read assembler for microbial genomes.
 
-**Based on SKESA v2.4.0 / SAUTE v1.3.0** (commit [`27caba2`](https://github.com/ncbi/SKESA/commit/27caba2ed075c7f44dd5bd4a24332c23b5b2bdaa), 2024-10-11)
+Based on SKESA v2.4.0 / SAUTE v1.3.0 (commit [`27caba2`](https://github.com/ncbi/SKESA/commit/27caba2ed075c7f44dd5bd4a24332c23b5b2bdaa), 2024-10-11)
 
-**this crate is not yet ready for production!!!**
+* 2026-04-26: This crate has only passed a bare minimum of testing. Still slower than original SKESA. Use on own risk
+
 
 ## This is an LLM-mediated faithful (hopefully) translation, not the original code!
 
@@ -26,6 +27,16 @@ But:
 * Translations are not endorsed by the original authors unless otherwise noted. **Do not send bug reports to the original developers**. Use our Github issues page instead.
 * **Do not trust the benchmarks on this page**. They are used to help evaluate the translation. If you want improved performance, you generally have to use this code as a library, and use the additional tricks it offers. We generally accept performance losses in order to reduce our dependency issues
 * **Check the original Github pages for information about the package**. This README is kept sparse on purpose. It is not meant to be the primary source of information
+
+## Citation
+
+Please cite the original SKESA paper for the underlying assembler:
+
+Alexandre Souvorov, Richa Agarwala and David J. Lipman. SKESA: strategic k-mer extension for scrupulous assemblies. Genome Biology 2018 19:153. https://doi.org/10.1186/s13059-018-1540-z
+
+This repository also tracks the upstream SAUTE code path for future support; please cite the original SAUTE paper when using that functionality:
+
+Alexandre Souvorov and Richa Agarwala. SAUTE: sequence assembly using target enrichment. BMC Bioinformatics 22, 375 (2021). https://doi.org/10.1186/s12859-021-04174-9
 
 
 

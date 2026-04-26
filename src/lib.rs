@@ -64,6 +64,7 @@ pub mod hash_graph_output;
 pub mod kmer_output;
 pub mod linked_contig;
 pub mod nuc_prot_align;
+pub mod output;
 pub mod paired_reads;
 pub mod reads_getter;
 pub mod snp_discovery;

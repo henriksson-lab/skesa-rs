@@ -10,6 +10,7 @@ use crate::graph_digger::{self, DiggerParams};
 use crate::histogram::{self};
 use crate::kmer;
 use crate::linked_contig::LinkedContig;
+use crate::output::{RunOutput, StdioOutput};
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
 use crate::sorted_counter;
@@ -98,6 +99,22 @@ pub fn run_assembly(
     params: &AssemblerParams,
     seeds: &[String],
 ) -> AssemblyResult {
+    let output = StdioOutput;
+    run_assembly_with_output(reads, params, seeds, &output)
+}
+
+pub fn run_assembly_with_output(
+    reads: &[ReadPair],
+    params: &AssemblerParams,
+    seeds: &[String],
+    output: &dyn RunOutput,
+) -> AssemblyResult {
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {
+            crate::output::err(output, format_args!($($arg)*))
+        };
+    }
+
     // Local mutable copy: auto-estimation may raise min_count / max_kmer_count.
     let mut params = params.clone();
 
@@ -122,8 +139,13 @@ pub fn run_assembly(
             .iter()
             .any(|r| r[0].read_num() > 0 && r[0].contains_paired());
     // Build graph at min_kmer
-    let (mut kmers, mut average_count) =
-        build_graph(reads, params.min_kmer, params.min_count, params.memory_gb);
+    let (mut kmers, mut average_count) = build_graph_with_output(
+        reads,
+        params.min_kmer,
+        params.min_count,
+        params.memory_gb,
+        output,
+    );
     let bins = sorted_counter::get_bins(&kmers);
     let genome_size = histogram::calculate_genome_size(&bins);
 
@@ -183,7 +205,7 @@ pub fn run_assembly(
         if params.allow_snps {
             graph_digger::check_repeats(&mut contigs, &kmers, params.min_kmer, &digger_params);
         }
-        connect_and_extend_contigs(&mut contigs, &kmers, params.min_kmer, &digger_params);
+        connect_and_extend_contigs(&mut contigs, &kmers, params.min_kmer, &digger_params, output);
         contigs.sort();
 
         eprintln!(
@@ -229,7 +251,7 @@ pub fn run_assembly(
             new_seeds.len()
         );
         contigs.extend(new_seeds);
-        connect_and_extend_contigs(&mut contigs, &kmers, params.min_kmer, &digger_params);
+        connect_and_extend_contigs(&mut contigs, &kmers, params.min_kmer, &digger_params, output);
         contigs.sort();
         contigs
     };
@@ -269,7 +291,7 @@ pub fn run_assembly(
     let mut use_long_paired_iterations = false;
     if has_paired {
         paired_insert_n50 = if params.insert_size == 0 {
-            let insert_n50 = crate::paired_reads::estimate_insert_size_full(
+            let insert_n50 = crate::paired_reads::estimate_insert_size_full_with_output(
                 reads,
                 &kmers,
                 params.min_kmer,
@@ -278,6 +300,7 @@ pub fn run_assembly(
                 params.fraction,
                 params.min_count,
                 true,
+                output,
             );
             // C++ assembler.hpp:255 clamps to TKmer::MaxKmer().
             let insert_n50 = insert_n50.min(crate::kmer::MAX_KMER);
@@ -292,7 +315,7 @@ pub fn run_assembly(
         use_long_paired_iterations =
             paired_insert_n50 > 0 && paired_insert_n50 as f64 > 1.5 * max_kmer as f64;
         if !use_long_paired_iterations {
-            connected_reads = crate::paired_reads::connect_pairs_full(
+            connected_reads = crate::paired_reads::connect_pairs_full_with_output(
                 reads,
                 &kmers,
                 params.min_kmer,
@@ -300,6 +323,7 @@ pub fn run_assembly(
                 params.fraction,
                 params.min_count,
                 true,
+                output,
             )
             .connected;
         }
@@ -375,8 +399,13 @@ pub fn run_assembly(
                 }
             }
 
-            let (mut iter_kmers, iter_avg) =
-                build_graph(&iter_reads, kmer_len, params.min_count, params.memory_gb);
+            let (mut iter_kmers, iter_avg) = build_graph_with_output(
+                &iter_reads,
+                kmer_len,
+                params.min_count,
+                params.memory_gb,
+                output,
+            );
             if iter_kmers.size() == 0 {
                 eprintln!(
                     "Empty graph for kmer length: {} skipping this and longer kmers",
@@ -461,6 +490,7 @@ pub fn run_assembly(
                 &iter_kmers,
                 kmer_len,
                 &iter_digger_params,
+                output,
             );
             current_contigs.sort();
 
@@ -538,7 +568,7 @@ pub fn run_assembly(
 Connecting mate pairs using kmer length: {}",
                 kmer_len
             );
-            let pair_result = crate::paired_reads::connect_pairs_extending_full(
+            let pair_result = crate::paired_reads::connect_pairs_extending_full_with_output(
                 &remaining_pairs,
                 graph_kmers,
                 *kmer_len,
@@ -546,6 +576,7 @@ Connecting mate pairs using kmer length: {}",
                 params.fraction,
                 params.min_count,
                 true,
+                output,
             );
             let mut iter = pair_result.connected.string_iter();
             while !iter.at_end() {
@@ -587,11 +618,12 @@ Connecting mate pairs using kmer length: {}",
 
             for mut kmer_len in long_kmers {
                 kmer_len -= 1 - kmer_len % 2;
-                let (mut paired_kmers, _paired_avg) = build_graph(
+                let (mut paired_kmers, _paired_avg) = build_graph_with_output(
                     &connected_read_pairs,
                     kmer_len,
                     params.min_count,
                     params.memory_gb,
+                    output,
                 );
                 if paired_kmers.size() == 0 {
                     eprintln!(
@@ -668,6 +700,7 @@ Connecting mate pairs using kmer length: {}",
                     &paired_kmers,
                     kmer_len,
                     &paired_digger_params,
+                    output,
                 );
                 current_contigs.sort();
                 all_iterations.push(current_contigs.clone());
@@ -739,6 +772,7 @@ Connecting mate pairs using kmer length: {}",
                 graph_kmers,
                 kmer_len,
                 &snp_digger_params,
+                output,
             );
             current_contigs.sort();
             all_iterations.push(current_contigs.clone());
@@ -1676,7 +1710,14 @@ fn connect_and_extend_contigs(
     kmers: &KmerCount,
     kmer_len: usize,
     params: &graph_digger::DiggerParams,
+    output: &dyn RunOutput,
 ) {
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {
+            crate::output::err(output, format_args!($($arg)*))
+        };
+    }
+
     use crate::linked_contig::LinkedContig;
 
     if contigs.is_empty() {
@@ -2730,14 +2771,16 @@ fn stabilize_contig_directions(contigs: &mut ContigSequenceList, kmer_len: usize
     });
 }
 
-/// Build a de Bruijn graph (count k-mers and compute branches) for a given k-mer length
-fn build_graph(
+fn build_graph_with_output(
     reads: &[ReadPair],
     kmer_len: usize,
     min_count: usize,
     memory_gb: usize,
+    output: &dyn RunOutput,
 ) -> (KmerCount, f64) {
-    let mut kmers = sorted_counter::count_kmers_sorted(reads, kmer_len, min_count, memory_gb);
+    let mut kmers = sorted_counter::count_kmers_sorted_with_output(
+        reads, kmer_len, min_count, memory_gb, output,
+    );
 
     if kmers.size() == 0 {
         return (kmers, 0.0);
@@ -2748,7 +2791,7 @@ fn build_graph(
     let average_count = histogram::get_average_count(&bins);
 
     // Compute branch information
-    sorted_counter::get_branches(&mut kmers, kmer_len);
+    sorted_counter::get_branches_with_output(&mut kmers, kmer_len, output);
 
     (kmers, average_count)
 }

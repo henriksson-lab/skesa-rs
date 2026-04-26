@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Read};
 
 use flate2::read::GzDecoder;
 
+use crate::output::{RunOutput, StdioOutput};
 use crate::read_holder::ReadHolder;
 
 /// A set of reads from one input source: [paired, unpaired]
@@ -422,6 +423,22 @@ fn split_for_threads(all_reads: ReadPair, ncores: usize) -> Vec<ReadPair> {
 /// Adapters are 19-mers that pass SKESA's adapter counter threshold and appear
 /// in more than vector_percent of reads.
 pub fn clip_adapters(reads: &mut [ReadPair], vector_percent: f64, min_count_for_adapters: u32) {
+    let output = StdioOutput;
+    clip_adapters_with_output(reads, vector_percent, min_count_for_adapters, &output);
+}
+
+pub fn clip_adapters_with_output(
+    reads: &mut [ReadPair],
+    vector_percent: f64,
+    min_count_for_adapters: u32,
+    output: &dyn RunOutput,
+) {
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {
+            crate::output::err(output, format_args!($($arg)*))
+        };
+    }
+
     if vector_percent >= 1.0 {
         eprintln!("Adapters clip is disabled");
         return;
@@ -565,12 +582,36 @@ impl ReadsGetter {
         Self::new_with_ncores(file_list, use_paired_ends, 1)
     }
 
+    pub fn new_with_output(
+        file_list: &[String],
+        use_paired_ends: bool,
+        output: &dyn RunOutput,
+    ) -> Result<Self, String> {
+        Self::new_with_ncores_and_output(file_list, use_paired_ends, 1, output)
+    }
+
     /// Load reads and split them into C++-style work chunks.
     pub fn new_with_ncores(
         file_list: &[String],
         use_paired_ends: bool,
         ncores: usize,
     ) -> Result<Self, String> {
+        let output = StdioOutput;
+        Self::new_with_ncores_and_output(file_list, use_paired_ends, ncores, &output)
+    }
+
+    pub fn new_with_ncores_and_output(
+        file_list: &[String],
+        use_paired_ends: bool,
+        ncores: usize,
+        output: &dyn RunOutput,
+    ) -> Result<Self, String> {
+        macro_rules! eprintln {
+            ($($arg:tt)*) => {
+                crate::output::err(output, format_args!($($arg)*))
+            };
+        }
+
         let mut all_reads = [ReadHolder::new(true), ReadHolder::new(false)];
 
         for file_spec in file_list {

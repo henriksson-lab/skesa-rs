@@ -10,6 +10,7 @@ use crate::flat_counter::FlatKmerCount;
 use crate::histogram::Bins;
 use crate::kmer::Kmer;
 use crate::large_int::{oahash64, LargeInt};
+use crate::output::{RunOutput, StdioOutput};
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
 
@@ -87,6 +88,23 @@ pub fn count_kmers_sorted(
     min_count: usize,
     mem_available_gb: usize,
 ) -> KmerCount {
+    let output = StdioOutput;
+    count_kmers_sorted_with_output(reads, kmer_len, min_count, mem_available_gb, &output)
+}
+
+pub fn count_kmers_sorted_with_output(
+    reads: &[ReadPair],
+    kmer_len: usize,
+    min_count: usize,
+    mem_available_gb: usize,
+    output: &dyn RunOutput,
+) -> KmerCount {
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {
+            crate::output::err(output, format_args!($($arg)*))
+        };
+    }
+
     eprintln!("\nKmer len: {}", kmer_len);
 
     let mut raw_kmer_num: usize = 0;
@@ -109,9 +127,9 @@ pub fn count_kmers_sorted(
     // is bounded; the over-reservation issue of `count_single_pass` is
     // avoided. Use `--single-pass-counter` to opt into the legacy fast path.
     if single_pass_counter_enabled() {
-        return count_single_pass(reads, kmer_len, min_count, raw_kmer_num);
+        return count_single_pass(reads, kmer_len, min_count, raw_kmer_num, output);
     }
-    count_chunked(reads, kmer_len, min_count, &plan)
+    count_chunked(reads, kmer_len, min_count, &plan, output)
 }
 
 fn single_pass_counter_enabled() -> bool {
@@ -134,7 +152,14 @@ fn count_single_pass(
     kmer_len: usize,
     min_count: usize,
     raw_kmer_num: usize,
+    output: &dyn RunOutput,
 ) -> KmerCount {
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {
+            crate::output::err(output, format_args!($($arg)*))
+        };
+    }
+
     if reads.len() > 1 && kmer_len <= 32 {
         let partial_counts: Vec<KmerCount> = reads
             .par_iter()
@@ -180,7 +205,14 @@ fn count_chunked(
     kmer_len: usize,
     min_count: usize,
     plan: &SortedCounterPlan,
+    output: &dyn RunOutput,
 ) -> KmerCount {
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {
+            crate::output::err(output, format_args!($($arg)*))
+        };
+    }
+
     let cycles = plan.cycles;
     let njobs = plan.jobs;
     let total_buckets = plan.kmer_buckets;
@@ -499,6 +531,17 @@ pub fn get_branches_flat(kmers: &mut FlatKmerCount, kmer_len: usize) {
 }
 
 pub fn get_branches(kmers: &mut KmerCount, kmer_len: usize) {
+    let output = StdioOutput;
+    get_branches_with_output(kmers, kmer_len, &output);
+}
+
+pub fn get_branches_with_output(kmers: &mut KmerCount, kmer_len: usize, output: &dyn RunOutput) {
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {
+            crate::output::err(output, format_args!($($arg)*))
+        };
+    }
+
     let size = kmers.size();
     if size == 0 {
         return;
@@ -686,7 +729,8 @@ mod tests {
             jobs: 4,
             kmer_buckets: 12,
         };
-        let chunked = count_chunked(&reads, 21, 2, &plan);
+        let output = StdioOutput;
+        let chunked = count_chunked(&reads, 21, 2, &plan, &output);
 
         assert_eq!(single.size(), chunked.size());
         for i in 0..single.size() {

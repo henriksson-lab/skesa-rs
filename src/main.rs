@@ -439,6 +439,7 @@ fn skesa_input_files(args: &SkesaArgs) -> Vec<String> {
 }
 
 fn run_skesa(args: &SkesaArgs) -> i32 {
+    let output = skesa_rs::output::StdioOutput;
     let input_files = skesa_input_files(args);
 
     if !args.sra_run.is_empty() {
@@ -539,7 +540,12 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
 
     // Load reads
     let ncores = resolve_cores(args.cores);
-    let rg = match ReadsGetter::new_with_ncores(&input_files, args.use_paired_ends, ncores) {
+    let rg = match ReadsGetter::new_with_ncores_and_output(
+        &input_files,
+        args.use_paired_ends,
+        ncores,
+        &output,
+    ) {
         Ok(rg) => rg,
         Err(e) => {
             eprintln!("{}", e);
@@ -552,7 +558,12 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
     let reads_ref = if args.vector_percent < 1.0 {
         clipped = {
             let mut v = rg.reads().to_vec();
-            skesa_rs::reads_getter::clip_adapters(&mut v, args.vector_percent, 100);
+            skesa_rs::reads_getter::clip_adapters_with_output(
+                &mut v,
+                args.vector_percent,
+                100,
+                &output,
+            );
             v
         };
         &clipped[..]
@@ -607,7 +618,7 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
         }
     };
 
-    let result = assembler::run_assembly(reads_ref, &params, &seeds);
+    let result = assembler::run_assembly_with_output(reads_ref, &params, &seeds, &output);
 
     // Output contigs
     let min_contig = args.min_contig as usize;
@@ -815,6 +826,7 @@ fn load_seed_fasta(path: Option<&str>) -> Result<Vec<String>, String> {
 }
 
 fn run_kmercounter(args: &KmercounterArgs) -> i32 {
+    let output = skesa_rs::output::StdioOutput;
     if !args.sra_run.is_empty() {
         eprintln!("SRA input is not supported; use --reads with local FASTA/FASTQ files");
         return 1;
@@ -853,7 +865,12 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
     }
 
     // Load reads
-    let rg = match ReadsGetter::new_with_ncores(&args.reads, false, resolve_cores(args.cores)) {
+    let rg = match ReadsGetter::new_with_ncores_and_output(
+        &args.reads,
+        false,
+        resolve_cores(args.cores),
+        &output,
+    ) {
         Ok(rg) => rg,
         Err(e) => {
             eprintln!("{}", e);
@@ -866,7 +883,12 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
     let reads_ref = if args.vector_percent < 1.0 {
         clipped = {
             let mut v = rg.reads().to_vec();
-            skesa_rs::reads_getter::clip_adapters(&mut v, args.vector_percent, 15);
+            skesa_rs::reads_getter::clip_adapters_with_output(
+                &mut v,
+                args.vector_percent,
+                15,
+                &output,
+            );
             v
         };
         &clipped[..]
@@ -928,13 +950,18 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
 
     // DBG output: write SKESA's hash graph file format.
     if let Some(ref path) = args.dbg_out {
-        let mut sorted_kmers = skesa_rs::sorted_counter::count_kmers_sorted(
+        let mut sorted_kmers = skesa_rs::sorted_counter::count_kmers_sorted_with_output(
             reads_ref,
             args.kmer as usize,
             args.min_count as usize,
             32,
+            &output,
         );
-        skesa_rs::sorted_counter::get_branches(&mut sorted_kmers, args.kmer as usize);
+        skesa_rs::sorted_counter::get_branches_with_output(
+            &mut sorted_kmers,
+            args.kmer as usize,
+            &output,
+        );
 
         let file = match File::create(path) {
             Ok(f) => f,

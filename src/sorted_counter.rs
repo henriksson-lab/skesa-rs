@@ -103,14 +103,29 @@ pub fn count_kmers_sorted(
         plan.cycles
     );
 
-    // Single-pass path: when memory is plentiful (cycles <= 1) keep the
-    // simpler high-throughput path. The chunked path adds bucket-routing
-    // overhead per kmer so we only use it when necessary to fit memory.
-    if plan.cycles <= 1 {
+    // Default path: bucketed/chunked counting — mirrors C++'s
+    // `CKmerCounter::CKmerCounter` (counter.hpp:316-335) which routes k-mers
+    // into hash buckets even when only one cycle is needed. Per bucket peak
+    // is bounded; the over-reservation issue of `count_single_pass` is
+    // avoided. Use `--single-pass-counter` to opt into the legacy fast path.
+    if single_pass_counter_enabled() {
         return count_single_pass(reads, kmer_len, min_count, raw_kmer_num);
     }
-
     count_chunked(reads, kmer_len, min_count, &plan)
+}
+
+fn single_pass_counter_enabled() -> bool {
+    SINGLE_PASS_COUNTER.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static SINGLE_PASS_COUNTER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable the legacy single-pass counter (collects all raw k-mers in one Vec
+/// before dedup). Faster for small workloads but inflates peak RSS by the
+/// raw kmer total — opt-in only.
+pub fn set_single_pass_counter(enabled: bool) {
+    SINGLE_PASS_COUNTER.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Single-pass counting (former default path). Used when memory is plentiful.
@@ -467,6 +482,11 @@ pub fn get_branches(kmers: &mut KmerCount, kmer_len: usize) {
     // Build hash index for O(1) lookups during branch computation
     kmers.build_hash_index();
 
+    // Mirror C++ `CKmerCounter::GetBranches` (counter.hpp:366-388) which
+    // splits the kmer-index range into `m_ncores` ranges and runs
+    // `GetBranchesJob` in parallel — each job is read-only on `kmers` and
+    // writes to its own `branches[index]` slot, so the partition is
+    // embarrassingly parallel.
     let mut branches = vec![0u8; size];
 
     // Fast path for precision=1: operate directly on u64 without Kmer enum
@@ -477,64 +497,71 @@ pub fn get_branches(kmers: &mut KmerCount, kmer_len: usize) {
             (1u64 << (2 * kmer_len)) - 1
         };
 
-        for index in 0..size {
-            let (kmer, _) = kmers.get_kmer_count(index);
-            let val = kmer.get_val();
+        let kmers_ref = &*kmers;
+        branches
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, branch_byte)| {
+                let (kmer, _) = kmers_ref.get_kmer_count(index);
+                let val = kmer.get_val();
 
-            let shifted = (val << 2) & max_val;
-            for nt in 0..4u64 {
-                let k = shifted | nt;
-                let rk = LargeInt::<1>::new(k).revcomp(kmer_len).get_val();
-                let canonical = k.min(rk);
-                let ckmer = Kmer::from_u64(kmer_len, canonical);
-                let new_index = kmers.find(&ckmer);
-                if new_index != size && new_index != index {
-                    branches[index] |= 1 << nt;
+                let shifted = (val << 2) & max_val;
+                for nt in 0..4u64 {
+                    let k = shifted | nt;
+                    let rk = LargeInt::<1>::new(k).revcomp(kmer_len).get_val();
+                    let canonical = k.min(rk);
+                    let ckmer = Kmer::from_u64(kmer_len, canonical);
+                    let new_index = kmers_ref.find(&ckmer);
+                    if new_index != size && new_index != index {
+                        *branch_byte |= 1 << nt;
+                    }
                 }
-            }
 
-            let rval = LargeInt::<1>::new(val).revcomp(kmer_len).get_val();
-            let rshifted = (rval << 2) & max_val;
-            for nt in 0..4u64 {
-                let k = rshifted | nt;
-                let rk = LargeInt::<1>::new(k).revcomp(kmer_len).get_val();
-                let canonical = k.min(rk);
-                let ckmer = Kmer::from_u64(kmer_len, canonical);
-                let new_index = kmers.find(&ckmer);
-                if new_index != size && new_index != index {
-                    branches[index] |= 1 << (nt + 4);
+                let rval = LargeInt::<1>::new(val).revcomp(kmer_len).get_val();
+                let rshifted = (rval << 2) & max_val;
+                for nt in 0..4u64 {
+                    let k = rshifted | nt;
+                    let rk = LargeInt::<1>::new(k).revcomp(kmer_len).get_val();
+                    let canonical = k.min(rk);
+                    let ckmer = Kmer::from_u64(kmer_len, canonical);
+                    let new_index = kmers_ref.find(&ckmer);
+                    if new_index != size && new_index != index {
+                        *branch_byte |= 1 << (nt + 4);
+                    }
                 }
-            }
-        }
+            });
     } else {
         let max_kmer = Kmer::from_chars(kmer_len, std::iter::repeat_n('G', kmer_len));
+        let kmers_ref = &*kmers;
+        branches
+            .par_iter_mut()
+            .enumerate()
+            .for_each(|(index, branch_byte)| {
+                let (kmer, _count) = kmers_ref.get_kmer_count(index);
 
-        for index in 0..size {
-            let (kmer, _count) = kmers.get_kmer_count(index);
-
-            let shifted = (kmer.shl(2)) & max_kmer;
-            for nt in 0..4u64 {
-                let k = shifted + nt;
-                let rk = k.revcomp(kmer_len);
-                let canonical = if k < rk { k } else { rk };
-                let new_index = kmers.find(&canonical);
-                if new_index != size && new_index != index {
-                    branches[index] |= 1 << nt;
+                let shifted = (kmer.shl(2)) & max_kmer;
+                for nt in 0..4u64 {
+                    let k = shifted + nt;
+                    let rk = k.revcomp(kmer_len);
+                    let canonical = if k < rk { k } else { rk };
+                    let new_index = kmers_ref.find(&canonical);
+                    if new_index != size && new_index != index {
+                        *branch_byte |= 1 << nt;
+                    }
                 }
-            }
 
-            let rkmer = kmer.revcomp(kmer_len);
-            let shifted_r = (rkmer.shl(2)) & max_kmer;
-            for nt in 0..4u64 {
-                let k = shifted_r + nt;
-                let rk = k.revcomp(kmer_len);
-                let canonical = if k < rk { k } else { rk };
-                let new_index = kmers.find(&canonical);
-                if new_index != size && new_index != index {
-                    branches[index] |= 1 << (nt + 4);
+                let rkmer = kmer.revcomp(kmer_len);
+                let shifted_r = (rkmer.shl(2)) & max_kmer;
+                for nt in 0..4u64 {
+                    let k = shifted_r + nt;
+                    let rk = k.revcomp(kmer_len);
+                    let canonical = if k < rk { k } else { rk };
+                    let new_index = kmers_ref.find(&canonical);
+                    if new_index != size && new_index != index {
+                        *branch_byte |= 1 << (nt + 4);
+                    }
                 }
-            }
-        }
+            });
     }
 
     // Update counts with branch info and plus-strand fraction

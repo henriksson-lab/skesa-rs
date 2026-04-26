@@ -199,6 +199,13 @@ struct SkesaArgs {
     /// Output assembly in GFA format
     #[arg(long, alias = "gfa_out")]
     gfa_out: Option<String>,
+
+    /// Use the legacy single-pass k-mer counter (collects all raw k-mers in
+    /// one Vec before dedup). Faster on small inputs but inflates peak RSS
+    /// by the raw k-mer total — defaults to false to keep RSS comparable
+    /// with the bundled C++ build, which uses the bucketed counter always.
+    #[arg(long, alias = "single_pass_counter", default_value_t = false)]
+    single_pass_counter: bool,
 }
 
 #[derive(Parser)]
@@ -567,6 +574,8 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
     let min_count = args.min_count.unwrap_or(2) as usize;
     let max_kmer_count = args.max_kmer_count.unwrap_or(10) as usize;
     let estimate_min_count = args.min_count.is_none() && args.max_kmer_count.is_none();
+
+    skesa_rs::sorted_counter::set_single_pass_counter(args.single_pass_counter);
 
     let params = AssemblerParams {
         min_kmer: args.kmer as usize,

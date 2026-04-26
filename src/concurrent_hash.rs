@@ -77,20 +77,39 @@ const NUM_SHARDS: usize = 256;
 
 /// Concurrent k-mer hash count table.
 ///
-/// Uses sharded mutexes for thread safety. Each shard is a HashMap of
-/// kmer (as raw u64 slice) -> KmerCounter.
+/// Uses sharded mutexes for thread safety. For k ≤ 32 (precision=1), the
+/// kmer fits in a single `u64` and we use `HashMap<u64, KmerCounter>` —
+/// avoiding the per-entry `Vec<u64>` heap allocation that the multi-word
+/// path needs. This is the same packed-array spirit as C++
+/// `CKmerHashMap` (concurrenthash.hpp:610): keep the kmer payload inline
+/// in the cell instead of routing it through a separate heap object.
 pub struct KmerHashCount {
-    shards: Vec<Mutex<HashMap<Vec<u64>, KmerCounter>>>,
+    storage: HashStorage,
     kmer_len: usize,
+}
+
+enum HashStorage {
+    Single(Vec<Mutex<HashMap<u64, KmerCounter>>>),
+    Multi(Vec<Mutex<HashMap<Box<[u64]>, KmerCounter>>>),
 }
 
 impl KmerHashCount {
     pub fn new(kmer_len: usize, estimated_size: usize) -> Self {
         let shard_size = (estimated_size / NUM_SHARDS).max(64);
-        let shards = (0..NUM_SHARDS)
-            .map(|_| Mutex::new(HashMap::with_capacity(shard_size)))
-            .collect();
-        KmerHashCount { shards, kmer_len }
+        let storage = if kmer_len <= 32 {
+            HashStorage::Single(
+                (0..NUM_SHARDS)
+                    .map(|_| Mutex::new(HashMap::with_capacity(shard_size)))
+                    .collect(),
+            )
+        } else {
+            HashStorage::Multi(
+                (0..NUM_SHARDS)
+                    .map(|_| Mutex::new(HashMap::with_capacity(shard_size)))
+                    .collect(),
+            )
+        };
+        KmerHashCount { storage, kmer_len }
     }
 
     /// Get the shard index for a kmer based on its hash
@@ -98,46 +117,88 @@ impl KmerHashCount {
         (kmer.oahash() as usize) % NUM_SHARDS
     }
 
-    /// Extract the raw u64 key from a kmer
-    fn kmer_key(kmer: &Kmer) -> Vec<u64> {
+    /// Single-word key (precision=1). Caller must ensure kmer_len ≤ 32.
+    fn kmer_key_single(kmer: &Kmer) -> u64 {
+        kmer.as_words()[0]
+    }
+
+    /// Multi-word key (precision>1).
+    fn kmer_key_multi(&self, kmer: &Kmer) -> Box<[u64]> {
         let n_words = kmer.get_size() / 64;
-        let words = kmer.to_words();
-        words[..n_words].to_vec()
+        kmer.as_words()[..n_words].to_vec().into_boxed_slice()
     }
 
     /// Update count for a kmer. Returns true if this was a new insertion.
     pub fn update_count(&self, kmer: &Kmer, is_plus: bool) -> bool {
         let shard_idx = self.shard_for(kmer);
-        let key = Self::kmer_key(kmer);
-        let mut shard = self.shards[shard_idx].lock().unwrap();
-
-        if let Some(counter) = shard.get(&key) {
-            counter.increment(is_plus);
-            false
-        } else {
-            let counter = KmerCounter::new();
-            counter.increment(is_plus);
-            shard.insert(key, counter);
-            true
+        match &self.storage {
+            HashStorage::Single(shards) => {
+                let key = Self::kmer_key_single(kmer);
+                let mut shard = shards[shard_idx].lock().unwrap();
+                if let Some(counter) = shard.get(&key) {
+                    counter.increment(is_plus);
+                    false
+                } else {
+                    let counter = KmerCounter::new();
+                    counter.increment(is_plus);
+                    shard.insert(key, counter);
+                    true
+                }
+            }
+            HashStorage::Multi(shards) => {
+                let key = self.kmer_key_multi(kmer);
+                let mut shard = shards[shard_idx].lock().unwrap();
+                if let Some(counter) = shard.get(&key) {
+                    counter.increment(is_plus);
+                    false
+                } else {
+                    let counter = KmerCounter::new();
+                    counter.increment(is_plus);
+                    shard.insert(key, counter);
+                    true
+                }
+            }
         }
     }
 
     /// Find a kmer's count. Returns None if not found.
     pub fn find_count(&self, kmer: &Kmer) -> Option<u32> {
         let shard_idx = self.shard_for(kmer);
-        let key = Self::kmer_key(kmer);
-        let shard = self.shards[shard_idx].lock().unwrap();
-        shard.get(&key).map(|c| c.count())
+        match &self.storage {
+            HashStorage::Single(shards) => {
+                let key = Self::kmer_key_single(kmer);
+                let shard = shards[shard_idx].lock().unwrap();
+                shard.get(&key).map(|c| c.count())
+            }
+            HashStorage::Multi(shards) => {
+                let key = self.kmer_key_multi(kmer);
+                let shard = shards[shard_idx].lock().unwrap();
+                shard.get(&key).map(|c| c.count())
+            }
+        }
     }
 
     /// Get histogram of k-mer counts (count_value, frequency)
     pub fn get_bins(&self) -> Bins {
         let mut count_freq: HashMap<i32, usize> = HashMap::new();
-        for shard in &self.shards {
-            let shard = shard.lock().unwrap();
-            for (_, counter) in shard.iter() {
-                let count = counter.count() as i32;
-                *count_freq.entry(count).or_insert(0) += 1;
+        match &self.storage {
+            HashStorage::Single(shards) => {
+                for shard in shards {
+                    let shard = shard.lock().unwrap();
+                    for counter in shard.values() {
+                        let count = counter.count() as i32;
+                        *count_freq.entry(count).or_insert(0) += 1;
+                    }
+                }
+            }
+            HashStorage::Multi(shards) => {
+                for shard in shards {
+                    let shard = shard.lock().unwrap();
+                    for counter in shard.values() {
+                        let count = counter.count() as i32;
+                        *count_freq.entry(count).or_insert(0) += 1;
+                    }
+                }
             }
         }
         let mut bins: Bins = count_freq.into_iter().collect();
@@ -147,15 +208,32 @@ impl KmerHashCount {
 
     /// Remove k-mers with count below min_count
     pub fn remove_low_count(&self, min_count: u32) {
-        for shard in &self.shards {
-            let mut shard = shard.lock().unwrap();
-            shard.retain(|_, counter| counter.count() >= min_count);
+        match &self.storage {
+            HashStorage::Single(shards) => {
+                for shard in shards {
+                    let mut shard = shard.lock().unwrap();
+                    shard.retain(|_, counter| counter.count() >= min_count);
+                }
+            }
+            HashStorage::Multi(shards) => {
+                for shard in shards {
+                    let mut shard = shard.lock().unwrap();
+                    shard.retain(|_, counter| counter.count() >= min_count);
+                }
+            }
         }
     }
 
     /// Total number of k-mers in the table
     pub fn size(&self) -> usize {
-        self.shards.iter().map(|s| s.lock().unwrap().len()).sum()
+        match &self.storage {
+            HashStorage::Single(shards) => {
+                shards.iter().map(|s| s.lock().unwrap().len()).sum()
+            }
+            HashStorage::Multi(shards) => {
+                shards.iter().map(|s| s.lock().unwrap().len()).sum()
+            }
+        }
     }
 
     /// K-mer length
@@ -164,23 +242,52 @@ impl KmerHashCount {
     }
 
     /// Iterate over all k-mers and their counts.
-    /// Calls `f(kmer, count, plus_count)` for each entry.
+    /// Calls `f(kmer_words, count, plus_count)` for each entry.
+    /// For the single-word path the temporary key buffer is recycled.
     pub fn for_each<F: FnMut(&[u64], u32, u32)>(&self, mut f: F) {
-        for shard in &self.shards {
-            let shard = shard.lock().unwrap();
-            for (key, counter) in shard.iter() {
-                f(key, counter.count(), counter.plus_count());
+        match &self.storage {
+            HashStorage::Single(shards) => {
+                let mut buf = [0u64; 1];
+                for shard in shards {
+                    let shard = shard.lock().unwrap();
+                    for (key, counter) in shard.iter() {
+                        buf[0] = *key;
+                        f(&buf, counter.count(), counter.plus_count());
+                    }
+                }
+            }
+            HashStorage::Multi(shards) => {
+                for shard in shards {
+                    let shard = shard.lock().unwrap();
+                    for (key, counter) in shard.iter() {
+                        f(key, counter.count(), counter.plus_count());
+                    }
+                }
             }
         }
     }
 
     /// Iterate over all k-mers with their raw data.
-    /// Calls `f(kmer_key, raw_data)` for each entry.
+    /// Calls `f(kmer_words, raw_data)` for each entry.
     pub fn for_each_raw<F: FnMut(&[u64], u64)>(&self, mut f: F) {
-        for shard in &self.shards {
-            let shard = shard.lock().unwrap();
-            for (key, counter) in shard.iter() {
-                f(key, counter.load());
+        match &self.storage {
+            HashStorage::Single(shards) => {
+                let mut buf = [0u64; 1];
+                for shard in shards {
+                    let shard = shard.lock().unwrap();
+                    for (key, counter) in shard.iter() {
+                        buf[0] = *key;
+                        f(&buf, counter.load());
+                    }
+                }
+            }
+            HashStorage::Multi(shards) => {
+                for shard in shards {
+                    let shard = shard.lock().unwrap();
+                    for (key, counter) in shard.iter() {
+                        f(key, counter.load());
+                    }
+                }
             }
         }
     }

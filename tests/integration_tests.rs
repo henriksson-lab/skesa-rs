@@ -3117,6 +3117,44 @@ fn skesa_positive_paired_connection_fixture_matches_cpp_golden() {
 }
 
 #[test]
+fn skesa_divergent_1180_pair_fixture_matches_cpp_golden() {
+    let bin = cargo_bin();
+    let data = test_data_dir().join("divergent");
+    let read1 = data.join("srr_1180_pairs_1.fastq.gz");
+    let read2 = data.join("srr_1180_pairs_2.fastq.gz");
+    let expected_contigs = data.join("expected_srr_1180_pairs_contigs.fasta");
+
+    let tmp_contigs = unique_temp_path("skesa_srr_1180_pairs_contigs", "fasta");
+
+    let reads_arg = format!("{},{}", read1.display(), read2.display());
+    let output = Command::new(&bin)
+        .args([
+            "skesa",
+            "--fastq",
+            &reads_arg,
+            "--cores",
+            "1",
+            "--contigs-out",
+            tmp_contigs.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run skesa on divergent 1180-pair fixture");
+
+    assert!(
+        output.status.success(),
+        "skesa failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&tmp_contigs).expect("failed to read contigs"),
+        std::fs::read_to_string(&expected_contigs).expect("failed to read expected contigs"),
+        "Rust contigs do not match C++ golden output on the divergent 1180-pair fixture"
+    );
+
+    let _ = std::fs::remove_file(&tmp_contigs);
+}
+
+#[test]
 fn skesa_seeded_contigs_match_golden() {
     let bin = cargo_bin();
     let data = test_data_dir();

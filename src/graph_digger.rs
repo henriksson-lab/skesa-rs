@@ -32,6 +32,10 @@ fn debug_extension_trace_enabled(trace_id: usize) -> bool {
     debug_extension_trace_limit().is_some_and(|limit| trace_id < limit)
 }
 
+fn debug_extension_seed_target() -> Option<String> {
+    std::env::var("SKESA_DEBUG_EXTENSION_SEED").ok()
+}
+
 fn debug_seed_trace_enabled() -> bool {
     std::env::var_os("SKESA_DEBUG_SEED_TRACE").is_some()
 }
@@ -381,17 +385,42 @@ fn find_successors_direct(
     max_kmer: &Kmer,
     low_count: usize,
 ) -> Vec<SuccessorCandidate> {
-    let shifted = (current.shl(2)) & *max_kmer;
+    // Mirror C++ `DBGraph::GetNodeSuccessors` (DBGraph.hpp:249-267) which
+    // consults the precomputed branch bitmask in the kmer count's high byte.
+    // The bitmask was set by `sorted_counter::get_branches` (= C++
+    // `GetBranchesJob`) which already excludes self-loop palindromes, so we
+    // skip find() entirely for nts the bitmask says don't exist.
+    //
+    // Strand-aware nibble: bits 0..3 are successors when `current` is the
+    // canonical/plus form, bits 4..7 are successors when `current` is the
+    // minus form (= predecessors of canonical in the plus direction).
+    let current_rc = current.revcomp(kmer_len);
+    let is_minus = current_rc < *current;
+    let current_canonical = if is_minus { current_rc } else { *current };
+    let current_idx = kmers.find(&current_canonical);
     let mut successors = Vec::new();
+    if current_idx >= kmers.size() {
+        return successors;
+    }
 
+    let branch_info = (kmers.get_count(current_idx) >> 32) as u8;
+    let bits = if is_minus { branch_info >> 4 } else { branch_info & 0x0F };
+    if bits == 0 {
+        return successors;
+    }
+
+    let shifted = (current.shl(2)) & *max_kmer;
     for nt in 0..4u64 {
+        if bits & (1 << nt) == 0 {
+            continue;
+        }
         let next = shifted + nt;
         let rnext = next.revcomp(kmer_len);
         let canonical = if next < rnext { next } else { rnext };
         let idx = kmers.find(&canonical);
         if idx < kmers.size() {
             let count = kmers.get_count(idx);
-            let total_count = (count & 0xFFFFFFFF) as u32;
+            let total_count = (count & 0xFFFF_FFFF) as u32;
             if total_count >= low_count as u32 {
                 successors.push(SuccessorCandidate {
                     kmer: next,
@@ -924,7 +953,9 @@ pub fn extend_right_with_endpoint(
     params: &DiggerParams,
 ) -> ExtensionResult {
     let trace_id = DEBUG_EXTENSION_TRACE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let trace_enabled = debug_extension_trace_enabled(trace_id);
+    let start_seed = start_kmer.to_kmer_string(kmer_len);
+    let trace_enabled = debug_extension_trace_enabled(trace_id)
+        || debug_extension_seed_target().as_deref() == Some(start_seed.as_str());
     let mut extension = Vec::new();
     let mut forks = Vec::new();
     let mut current = *start_kmer;
@@ -934,7 +965,7 @@ pub fn extend_right_with_endpoint(
         eprintln!(
             "EXT_TRACE start id={} start={}",
             trace_id,
-            start_kmer.to_kmer_string(kmer_len)
+            start_seed
         );
     }
 
@@ -1810,7 +1841,7 @@ fn collect_accepted_snp_nodes(
 }
 
 /// Mirror C++ GenerateNewSeeds post-processing: reject short fragments, clip
-/// uncertain flanks, and put removed flank/fragment kmers back into the graph.
+/// k-mer flanks, and put removed flank/fragment kmers back into the graph.
 fn seed_survives_test_graph(
     contig: &ContigSequence,
     test_graph: SeedTestGraph<'_>,
@@ -1878,7 +1909,29 @@ fn finalize_new_seed_contigs(
                 removed_sequences.push(first_chunk[..flank_len].to_vec());
                 removed_sequences.push(first_chunk[first_chunk.len() - flank_len..].to_vec());
             }
+            if debug_seed_phase_details_enabled() {
+                let seq = contig.primary_sequence();
+                let prefix_len = seq.len().min(30);
+                let suffix_start = seq.len().saturating_sub(30);
+                eprintln!(
+                    "RUST_SEED preclip len={} prefix={} suffix={}",
+                    contig.len_max(),
+                    &seq[..prefix_len],
+                    &seq[suffix_start..]
+                );
+            }
             clip_new_seed_flanks(contig, kmers, kmer_len);
+            if debug_seed_phase_details_enabled() {
+                let seq = contig.primary_sequence();
+                let prefix_len = seq.len().min(30);
+                let suffix_start = seq.len().saturating_sub(30);
+                eprintln!(
+                    "RUST_SEED postclip len={} prefix={} suffix={}",
+                    contig.len_max(),
+                    &seq[..prefix_len],
+                    &seq[suffix_start..]
+                );
+            }
             contig.left_repeat = (kmer_len - 1) as i32;
             contig.right_repeat = (kmer_len - 1) as i32;
         }
@@ -1891,52 +1944,13 @@ fn finalize_new_seed_contigs(
 }
 
 fn clip_new_seed_flanks(contig: &mut ContigSequence, kmers: &KmerCount, kmer_len: usize) {
+    // C++ GenerateNewSeeds only removes kmer_len flanks here
+    // (graphdigger.hpp:3179-3181). The abundance loop belongs to
+    // ConnectContigsJob, not seed finalization. But the clip itself still
+    // runs through SContig state, so the remaining clip budgets come from a
+    // fresh linked contig initialized to the current sequence length.
+    let _ = kmers;
     let mut linked = crate::linked_contig::LinkedContig::new(std::mem::take(contig), kmer_len);
-    // Mirror C++ ConnectContigsJob (graphdigger.hpp:1714-1736): run the
-    // up-to-10 abundance loop *before* the kmer_len clip, so the abundance
-    // check consults raw-position 0..9 kmers (matching C++) instead of
-    // post-clip kmers. This is what makes the eventual final-pass clip
-    // unnecessary for the seeded fixture.
-    for _ in 0..10 {
-        if linked.left_extend <= 0 {
-            break;
-        }
-        let Some(front) = linked.front_kmer() else {
-            break;
-        };
-        let canonical = {
-            let rc = front.revcomp(kmer_len);
-            if front < rc { front } else { rc }
-        };
-        let idx = kmers.find(&canonical);
-        if idx >= kmers.size() {
-            break;
-        }
-        if (kmers.get_count(idx) & 0xFFFF_FFFF) as u32 > 5 {
-            break;
-        }
-        linked.clip_left(1);
-    }
-    for _ in 0..10 {
-        if linked.right_extend <= 0 {
-            break;
-        }
-        let Some(back) = linked.back_kmer() else {
-            break;
-        };
-        let canonical = {
-            let rc = back.revcomp(kmer_len);
-            if back < rc { back } else { rc }
-        };
-        let idx = kmers.find(&canonical);
-        if idx >= kmers.size() {
-            break;
-        }
-        if (kmers.get_count(idx) & 0xFFFF_FFFF) as u32 > 5 {
-            break;
-        }
-        linked.clip_right(1);
-    }
     linked.clip_left(kmer_len);
     linked.clip_right(kmer_len);
     *contig = linked.seq;
@@ -2728,11 +2742,6 @@ pub fn join_overlapping_contigs(contigs: &mut ContigSequenceList, kmer_len: usiz
 
     let seqs: Vec<String> = contigs.iter().map(|c| c.primary_sequence()).collect();
 
-    // prefix(first k-1 chars) → first contig with that prefix.
-    // The original loop's match condition is `prefix(i) == suffix(left_idx)`,
-    // i.e. "find some left whose suffix matches my prefix". Equivalently:
-    // for each contig with a given suffix, the right-neighbor is whichever
-    // contig has that suffix as its prefix.
     let mut prefix_map: HashMap<&str, usize> = HashMap::new();
     for (i, seq) in seqs.iter().enumerate() {
         if seq.len() >= min_overlap {
@@ -2747,9 +2756,6 @@ pub fn join_overlapping_contigs(contigs: &mut ContigSequenceList, kmer_len: usiz
         if consumed[start] {
             continue;
         }
-
-        // Walk chain forward from `start`: while my suffix == some unconsumed
-        // contig's prefix, append that contig and follow.
         let mut chain = vec![start];
         consumed[start] = true;
         let mut cur = start;
@@ -2767,7 +2773,6 @@ pub fn join_overlapping_contigs(contigs: &mut ContigSequenceList, kmer_len: usiz
                 _ => break,
             }
         }
-
         if chain.len() == 1 {
             new_contigs.push(std::mem::replace(
                 &mut contigs[start],
@@ -2775,7 +2780,6 @@ pub fn join_overlapping_contigs(contigs: &mut ContigSequenceList, kmer_len: usiz
             ));
             continue;
         }
-
         let mut merged: Vec<char> = seqs[chain[0]].chars().collect();
         for &j in &chain[1..] {
             merged.extend(seqs[j][min_overlap..].chars());
@@ -2913,9 +2917,6 @@ mod tests {
         let kmer_len = 5;
         let mut contig = ContigSequence::new();
         contig.insert_new_chunk_with("ACGTACGTACGTACGTACGT".chars().collect());
-        // Empty kmer table — abundance loop will not find any flank kmer
-        // so it does nothing, leaving only the kmer_len-side clips. This
-        // exercises the original budget invariant.
         let kmers = KmerCount::new(kmer_len);
 
         clip_new_seed_flanks(&mut contig, &kmers, kmer_len);

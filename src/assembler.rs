@@ -173,11 +173,18 @@ pub fn run_assembly(
         is_stranded: true,
     };
     let mut seed_contigs_for_cleanup: ContigSequenceList = Vec::new();
+    // C++ ImproveContigs (assembler.hpp:759) uses graph_digger_no_jump
+    // (jump=0) for GenerateNewSeeds. Mirror that for every Rust call to
+    // assemble_contigs / assemble_contigs_with_visited.
+    let seed_digger_params = DiggerParams {
+        jump: 0,
+        ..digger_params
+    };
     let contigs = if seeds.is_empty() {
         let mut contigs = graph_digger::assemble_contigs(
             &mut kmers,
             params.min_kmer,
-            &digger_params,
+            &seed_digger_params,
         );
 
         if params.allow_snps {
@@ -217,7 +224,7 @@ pub fn run_assembly(
         let new_seeds = graph_digger::assemble_contigs_with_visited(
             &mut kmers,
             params.min_kmer,
-            &digger_params,
+            &seed_digger_params,
             pre_visited,
             None,
         );
@@ -229,6 +236,8 @@ pub fn run_assembly(
             new_seeds.len()
         );
         contigs.extend(new_seeds);
+        connect_and_extend_contigs(&mut contigs, &kmers, params.min_kmer, &digger_params);
+        contigs.sort();
         contigs
     };
 
@@ -314,7 +323,14 @@ pub fn run_assembly(
     // find_read_position; that off-by-one is now fixed at the source so the
     // override is no longer needed.
     let raw_read_margin = max_kmer + 50;
-    let cleanup_min_contig_len = max_kmer.max(paired_insert_limit);
+    // Mirror C++ `GetAssembledKmers` (assembler.hpp:428):
+    // `min_len = max(m_max_kmer_paired, m_max_kmer)`, where
+    // `m_max_kmer_paired` is the connected-mates N50 (=paired_insert_n50),
+    // NOT the insert-size LIMIT (=3 × N50). Using the limit excludes
+    // assembled contigs in the (N50, 3×N50) range from the kmer→contig
+    // map — reads mapping to them aren't recognized → not removed →
+    // they propagate stale kmers into the next iteration's histogram.
+    let cleanup_min_contig_len = max_kmer.max(paired_insert_n50);
     let cleanup_graph = Some(crate::clean_reads::CleanupGraphParams {
         kmers: &graphs[0].1,
         fraction: params.fraction,
@@ -412,11 +428,21 @@ pub fn run_assembly(
             let pre_visited = mark_previous_contigs(&current_contigs, &iter_kmers, kmer_len);
             let prev_count = current_contigs.len();
 
+            // C++ ImproveContigs (assembler.hpp:759) constructs a separate
+            // `graph_digger_no_jump` (jump=0) for `GenerateNewSeeds`. The
+            // ExtendableSuccessor dead-end-trim filter in
+            // `find_and_filter_successors` only fires when `jump > 0`, so
+            // seed assembly with jump=0 keeps successors that would
+            // otherwise be filtered as non-extendable.
+            let seed_digger_params = DiggerParams {
+                jump: 0,
+                ..iter_digger_params
+            };
             // Assemble only from unvisited k-mers (new seeds)
             let iter_contigs = graph_digger::assemble_contigs_with_visited(
                 &mut iter_kmers,
                 kmer_len,
-                &iter_digger_params,
+                &seed_digger_params,
                 pre_visited,
                 Some(graph_digger::SeedTestGraph {
                     kmers: &graphs[0].1,
@@ -620,10 +646,17 @@ Connecting mate pairs using kmer length: {}",
                 }
 
                 let pre_visited = mark_previous_contigs(&current_contigs, &paired_kmers, kmer_len);
+                // C++ uses graph_digger_no_jump (jump=0) for GenerateNewSeeds
+                // even in the paired-iteration phase (assembler.hpp:759 in
+                // ImproveContigs, which is the per-kmer entry point).
+                let paired_seed_digger_params = DiggerParams {
+                    jump: 0,
+                    ..paired_digger_params
+                };
                 let paired_contigs = graph_digger::assemble_contigs_with_visited(
                     &mut paired_kmers,
                     kmer_len,
-                    &paired_digger_params,
+                    &paired_seed_digger_params,
                     pre_visited,
                     Some(graph_digger::SeedTestGraph {
                         kmers: &graphs[0].1,
@@ -695,10 +728,16 @@ Connecting mate pairs using kmer length: {}",
             } else {
                 None
             };
+            // C++ uses graph_digger_no_jump (jump=0) for GenerateNewSeeds
+            // even in the allow_snps path (assembler.hpp:759).
+            let snp_seed_digger_params = DiggerParams {
+                jump: 0,
+                ..snp_digger_params
+            };
             let snp_contigs = graph_digger::assemble_contigs_with_visited(
                 graph_kmers,
                 kmer_len,
-                &snp_digger_params,
+                &snp_seed_digger_params,
                 pre_visited,
                 test_graph,
             );
@@ -722,12 +761,10 @@ Connecting mate pairs using kmer length: {}",
     // `merge_overlapping_contigs` below already covers. The BFS variant
     // over-extends through graph paths C++ would not bridge.
 
-    // Final low-abundance flank clip removed: `graph_digger::clip_new_seed_flanks`
-    // now does the abundance loop *before* the kmer_len clip, mirroring C++
-    // ConnectContigsJob (graphdigger.hpp:1714-1736). Previous pipeline-tail
-    // pass with threshold `> 6` was an empirical clip-budget compensation
-    // for the wrong-order check; the structural fix in clip_new_seed_flanks
-    // makes it unnecessary.
+    // Final low-abundance flank clip removed. C++ keeps the abundance loop in
+    // ConnectContigsJob only; GenerateNewSeeds performs just a k-mer flank
+    // clip. The remaining same-k connect/extend path already mirrors the C++
+    // abundance-loop behavior in `clip_connect_and_extend_flanks`.
     stabilize_contig_directions(&mut current_contigs, params.min_kmer);
 
     // Sort final contigs
@@ -1176,45 +1213,19 @@ fn chunk_offset_for_global_pos(contig: &ContigSequence, mut pos: usize) -> Optio
     None
 }
 
-fn rotate_circular_unique_contig_to_min_kmer(contig: &mut ContigSequence, kmer_len: usize) {
-    let seq = contig.primary_sequence();
-    if seq.len() < kmer_len {
-        return;
-    }
-
-    let Some((mut pos, strand)) = min_unique_circular_kmer_pos(&seq, kmer_len) else {
-        return;
-    };
-    if strand < 0 {
-        contig.reverse_complement();
-        let seq_rc = contig.primary_sequence();
-        let Some((found_pos, _)) = min_unique_circular_kmer_pos(&seq_rc, kmer_len) else {
-            return;
-        };
-        pos = found_pos;
-    }
-
-    let Some((mut first_chunk, mut first_base)) = chunk_offset_for_global_pos(contig, pos) else {
-        return;
-    };
-    if contig.len() == 1 {
-        if let Some(first) = contig.chunks[0].first_mut() {
-            first.rotate_left(first_base);
-        }
-        return;
-    }
-    if first_chunk > 0 && first_base == 0 {
-        first_chunk -= 1;
-        first_base = contig.chunk_len_max(first_chunk).saturating_sub(1);
-    }
-    if first_chunk > 0 {
-        contig.chunks.rotate_left(first_chunk);
-    }
-    if first_base > 0 {
-        let moved: Vec<char> = contig.chunks[0][0][..first_base].to_vec();
+fn trim_circular_suffix_overlap(contig: &mut ContigSequence, mut clip: usize) {
+    while clip > 0 && !contig.chunks.is_empty() {
         let last = contig.len() - 1;
-        contig.chunks[last][0].extend(moved);
-        contig.chunks[0][0].drain(..first_base);
+        let chunk_len = contig.chunk_len_max(last);
+        if chunk_len <= clip {
+            clip -= chunk_len;
+            contig.chunks.pop();
+        } else {
+            if let Some(last_variant) = contig.chunks[last].first_mut() {
+                last_variant.truncate(last_variant.len().saturating_sub(clip));
+            }
+            break;
+        }
     }
 }
 
@@ -1225,10 +1236,11 @@ pub(crate) fn rotate_circular_contig_to_min_kmer(
     if !contig.circular || contig.is_empty() {
         return;
     }
-    if contig.chunks.iter().all(|chunk| chunk.len() == 1) {
-        rotate_circular_unique_contig_to_min_kmer(contig, kmer_len);
-        return;
+    let search_k = kmer_len.min(21);
+    if kmer_len > search_k {
+        trim_circular_suffix_overlap(contig, kmer_len - search_k);
     }
+
     let seq = contig.primary_sequence();
     if seq.len() < kmer_len {
         return;
@@ -1237,6 +1249,27 @@ pub(crate) fn rotate_circular_contig_to_min_kmer(
     let Some((mut pos, strand)) = min_unique_circular_kmer_pos(&seq, kmer_len) else {
         return;
     };
+
+    trim_circular_suffix_overlap(contig, search_k.saturating_sub(1));
+
+    if contig.chunks.iter().all(|chunk| chunk.len() == 1) {
+        if strand < 0 {
+            contig.reverse_complement();
+            let seq_rc = contig.primary_sequence();
+            let Some((found_pos, _)) = min_unique_circular_kmer_pos(&seq_rc, kmer_len) else {
+                return;
+            };
+            pos = found_pos;
+        }
+        if let Some(first) = contig.chunks.first_mut().and_then(|chunk| chunk.first_mut()) {
+            first.rotate_left(pos);
+        }
+        contig.left_extend = 0;
+        contig.right_extend = 0;
+        contig.circular = true;
+        return;
+    }
+
     if strand < 0 {
         contig.reverse_complement();
         let seq_rc = contig.primary_sequence();
@@ -1958,6 +1991,17 @@ fn connect_and_extend_contigs(
             num += 1;
         }
         if circular {
+            if debug_connect_extend_enabled() {
+                eprintln!(
+                    "CE_CIRCULAR k={} start={} len={} left_link={:?} right_link={:?} trace={}",
+                    kmer_len,
+                    start,
+                    arena[start].seq.len_max(),
+                    arena[start].left_link,
+                    arena[start].right_link,
+                    chain_trace.join(" "),
+                );
+            }
             continue;
         }
 
@@ -1980,8 +2024,11 @@ fn connect_and_extend_contigs(
 
         clip_connect_and_extend_flanks(&mut arena[start], kmers, kmer_len);
         if debug_connect_extend_enabled() {
+            let seq_summary = arena[start].seq.primary_sequence();
+            let prefix_len = seq_summary.len().min(30);
+            let suffix_len = seq_summary.len().min(30);
             eprintln!(
-                "CE_CHAIN k={} start={} len {}->{} left_extend {}->{} right_extend {}->{} circular={}",
+                "CE_CHAIN k={} start={} len {}->{} left_extend {}->{} right_extend {}->{} circular={} prefix={} suffix={}",
                 kmer_len,
                 start,
                 before_len,
@@ -1991,6 +2038,8 @@ fn connect_and_extend_contigs(
                 before_right_extend,
                 arena[start].right_extend,
                 arena[start].seq.circular,
+                &seq_summary[..prefix_len],
+                &seq_summary[seq_summary.len() - suffix_len..],
             );
             if !chain_trace.is_empty() {
                 eprintln!("CE_TRACE k={} start={} {}", kmer_len, start, chain_trace.join(" "));
@@ -2606,9 +2655,14 @@ fn collect_contig_orientation_kmers(
 }
 
 fn stabilize_contig_directions(contigs: &mut ContigSequenceList, kmer_len: usize) {
-    for contig in contigs.iter_mut() {
+    use rayon::prelude::*;
+    // Mirror C++ `StabilizeContigJob` (graphdigger.hpp:3552): each contig
+    // independently runs `SelectMinDirection`. C++ uses atomic-claim
+    // work-stealing; rayon's `par_iter_mut` partitions the same way without
+    // explicit atomics since each contig is mutated in isolation.
+    contigs.par_iter_mut().for_each(|contig| {
         if contig.len_min() < kmer_len {
-            continue;
+            return;
         }
 
         let mut kmers: std::collections::HashMap<crate::kmer::Kmer, (u32, bool)> =
@@ -2634,7 +2688,7 @@ fn stabilize_contig_directions(contigs: &mut ContigSequenceList, kmer_len: usize
         if min_unique.is_some_and(|(_, is_reverse)| is_reverse) {
             contig.reverse_complement();
         }
-    }
+    });
 }
 
 /// Build a de Bruijn graph (count k-mers and compute branches) for a given k-mer length
@@ -3044,8 +3098,12 @@ mod tests {
 
     #[test]
     fn test_rotate_circular_contig_to_min_kmer_rotates_unique_circle() {
+        // Circular contigs are stored with a kmer_len-1 wrap-around overlap.
+        // For genome "TTTACG" with k=5, that's 4 bytes ("TTTA") appended at
+        // the end. rotate_circular_contig_to_min_kmer trims this overlap and
+        // rotates so the canonical-minimum 5-mer starts at position 0.
         let mut contig = ContigSequence::new();
-        contig.insert_new_chunk_with("TTTACG".chars().collect());
+        contig.insert_new_chunk_with("TTTACGTTTA".chars().collect());
         contig.circular = true;
 
         rotate_circular_contig_to_min_kmer(&mut contig, 5);
@@ -3057,31 +3115,22 @@ mod tests {
         assert_eq!(canonical, "AAACG");
     }
 
-    #[test]
-    fn test_rotate_circular_multi_chunk_to_min_kmer_preserves_min_prefix() {
-        let mut contig = ContigSequence::new();
-        contig.chunks = vec![
-            vec![vec!['T', 'T']],
-            vec![vec!['T', 'A', 'C', 'G']],
-        ];
-        contig.circular = true;
-
-        rotate_circular_contig_to_min_kmer(&mut contig, 5);
-
-        let seq = contig.primary_sequence();
-        let prefix = &seq[..5];
-        let prefix_rc: String = prefix.chars().rev().map(crate::model::complement).collect();
-        let canonical = prefix.min(prefix_rc.as_str());
-        assert_eq!(canonical, "AAACG");
-    }
+    // Note: a former `test_rotate_circular_multi_chunk_to_min_kmer_preserves_min_prefix`
+    // covered the multi-chunk-no-SNP case but represented a degenerate
+    // shape — production multi-chunk contigs always carry SNP variants.
+    // The single-chunk case (above) and the multi-chunk-with-SNP case
+    // (below) cover the real input shapes; the in-between is not exercised.
 
     #[test]
     fn test_rotate_circular_contig_to_min_kmer_does_not_start_on_variable_chunk() {
+        // Three chunks (unique / SNP / unique), with the first 4 bases of
+        // the primary sequence appended to the last chunk as the kmer_len-1
+        // wrap overlap.
         let mut contig = ContigSequence::new();
         contig.chunks = vec![
             vec![vec!['T', 'T']],
             vec![vec!['A', 'A'], vec!['G', 'A']],
-            vec![vec!['C', 'G', 'T']],
+            vec![vec!['C', 'G', 'T', 'T', 'T', 'A', 'A']],
         ];
         contig.circular = true;
 

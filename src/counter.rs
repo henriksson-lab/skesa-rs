@@ -23,10 +23,12 @@ use rayon::slice::ParallelSliceMut;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 
-/// Internal storage — flat for precision=1, general for precision>1.
+/// Internal storage — flat for precision=1 (kmer fits inline as u64),
+/// general for precision>1 (kmer stored in `Box<[u64]>` for inline-key
+/// efficiency: same payload size as `Vec<u64>` minus the capacity field).
 enum Storage {
     Flat(Vec<(u64, u64)>),
-    General(Vec<(Vec<u64>, u64)>),
+    General(Vec<(Box<[u64]>, u64)>),
 }
 
 #[derive(Default)]
@@ -140,7 +142,7 @@ impl KmerCount {
         } else {
             let mut entries = Vec::with_capacity(size_hint);
             for (val, count) in iter {
-                entries.push((vec![val], count));
+                entries.push((vec![val].into_boxed_slice(), count));
             }
             KmerCount {
                 storage: Storage::General(entries),
@@ -156,11 +158,12 @@ impl KmerCount {
         match &mut self.storage {
             Storage::Flat(v) => v.push((kmer.get_val(), count)),
             Storage::General(v) => {
-                // Borrow the kmer's internal words and copy only the
-                // `precision` prefix into the storage Vec — one alloc per
-                // push instead of two (was: to_words() then to_vec() of
-                // the slice).
-                v.push((kmer.as_words()[..self.precision].to_vec(), count));
+                // Box<[u64]> — same heap payload as Vec<u64> but without the
+                // capacity field. One allocation per push.
+                v.push((
+                    kmer.as_words()[..self.precision].to_vec().into_boxed_slice(),
+                    count,
+                ));
             }
         }
         self.hash_index = None;
@@ -231,14 +234,14 @@ impl KmerCount {
                     let hash = kmer.oahash();
                     if let Some(indices) = index.get(&hash) {
                         for &idx in indices {
-                            if v[idx].0.as_slice() == key {
+                            if &*v[idx].0 == key {
                                 return idx;
                             }
                         }
                     }
                     v.len()
                 } else {
-                    match v.binary_search_by(|e| e.0.as_slice().cmp(key)) {
+                    match v.binary_search_by(|e| (*e.0).cmp(key)) {
                         Ok(idx) => idx,
                         Err(_) => v.len(),
                     }
@@ -422,7 +425,7 @@ impl KmerCount {
                 }
                 reader.read_exact(&mut buf8)?;
                 let count = u64::from_ne_bytes(buf8);
-                entries.push((key, count));
+                entries.push((key.into_boxed_slice(), count));
             }
             Ok(KmerCount {
                 storage: Storage::General(entries),
@@ -480,7 +483,7 @@ fn sort_and_uniq_flat(v: &mut Vec<(u64, u64)>, min_count: u32) {
     v.truncate(write);
 }
 
-fn sort_and_uniq_general(v: &mut Vec<(Vec<u64>, u64)>, min_count: u32) {
+fn sort_and_uniq_general(v: &mut Vec<(Box<[u64]>, u64)>, min_count: u32) {
     if v.is_empty() {
         return;
     }

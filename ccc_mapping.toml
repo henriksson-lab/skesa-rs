@@ -1130,14 +1130,30 @@ other = "AvailableMemory"
 rust = "build_kmer_to_contig_map"
 other = "AssembledKmersJob"
 
-# ConverToSContigAndMarkVisited / Job collapse into the assembly loop's
-# visited-tracking and LinkedContig conversion in Rust; no separate step.
+# `assemble_contigs_with_visited` is the Rust analog of C++
+# `GenerateNewSeeds`: it iterates over graph nodes, assembles seed contigs,
+# and calls `connect_fragments_from_contigs_with_graph` (the analog of C++
+# `SContig::ConnectFragments`). The post-assembly clipping step is split
+# out into `clip_new_seed_flanks` and `finalize_new_seed_contigs`.
 [[entries]]
 rust = "assemble_contigs_with_visited"
-other = "ConverToSContigAndMarkVisited"
+other = "GenerateNewSeeds"
 
 [[entries]]
 rust = "assemble_contigs_with_visited"
+other = "NewSeedsJob"
+
+# ConverToSContigAndMarkVisited / Job (assembler.hpp:806-856) converts the
+# previous-iteration `m_contigs.back()` list to SContigs and marks their
+# kmers visited in the new graph. Rust folds this into the per-iteration
+# preamble inside `run_assembly` (see assembler.rs handling of `prev_contigs`
+# before each call to `assemble_contigs_with_visited`).
+[[entries]]
+rust = "run_assembly"
+other = "ConverToSContigAndMarkVisited"
+
+[[entries]]
+rust = "run_assembly"
 other = "ConverToSContigAndMarkVisitedJob"
 
 # ImproveContigs is inlined into run_assembly's per-iteration flow.

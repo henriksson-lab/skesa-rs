@@ -850,6 +850,30 @@ fn connect_fragments_impl(contigs: &mut Vec<LinkedContig>, kmers: Option<&KmerCo
         idx += 1;
         keep
     });
+
+    if debug {
+        for contig in contigs.iter() {
+            eprintln!(
+                "RUST_CF_POST seq_len={} empty={} next_left={} next_right={} left_link={:?} right_link={:?} prefix={} suffix={}",
+                contig.seq.len_max(),
+                contig.empty_linker(),
+                debug_kmer_summary(contig.next_left, kmer_len),
+                debug_kmer_summary(contig.next_right, kmer_len),
+                contig.left_link,
+                contig.right_link,
+                {
+                    let s = contig.seq.primary_sequence();
+                    let n = s.len().min(30);
+                    s[..n].to_string()
+                },
+                {
+                    let s = contig.seq.primary_sequence();
+                    let n = s.len().min(30);
+                    s[s.len() - n..].to_string()
+                },
+            );
+        }
+    }
 }
 
 /// Convert ContigSequences to LinkedContigs, run ConnectFragments, and convert back.

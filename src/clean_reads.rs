@@ -486,97 +486,101 @@ pub fn clean_reads(
     let contig_left_reps: Vec<i32> = contigs.iter().map(|c| c.left_repeat).collect();
     let contig_right_reps: Vec<i32> = contigs.iter().map(|c| c.right_repeat).collect();
 
-    let mut cleaned = Vec::with_capacity(reads.len());
+    // Mirror C++ `RemoveUsedReads` (assembler.hpp:658-664): one job per
+    // input ReadPair group, parallelized via `RunThreads(ncores, jobs)`.
+    use rayon::prelude::*;
+    reads
+        .par_iter()
+        .map(|rp| {
+            let mut cleaned_paired = ReadHolder::new(true);
+            let mut cleaned_unpaired = ReadHolder::new(false);
 
-    for rp in reads {
-        let mut cleaned_paired = ReadHolder::new(true);
-        let mut cleaned_unpaired = ReadHolder::new(false);
+            // Process paired reads
+            if rp[0].read_num() > 0 {
+                let mut si = rp[0].string_iter();
+                while !si.at_end() {
+                    let read1 = si.get();
+                    si.advance();
+                    if si.at_end() {
+                        break;
+                    }
+                    let read2 = si.get();
+                    si.advance();
 
-        // Process paired reads
-        if rp[0].read_num() > 0 {
-            let mut si = rp[0].string_iter();
-            while !si.at_end() {
-                let read1 = si.get();
-                si.advance();
-                if si.at_end() {
-                    break;
-                }
-                let read2 = si.get();
-                si.advance();
+                    // C++ pushes short-mate pairs into raw_reads[1] hoping they'd
+                    // be reused as unpaired (assembler.hpp:564-566), but the
+                    // unpaired loop's `if(rlen < kmer_len) continue;` immediately
+                    // drops them on the way out. Effective behavior: dropped.
+                    if read1.len() < kmer_len || read2.len() < kmer_len {
+                        continue;
+                    }
 
-                // C++ pushes short-mate pairs into raw_reads[1] hoping they'd
-                // be reused as unpaired (assembler.hpp:564-566), but the
-                // unpaired loop's `if(rlen < kmer_len) continue;` immediately
-                // drops them on the way out. Effective behavior: dropped.
-                if read1.len() < kmer_len || read2.len() < kmer_len {
-                    continue;
-                }
+                    let pos1 = find_read_position(&read1, kmer_len, &map, contigs);
+                    let pos2 = find_read_position(&read2, kmer_len, &map, contigs);
+                    let m = margin as i32;
+                    // C++ `RemoveUsedReadsJob` (assembler.hpp:581-595) uses
+                    // `insert_size` directly in the deep-pair check.
+                    let span = insert_size as i32;
 
-                let pos1 = find_read_position(&read1, kmer_len, &map, contigs);
-                let pos2 = find_read_position(&read2, kmer_len, &map, contigs);
-                let m = margin as i32;
-                let span = insert_size.max(read1.len().max(read2.len())) as i32;
-
-                let should_remove = if let Some((p1, plus1, ci1)) = pos1 {
-                    if pair_span_is_deep(p1, plus1, &contigs[ci1], m, span) {
-                        true
-                    } else if let Some((p2, plus2, ci2)) = pos2 {
-                        if pair_span_is_deep(p2, plus2, &contigs[ci2], m, span) {
+                    let should_remove = if let Some((p1, plus1, ci1)) = pos1 {
+                        if pair_span_is_deep(p1, plus1, &contigs[ci1], m, span) {
                             true
-                        } else if ci1 == ci2 && plus1 != plus2 {
-                            let clen = contig_lens[ci1] as i32;
-                            let lr = contig_left_reps[ci1];
-                            let rr = contig_right_reps[ci1];
-                            (plus1 > 0 && p1 >= m + lr && p2 < clen - m - rr)
-                                || (plus1 < 0 && p2 >= m + lr && p1 < clen - m - rr)
+                        } else if let Some((p2, plus2, ci2)) = pos2 {
+                            if pair_span_is_deep(p2, plus2, &contigs[ci2], m, span) {
+                                true
+                            } else if ci1 == ci2 && plus1 != plus2 {
+                                let clen = contig_lens[ci1] as i32;
+                                let lr = contig_left_reps[ci1];
+                                let rr = contig_right_reps[ci1];
+                                (plus1 > 0 && p1 >= m + lr && p2 < clen - m - rr)
+                                    || (plus1 < 0 && p2 >= m + lr && p1 < clen - m - rr)
+                            } else {
+                                false
+                            }
                         } else {
                             false
                         }
+                    } else if let Some((p2, plus2, ci2)) = pos2 {
+                        pair_span_is_deep(p2, plus2, &contigs[ci2], m, span)
                     } else {
                         false
-                    }
-                } else if let Some((p2, plus2, ci2)) = pos2 {
-                    pair_span_is_deep(p2, plus2, &contigs[ci2], m, span)
-                } else {
-                    false
-                };
+                    };
 
-                if !should_remove {
-                    cleaned_paired.push_back_str(&read1);
-                    cleaned_paired.push_back_str(&read2);
+                    if !should_remove {
+                        cleaned_paired.push_back_str(&read1);
+                        cleaned_paired.push_back_str(&read2);
+                    }
                 }
             }
-        }
 
-        // Process unpaired reads
-        if rp[1].read_num() > 0 {
-            let mut si = rp[1].string_iter();
-            while !si.at_end() {
-                let read = si.get();
-                si.advance();
+            // Process unpaired reads
+            if rp[1].read_num() > 0 {
+                let mut si = rp[1].string_iter();
+                while !si.at_end() {
+                    let read = si.get();
+                    si.advance();
 
-                if read.len() < kmer_len {
-                    continue;
-                }
-
-                let pos = find_read_position(&read, kmer_len, &map, contigs);
-                let should_remove = match pos {
-                    Some((p, plus, ci)) => {
-                        read_is_deep(p, plus, &contigs[ci], margin as i32, read.len() as i32)
+                    if read.len() < kmer_len {
+                        continue;
                     }
-                    None => false,
-                };
 
-                if !should_remove {
-                    cleaned_unpaired.push_back_str(&read);
+                    let pos = find_read_position(&read, kmer_len, &map, contigs);
+                    let should_remove = match pos {
+                        Some((p, plus, ci)) => {
+                            read_is_deep(p, plus, &contigs[ci], margin as i32, read.len() as i32)
+                        }
+                        None => false,
+                    };
+
+                    if !should_remove {
+                        cleaned_unpaired.push_back_str(&read);
+                    }
                 }
             }
-        }
 
-        cleaned.push([cleaned_paired, cleaned_unpaired]);
-    }
-
-    cleaned
+            [cleaned_paired, cleaned_unpaired]
+        })
+        .collect()
 }
 
 pub fn clean_pair_connection_reads(

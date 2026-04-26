@@ -142,23 +142,60 @@ fn kmer_plus_fraction(
 fn graph_successors(
     node: crate::kmer::Kmer,
     kmers: &KmerCount,
-    _kmer_len: usize,
+    kmer_len: usize,
     is_stranded: bool,
 ) -> Vec<PairSuccessor> {
-    let graph = pair_graph(kmers, is_stranded);
-    let graph_node = graph.get_node(&node);
-    if !graph_node.is_valid() {
-        return Vec::new();
+    let mut out = Vec::with_capacity(4);
+    fill_graph_successors(node, kmers, kmer_len, is_stranded, &mut out);
+    out
+}
+
+fn fill_graph_successors(
+    node: crate::kmer::Kmer,
+    kmers: &KmerCount,
+    kmer_len: usize,
+    _is_stranded: bool,
+    out: &mut Vec<PairSuccessor>,
+) {
+    // Specialized hot-path version of `db_graph::SortedDbGraph::get_node_successors`
+    // that fills a caller-owned buffer (so BFS callers can reuse it across
+    // expansions) and returns the oriented next kmer directly instead of
+    // round-tripping through Successor->Node->get_node_kmer.
+    out.clear();
+    let node_rc = node.revcomp(kmer_len);
+    let is_minus = node_rc < node;
+    let canonical = if is_minus { node_rc } else { node };
+    let node_idx = kmers.find(&canonical);
+    if node_idx >= kmers.size() {
+        return;
     }
-    graph
-        .get_node_successors(&graph_node)
-        .into_iter()
-        .map(|suc| PairSuccessor {
-            kmer: graph.get_node_kmer(&suc.node),
-            nt: suc.nt,
-            abundance: graph.abundance(&suc.node) as u32,
-        })
-        .collect()
+    let count_word = kmers.get_count(node_idx);
+    let branch_info = (count_word >> 32) as u8;
+    let bits = if is_minus { branch_info >> 4 } else { branch_info & 0x0F };
+    if bits == 0 {
+        return;
+    }
+    let max_kmer = crate::kmer::Kmer::from_chars(kmer_len, std::iter::repeat_n('G', kmer_len));
+    let shifted = node.shl(2) & max_kmer;
+    const BIN2NT: [char; 4] = ['A', 'C', 'T', 'G'];
+    for nt in 0..4u64 {
+        if bits & (1 << nt) == 0 {
+            continue;
+        }
+        let next_kmer = shifted + nt;
+        let next_rc = next_kmer.revcomp(kmer_len);
+        let next_canonical = if next_rc < next_kmer { next_rc } else { next_kmer };
+        let next_idx = kmers.find(&next_canonical);
+        if next_idx >= kmers.size() {
+            continue;
+        }
+        let total_count = (kmers.get_count(next_idx) & 0xFFFF_FFFF) as u32;
+        out.push(PairSuccessor {
+            kmer: next_kmer,
+            nt: BIN2NT[nt as usize],
+            abundance: total_count,
+        });
+    }
 }
 
 fn filter_successors(
@@ -529,7 +566,10 @@ fn connect_two_nodes_cpp(
     let debug_target = debug_connect_two_nodes_target(first_node, last_node, kmer_len);
     let mut storage: Vec<Link> = Vec::new();
     let mut current: PairNodeMap<Option<usize>> = PairNodeMap::default();
-    let mut successors = graph_successors(first_node, kmers, kmer_len, is_stranded);
+    // Reuse a single successor buffer across all BFS expansions so we don't
+    // allocate one Vec per node frontier (was 2.10% memmove in the profile).
+    let mut successors: Vec<PairSuccessor> = Vec::with_capacity(4);
+    fill_graph_successors(first_node, kmers, kmer_len, is_stranded, &mut successors);
     filter_successors_connect_two_nodes(&mut successors, kmers, fraction, low_count, is_stranded);
     if debug_target {
         eprintln!(
@@ -544,8 +584,8 @@ fn connect_two_nodes_cpp(
         );
     }
     current.reserve(successors.len());
-    for suc in successors {
-        storage.push(Link { prev: None, suc });
+    for suc in &successors {
+        storage.push(Link { prev: None, suc: *suc });
         let idx = storage.len() - 1;
         current.insert(suc.kmer, Some(idx));
     }
@@ -566,7 +606,7 @@ fn connect_two_nodes_cpp(
         let mut next_current: PairNodeMap<Option<usize>> = PairNodeMap::default();
         next_current.reserve(current.len().saturating_mul(2));
         for (node, link) in current {
-            let mut successors = graph_successors(node, kmers, kmer_len, is_stranded);
+            fill_graph_successors(node, kmers, kmer_len, is_stranded, &mut successors);
             filter_successors_connect_two_nodes(
                 &mut successors,
                 kmers,
@@ -588,10 +628,10 @@ fn connect_two_nodes_cpp(
                 );
             }
             if let Some(prev) = link {
-                for suc in successors {
+                for suc in &successors {
                     storage.push(Link {
                         prev: Some(prev),
-                        suc,
+                        suc: *suc,
                     });
                     let idx = storage.len() - 1;
                     if suc.kmer == last_node {
@@ -622,7 +662,7 @@ fn connect_two_nodes_cpp(
                     }
                 }
             } else {
-                for suc in successors {
+                for suc in &successors {
                     next_current.insert(suc.kmer, None);
                     if suc.kmer == last_node {
                         if debug_target {
@@ -936,19 +976,91 @@ fn connect_pairs_impl(
     low_count: usize,
     is_stranded: bool,
 ) -> ConnectionResult {
+    use rayon::prelude::*;
     let max_steps = insert_size;
+    let debug_pair_job = debug_pair_job_enabled();
+
+    // Mirror C++ `CDBGraphDigger::ConnectPairs` (graphdigger.hpp:3268-3279)
+    // which spawns one `ConnectPairsJob` per input ReadHolder group and
+    // runs them in parallel via `RunThreads(ncores, jobs)`.
+    let per_group: Vec<(ConnectionResult, usize)> = reads
+        .par_iter()
+        .map(|read_pair| {
+            connect_pairs_one_group(
+                read_pair,
+                kmers,
+                kmer_len,
+                max_steps,
+                extend_connected,
+                fraction,
+                low_count,
+                is_stranded,
+                debug_pair_job,
+            )
+        })
+        .collect();
 
     let mut connected = ReadHolder::new(false);
     let mut not_connected = ReadHolder::new(true);
     let mut num_connected = 0usize;
     let mut num_ambiguous = 0usize;
     let mut total_pairs = 0usize;
-    let debug_pair_job = debug_pair_job_enabled();
+    for (group, group_total) in per_group {
+        let mut iter = group.connected.string_iter();
+        while !iter.at_end() {
+            connected.push_back_str(&iter.get());
+            iter.advance();
+        }
+        let mut iter = group.not_connected.string_iter();
+        while !iter.at_end() {
+            not_connected.push_back_str(&iter.get());
+            iter.advance();
+        }
+        num_connected += group.num_connected;
+        num_ambiguous += group.num_ambiguous;
+        total_pairs += group_total;
+    }
+    eprintln!(
+        "Connected: {} ambiguously connected: {} from {} mate pairs",
+        num_connected, num_ambiguous, total_pairs
+    );
+    ConnectionResult {
+        connected,
+        not_connected,
+        num_connected,
+        num_ambiguous,
+    }
+}
 
-    for read_pair in reads {
+#[allow(clippy::too_many_arguments)]
+fn connect_pairs_one_group(
+    read_pair: &ReadPair,
+    kmers: &KmerCount,
+    kmer_len: usize,
+    max_steps: usize,
+    extend_connected: bool,
+    fraction: f64,
+    low_count: usize,
+    is_stranded: bool,
+    debug_pair_job: bool,
+) -> (ConnectionResult, usize) {
+    let mut connected = ReadHolder::new(false);
+    let mut not_connected = ReadHolder::new(true);
+    let mut num_connected = 0usize;
+    let mut num_ambiguous = 0usize;
+    let mut total_pairs = 0usize;
+    {
         let holder = &read_pair[0];
         if holder.read_num() < 2 {
-            continue;
+            return (
+                ConnectionResult {
+                    connected,
+                    not_connected,
+                    num_connected,
+                    num_ambiguous,
+                },
+                total_pairs,
+            );
         }
 
         let mut si = holder.string_iter();
@@ -1147,18 +1259,15 @@ fn connect_pairs_impl(
             }
         }
     }
-
-    eprintln!(
-        "Connected: {} ambiguously connected: {} from {} mate pairs",
-        num_connected, num_ambiguous, total_pairs
-    );
-
-    ConnectionResult {
-        connected,
-        not_connected,
-        num_connected,
-        num_ambiguous,
-    }
+    (
+        ConnectionResult {
+            connected,
+            not_connected,
+            num_connected,
+            num_ambiguous,
+        },
+        total_pairs,
+    )
 }
 
 #[cfg(test)]

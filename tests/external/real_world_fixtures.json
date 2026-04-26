@@ -1,0 +1,28 @@
+{
+  "fixtures": [
+    {
+      "id": "err486835_mgenitalium",
+      "accession": "ERR486835",
+      "organism": "Mycoplasmoides genitalium",
+      "library_layout": "PAIRED",
+      "subset_records_per_file": 5000,
+      "notes": "Public ENA/SRA paired-end bacterial WGS run kept external because vendoring even small real reads would bloat the repository. The integration test uses the first 5k records per mate after download so the real-world parity check stays practical.",
+      "source_urls": [
+        "https://www.ncbi.nlm.nih.gov/sra/ERX452667",
+        "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=ERR486835&result=read_run&fields=run_accession,fastq_ftp,fastq_md5,fastq_bytes&format=tsv&download=false"
+      ]
+    },
+    {
+      "id": "srr1703350_skesa_readme_example",
+      "accession": "SRR1703350",
+      "organism": "README example paired-end run",
+      "library_layout": "PAIRED",
+      "subset_records_per_file": 5000,
+      "notes": "Public paired-end run referenced in the upstream SKESA README as an example using separate mate files. Used for an ignored multi-iteration Rust-vs-bundled-C++ parity test on a practical real-world subset.",
+      "source_urls": [
+        "https://github.com/ncbi/SKESA",
+        "https://www.ebi.ac.uk/ena/portal/api/filereport?accession=SRR1703350&result=read_run&fields=run_accession,fastq_ftp,fastq_md5,fastq_bytes&format=tsv&download=false"
+      ]
+    }
+  ]
+}

@@ -7,7 +7,7 @@
 /// compatibility — the kmer_iterator reads consecutive bits without reversal.
 ///
 /// Encoding: A=0, C=1, T=2, G=3 (matching LargeInt's bin2NT)
-use crate::kmer::Kmer;
+use crate::kmer::{Kmer, MAX_PREC};
 
 const BIN2NT: [char; 4] = ['A', 'C', 'T', 'G'];
 
@@ -50,8 +50,14 @@ impl ReadHolder {
         }
     }
 
+    fn reserve_for_read(&mut self, len: usize) {
+        self.read_length.reserve(1);
+        self.storage.reserve((2 * len).div_ceil(64) + 1);
+    }
+
     /// Insert a read from a string (stores in reverse for k-mer compatibility)
     pub fn push_back_str(&mut self, read: &str) {
+        self.reserve_for_read(read.len());
         let mut shift = (self.total_seq * 2) % 64;
         let mut read_len: u32 = 0;
         // Iterate in reverse (matches C++ `read.rbegin()..read.rend()`)
@@ -69,6 +75,7 @@ impl ReadHolder {
 
     /// Insert a read from a slice of chars (stores in reverse)
     pub fn push_back_chars(&mut self, read: &[char]) {
+        self.reserve_for_read(read.len());
         let mut shift = (self.total_seq * 2) % 64;
         let len = read.len() as u32;
         // Iterate in reverse
@@ -81,6 +88,26 @@ impl ReadHolder {
         }
         self.read_length.push(len);
         self.total_seq += len as usize;
+    }
+
+    /// Insert a read from another holder iterator by copying packed bits.
+    pub fn push_back_iter(&mut self, iter: &StringIterator<'_>) {
+        let read_len = iter.read_len();
+        self.read_length.push(read_len as u32);
+        let destination_first_bit = 2 * self.total_seq;
+        self.total_seq += read_len;
+        self.storage.resize((2 * self.total_seq).div_ceil(64), 0);
+
+        let bit_from = iter.position;
+        let bit_to = bit_from + 2 * read_len;
+        let dest_size = self.storage.len();
+        iter.holder.copy_bits(
+            bit_from,
+            bit_to,
+            &mut self.storage,
+            destination_first_bit,
+            dest_size,
+        );
     }
 
     /// Swap contents with another ReadHolder
@@ -299,6 +326,22 @@ impl ReadHolder {
         }
     }
 
+    /// Create a string iterator starting at read index `read`.
+    pub fn string_iter_at(&self, read: usize) -> StringIterator<'_> {
+        let read = read.min(self.read_length.len());
+        let position = 2 * self
+            .read_length
+            .iter()
+            .take(read)
+            .map(|&len| len as usize)
+            .sum::<usize>();
+        StringIterator {
+            holder: self,
+            position,
+            read,
+        }
+    }
+
     /// Create a string end sentinel
     pub fn string_end(&self) -> StringIterator<'_> {
         StringIterator {
@@ -329,23 +372,23 @@ impl<'a> KmerIterator<'a> {
             return Kmer::from_u64(kmer_len, val);
         }
         let num_words = (2 * kmer_len).div_ceil(64);
-        let mut buf = vec![0u64; num_words];
+        let mut buf = [0u64; MAX_PREC];
         self.holder.copy_bits(
             self.position,
             self.position + 2 * kmer_len,
-            &mut buf,
+            &mut buf[..num_words],
             0,
             num_words,
         );
         let mut kmer = Kmer::zero(kmer_len);
-        kmer.copy_words_from(&buf);
+        kmer.copy_words_from(&buf[..num_words]);
         kmer
     }
 
     /// Fast extraction of single-word k-mer value (kmer_len <= 32).
     /// Extracts bits directly from storage without heap allocation.
     #[inline]
-    fn get_val_p1(&self) -> u64 {
+    pub(crate) fn get_val_p1(&self) -> u64 {
         let kmer_len = self.kmer_len as usize;
         let bit_len = 2 * kmer_len;
         let word_idx = self.position / 64;

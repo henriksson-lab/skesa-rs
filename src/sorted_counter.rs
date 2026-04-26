@@ -9,7 +9,7 @@ use crate::counter::KmerCount;
 use crate::flat_counter::FlatKmerCount;
 use crate::histogram::Bins;
 use crate::kmer::Kmer;
-use crate::large_int::LargeInt;
+use crate::large_int::{oahash64, LargeInt};
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
 
@@ -223,6 +223,20 @@ fn count_chunked(
             })
             .collect();
 
+        if raw.len() == 1 {
+            let buckets = raw.into_iter().next().unwrap();
+            let cycle_uniq: Vec<KmerCount> = buckets
+                .into_par_iter()
+                .map(|mut bucket| {
+                    bucket.sort_and_uniq(min_count as u32);
+                    bucket.shrink_to_fit();
+                    bucket
+                })
+                .collect();
+            all_sorted_buckets.extend(cycle_uniq);
+            continue;
+        }
+
         // For each bucket index in this cycle's range, merge the per-ReadPair
         // contributions, sort, and uniq. Buckets in this cycle process in
         // parallel — they're independent.
@@ -236,6 +250,7 @@ fn count_chunked(
                     merged.push_back_elements_from(&partial[bucket_offset]);
                 }
                 merged.sort_and_uniq(min_count as u32);
+                merged.shrink_to_fit();
                 merged
             })
             .collect();
@@ -247,17 +262,19 @@ fn count_chunked(
         all_sorted_buckets.extend(cycle_uniq);
     }
 
-    let total_unique: usize = all_sorted_buckets.iter().map(|b| b.size()).sum();
-    eprintln!("Distinct kmers: {}", total_unique);
+    eprintln!(
+        "Distinct kmers: {}",
+        all_sorted_buckets.iter().map(|b| b.size()).sum::<usize>()
+    );
 
     // Final merge: kmers from different hash buckets are disjoint, so we can
     // concatenate (in any order) and sort. Peak memory ≈ total_unique + sort
     // scratch — same order as a hierarchical pairwise merge.
-    let mut final_count = KmerCount::new(kmer_len);
-    final_count.reserve(total_unique);
+    let mut final_count = all_sorted_buckets
+        .pop()
+        .unwrap_or_else(|| KmerCount::new(kmer_len));
     for bucket in all_sorted_buckets.drain(..) {
-        final_count.push_back_elements_from(&bucket);
-        // bucket drops here, freeing its memory before the next iteration.
+        final_count.append_elements_from(bucket);
     }
     final_count.sort();
     final_count
@@ -293,15 +310,13 @@ fn spawn_kmers_into_buckets(
     let mut ki = holder.kmer_iter(kmer_len);
     if kmer_len <= 32 {
         while !ki.at_end() {
-            let kmer = ki.get();
-            let val = kmer.get_val();
-            let large = LargeInt::<1>::new(val);
-            let rc_val = large.revcomp(kmer_len).get_val();
+            let val = ki.get_val_p1();
+            let rc_val = revcomp_val_p1(val, kmer_len);
 
             let (canonical_val, count, hash) = if val < rc_val {
-                (val, 1u64 + (1u64 << 32), large.oahash())
+                (val, 1u64 + (1u64 << 32), oahash64(val))
             } else {
-                (rc_val, 1u64, LargeInt::<1>::new(rc_val).oahash())
+                (rc_val, 1u64, oahash64(rc_val))
             };
 
             let bucket = (hash as usize) % total_buckets;
@@ -373,9 +388,8 @@ fn spawn_kmers_fast_p1(holder: &ReadHolder, kmer_len: usize, output: &mut KmerCo
     // consecutive bit positions, which get_val_p1 already handles efficiently.
     let mut ki = holder.kmer_iter(kmer_len);
     while !ki.at_end() {
-        let kmer = ki.get();
-        let val = kmer.get_val();
-        let rc_val = LargeInt::<1>::new(val).revcomp(kmer_len).get_val();
+        let val = ki.get_val_p1();
+        let rc_val = revcomp_val_p1(val, kmer_len);
 
         let (canonical_val, count) = if val < rc_val {
             (val, 1u64 + (1u64 << 32))
@@ -386,6 +400,17 @@ fn spawn_kmers_fast_p1(holder: &ReadHolder, kmer_len: usize, output: &mut KmerCo
         output.push_flat(canonical_val, count);
         ki.advance();
     }
+}
+
+#[inline(always)]
+fn revcomp_val_p1(mut val: u64, kmer_len: usize) -> u64 {
+    val = ((val >> 2) & 0x3333333333333333) | ((val & 0x3333333333333333) << 2);
+    val = ((val >> 4) & 0x0F0F0F0F0F0F0F) | ((val & 0x0F0F0F0F0F0F0F0F) << 4);
+    val = ((val >> 8) & 0x00FF00FF00FF00FF) | ((val & 0x00FF00FF00FF00FF) << 8);
+    val = ((val >> 16) & 0x0000FFFF0000FFFF) | ((val & 0x0000FFFF0000FFFF) << 16);
+    val = ((val >> 32) & 0x00000000FFFFFFFF) | ((val & 0x00000000FFFFFFFF) << 32);
+    val ^= 0xAAAAAAAAAAAAAAAA;
+    val >> (2 * (32 - kmer_len))
 }
 
 /// Generic k-mer extraction for any precision.
@@ -510,8 +535,7 @@ pub fn get_branches(kmers: &mut KmerCount, kmer_len: usize) {
                     let k = shifted | nt;
                     let rk = LargeInt::<1>::new(k).revcomp(kmer_len).get_val();
                     let canonical = k.min(rk);
-                    let ckmer = Kmer::from_u64(kmer_len, canonical);
-                    let new_index = kmers_ref.find(&ckmer);
+                    let new_index = kmers_ref.find_val(canonical);
                     if new_index != size && new_index != index {
                         *branch_byte |= 1 << nt;
                     }
@@ -523,8 +547,7 @@ pub fn get_branches(kmers: &mut KmerCount, kmer_len: usize) {
                     let k = rshifted | nt;
                     let rk = LargeInt::<1>::new(k).revcomp(kmer_len).get_val();
                     let canonical = k.min(rk);
-                    let ckmer = Kmer::from_u64(kmer_len, canonical);
-                    let new_index = kmers_ref.find(&ckmer);
+                    let new_index = kmers_ref.find_val(canonical);
                     if new_index != size && new_index != index {
                         *branch_byte |= 1 << (nt + 4);
                     }
@@ -584,7 +607,7 @@ pub fn get_branches(kmers: &mut KmerCount, kmer_len: usize) {
 
 /// Get histogram bins from a sorted k-mer counter
 pub fn get_bins(kmers: &KmerCount) -> Bins {
-    let mut count_freq = std::collections::HashMap::new();
+    let mut count_freq = std::collections::HashMap::with_capacity(kmers.size().min(1024));
     for i in 0..kmers.size() {
         let count = (kmers.get_count(i) & 0xFFFFFFFF) as i32;
         *count_freq.entry(count).or_insert(0usize) += 1;

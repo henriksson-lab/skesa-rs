@@ -227,12 +227,8 @@ impl KmerHashCount {
     /// Total number of k-mers in the table
     pub fn size(&self) -> usize {
         match &self.storage {
-            HashStorage::Single(shards) => {
-                shards.iter().map(|s| s.lock().unwrap().len()).sum()
-            }
-            HashStorage::Multi(shards) => {
-                shards.iter().map(|s| s.lock().unwrap().len()).sum()
-            }
+            HashStorage::Single(shards) => shards.iter().map(|s| s.lock().unwrap().len()).sum(),
+            HashStorage::Multi(shards) => shards.iter().map(|s| s.lock().unwrap().len()).sum(),
         }
     }
 

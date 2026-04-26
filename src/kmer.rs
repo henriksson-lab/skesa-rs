@@ -232,8 +232,7 @@ macro_rules! define_kmer_enum {
                 let copy_prec = old_prec.min(new_prec);
 
                 let mut new_kmer = Self::zero(new_kmer_len);
-                let words = self.to_words();
-                new_kmer.copy_words_from(&words[..copy_prec]);
+                new_kmer.copy_words_from(&self.as_words()[..copy_prec]);
 
                 // Mask off extra bits in the top word
                 let partial_bits = 2 * (new_kmer_len % 32);

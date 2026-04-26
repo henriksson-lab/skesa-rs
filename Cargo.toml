@@ -9,16 +9,20 @@ documentation = "https://docs.rs/skesa-rs"
 keywords = ["bioinformatics", "assembly", "genome", "kmer", "debruijn"]
 categories = ["science", "command-line-utilities"]
 include = [
+    "benches/kmer_bench.rs",
+    "build.rs",
+    "examples/streaming_noodles.rs",
     "src/**/*.rs",
-    "tests/**",
+    "tests/data/**",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
-    "LICENSE",
+    "SKESA/LICENSE",
+    "SKESA/README.md",
 ]
 
 [features]
-default = ["cli"]
+default = []
 cli = ["dep:clap"]
 
 [dependencies]
@@ -37,3 +41,7 @@ required-features = ["cli"]
 [[bench]]
 name = "kmer_bench"
 harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

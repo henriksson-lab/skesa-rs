@@ -239,8 +239,7 @@ fn write_bins<W: Write>(out: &mut W, counts: &HashMap<Kmer, u64>) -> io::Result<
 }
 
 fn write_kmer<W: Write>(out: &mut W, kmer: &Kmer, precision: usize) -> io::Result<()> {
-    let words = kmer.to_words();
-    for word in words.iter().take(precision) {
+    for word in kmer.as_words().iter().take(precision) {
         out.write_all(&word.to_ne_bytes())?;
     }
     Ok(())

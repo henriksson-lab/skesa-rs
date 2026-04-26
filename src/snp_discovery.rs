@@ -733,9 +733,8 @@ pub fn discover_snp_cluster_full(
             // `shift` bases (compensation for new-SNP shift) and (if first SNP
             // had a shift) drop its leading `existing_shift` bases. Then
             // append each new variant trimmed by the same `shift`.
-            let mut combined: Vec<Variation> = Vec::with_capacity(
-                existing.variants.len() * snp_data.variants.len(),
-            );
+            let mut combined: Vec<Variation> =
+                Vec::with_capacity(existing.variants.len() * snp_data.variants.len());
             let mut max_combined_len = 0usize;
             for ev in &existing.variants {
                 let mut base = ev.clone();
@@ -782,7 +781,9 @@ pub fn discover_snp_cluster_full(
         // r.convergence_kmer stays at the actual bubble-convergence kmer
         // unless we re-enter the cluster body for another SNP.
         let r = rslt.as_mut().unwrap();
-        let Some(mut node) = r.convergence_kmer else { break; };
+        let Some(mut node) = r.convergence_kmer else {
+            break;
+        };
         let mut fork = false;
         while dist_to_snp < 2 * kmer_len {
             let mut succs = raw_successors(kmers, &node, kmer_len, &max_kmer, low_count);
@@ -833,10 +834,7 @@ pub fn discover_snp_cluster_full(
         if next_succs.len() < 2 {
             break;
         }
-        current_successors = next_succs
-            .iter()
-            .map(|s| (s.kmer, 0u64, s.nt))
-            .collect();
+        current_successors = next_succs.iter().map(|s| (s.kmer, 0u64, s.nt)).collect();
     }
 
     // Trim the trailing post-SNP extension we added for fork-search context.
@@ -953,10 +951,7 @@ mod tests {
         // a fixture and behaves consistently. Exact convergence depends on
         // FilterNeighbors thresholds; we use is_stranded=false to keep the
         // GGT/ACC/strand-balance filters out of the picture.
-        let kmers = build_graph(
-            4,
-            &["ATCC", "ACTC", "TCCG", "CCGA", "CTCC", "ACGA", "AGAA"],
-        );
+        let kmers = build_graph(4, &["ATCC", "ACTC", "TCCG", "CCGA", "CTCC", "ACGA", "AGAA"]);
         let successors = [
             (Kmer::from_kmer_str("ATCC"), 1, 'T'),
             (Kmer::from_kmer_str("ACTC"), 1, 'C'),

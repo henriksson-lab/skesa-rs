@@ -252,6 +252,85 @@ fn read_fastq(
     Ok(())
 }
 
+fn read_fastq_record_raw(
+    lines: &mut impl Iterator<Item = std::io::Result<String>>,
+) -> Result<Option<(String, String)>, String> {
+    let header = match lines.next() {
+        Some(Ok(l)) => l,
+        Some(Err(e)) => return Err(format!("Error reading: {}", e)),
+        None => return Ok(None),
+    };
+    if !header.starts_with('@') {
+        return Err(format!(
+            "Expected '@' in FASTQ, got: {}",
+            &header[..1.min(header.len())]
+        ));
+    }
+    let seq_id = header[1..].to_string();
+    if seq_id.is_empty() {
+        return Err("fastq record must have seq ID".to_string());
+    }
+
+    let seq = match lines.next() {
+        Some(Ok(l)) => l,
+        _ => return Err("Truncated FASTQ".to_string()),
+    };
+    validate_read_symbols(&seq).map_err(|e| format!("{} in FASTQ", e))?;
+
+    let sep = match lines.next() {
+        Some(Ok(l)) => l,
+        _ => return Err("Truncated FASTQ".to_string()),
+    };
+    if !sep.starts_with('+') {
+        return Err(format!(
+            "Expected '+' in FASTQ, got: {}",
+            &sep[..1.min(sep.len())]
+        ));
+    }
+
+    match lines.next() {
+        Some(Ok(_)) => {}
+        _ => return Err("Truncated FASTQ".to_string()),
+    };
+
+    Ok(Some((seq_id, seq)))
+}
+
+fn read_paired_fastq_files(file1: &str, file2: &str) -> Result<ReadPair, String> {
+    let reader1: Box<dyn BufRead> = if is_gzipped(file1) {
+        let file = File::open(file1).map_err(|e| format!("Can't open file {}: {}", file1, e))?;
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else {
+        let file = File::open(file1).map_err(|e| format!("Can't open file {}: {}", file1, e))?;
+        Box::new(BufReader::new(file))
+    };
+    let reader2: Box<dyn BufRead> = if is_gzipped(file2) {
+        let file = File::open(file2).map_err(|e| format!("Can't open file {}: {}", file2, e))?;
+        Box::new(BufReader::new(GzDecoder::new(file)))
+    } else {
+        let file = File::open(file2).map_err(|e| format!("Can't open file {}: {}", file2, e))?;
+        Box::new(BufReader::new(file))
+    };
+
+    let mut lines1 = reader1.lines();
+    let mut lines2 = reader2.lines();
+    let mut paired = ReadHolder::new(true);
+    let mut unpaired = ReadHolder::new(false);
+
+    while let Some((_id1, seq1)) = read_fastq_record_raw(&mut lines1)? {
+        if let Some((_id2, seq2)) = read_fastq_record_raw(&mut lines2)? {
+            add_read_pair(&seq1, &seq2, &mut paired, &mut unpaired);
+        } else {
+            return Err(format!(
+                "Files {},{} contain different number of mates",
+                file1, file2
+            ));
+        }
+    }
+
+    Ok([paired, unpaired])
+}
+
 fn add_record(
     seq_id: &str,
     seq: &str,
@@ -302,6 +381,41 @@ fn add_read_pair(seq1: &str, seq2: &str, paired: &mut ReadHolder, unpaired: &mut
         (Some(read), None) | (None, Some(read)) => unpaired.push_back_str(&read),
         (None, None) => {}
     }
+}
+
+fn append_read_pair(dst: &mut ReadPair, src: ReadPair) {
+    for holder_idx in 0..2 {
+        let mut si = src[holder_idx].string_iter();
+        while !si.at_end() {
+            dst[holder_idx].push_back_iter(&si);
+            si.advance();
+        }
+    }
+}
+
+fn split_for_threads(all_reads: ReadPair, ncores: usize) -> Vec<ReadPair> {
+    let ncores = ncores.max(1);
+    let total_reads = all_reads[0].read_num() + all_reads[1].read_num();
+    let mut job_length = total_reads / ncores + 1;
+    job_length += job_length % 2;
+
+    let mut reads: Vec<ReadPair> = Vec::new();
+    let mut num = 0usize;
+    for holder_idx in 0..2 {
+        let contains_paired = holder_idx == 0;
+        let mut si = all_reads[holder_idx].string_iter();
+        while !si.at_end() {
+            if num % job_length == 0 || reads.is_empty() {
+                reads.push([ReadHolder::new(true), ReadHolder::new(false)]);
+            }
+            reads.last_mut().expect("read chunk exists")[holder_idx].push_back_iter(&si);
+            si.advance();
+            num += 1;
+        }
+        debug_assert_eq!(all_reads[holder_idx].contains_paired(), contains_paired);
+    }
+
+    reads
 }
 
 /// Clip adapters from reads using k-mer frequency analysis.
@@ -448,7 +562,16 @@ impl ReadsGetter {
     /// - Single files (unpaired or interleaved paired)
     /// - Comma-separated pairs (e.g., "reads1.fq,reads2.fq")
     pub fn new(file_list: &[String], use_paired_ends: bool) -> Result<Self, String> {
-        let mut reads = Vec::new();
+        Self::new_with_ncores(file_list, use_paired_ends, 1)
+    }
+
+    /// Load reads and split them into C++-style work chunks.
+    pub fn new_with_ncores(
+        file_list: &[String],
+        use_paired_ends: bool,
+        ncores: usize,
+    ) -> Result<Self, String> {
+        let mut all_reads = [ReadHolder::new(true), ReadHolder::new(false)];
 
         for file_spec in file_list {
             if file_spec.contains(',') {
@@ -460,32 +583,17 @@ impl ReadsGetter {
                         parts.len()
                     ));
                 }
-                let r1 = read_one_file(parts[0].trim(), false)?;
-                let r2 = read_one_file(parts[1].trim(), false)?;
-
-                // Interleave the paired reads
-                let mut paired = ReadHolder::new(true);
-                let mut si1 = r1[1].string_iter(); // unpaired from file 1
-                let mut si2 = r2[1].string_iter(); // unpaired from file 2
-                while !si1.at_end() && !si2.at_end() {
-                    paired.push_back_str(&si1.get());
-                    paired.push_back_str(&si2.get());
-                    si1.advance();
-                    si2.advance();
-                }
-                if !si1.at_end() {
-                    return Err(format!(
-                        "Files {} contain different number of mates",
-                        file_spec
-                    ));
-                }
-                let unpaired = ReadHolder::new(false);
-                reads.push([paired, unpaired]);
+                append_read_pair(
+                    &mut all_reads,
+                    read_paired_fastq_files(parts[0].trim(), parts[1].trim())?,
+                );
             } else {
                 let read_pair = read_one_file(file_spec, use_paired_ends)?;
-                reads.push(read_pair);
+                append_read_pair(&mut all_reads, read_pair);
             }
         }
+
+        let reads = split_for_threads(all_reads, ncores);
 
         let total: usize = reads
             .iter()

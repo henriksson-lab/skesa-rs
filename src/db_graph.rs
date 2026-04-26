@@ -192,26 +192,64 @@ impl<'a> SortedDbGraph<'a> {
             max_kmer: Kmer::from_chars(kmer_len, std::iter::repeat_n('G', kmer_len)),
         }
     }
-}
 
-impl DBGraph for SortedDbGraph<'_> {
-    type Node = SortedNode;
-
-    fn get_node(&self, kmer: &Kmer) -> Self::Node {
-        let rkmer = kmer.revcomp(self.kmers.kmer_len());
-        if *kmer < rkmer {
-            let idx = self.kmers.find(kmer);
+    #[inline(always)]
+    pub fn get_node_val(&self, val: u64) -> SortedNode {
+        let kmer_len = self.kmers.kmer_len();
+        debug_assert!(kmer_len <= 32);
+        let rval = revcomp_val(val, kmer_len);
+        if val < rval {
+            let idx = self.kmers.find_val(val);
             if idx == self.kmers.size() {
                 SortedNode::invalid()
             } else {
                 SortedNode(2 * (idx + 1))
             }
         } else {
-            let idx = self.kmers.find(&rkmer);
+            let idx = self.kmers.find_val(rval);
             if idx == self.kmers.size() {
                 SortedNode::invalid()
             } else {
                 SortedNode(2 * (idx + 1) + 1)
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn revcomp_val(mut val: u64, kmer_len: usize) -> u64 {
+    val = ((val >> 2) & 0x3333333333333333) | ((val & 0x3333333333333333) << 2);
+    val = ((val >> 4) & 0x0F0F0F0F0F0F0F0F) | ((val & 0x0F0F0F0F0F0F0F0F) << 4);
+    val = ((val >> 8) & 0x00FF00FF00FF00FF) | ((val & 0x00FF00FF00FF00FF) << 8);
+    val = ((val >> 16) & 0x0000FFFF0000FFFF) | ((val & 0x0000FFFF0000FFFF) << 16);
+    val = ((val >> 32) & 0x00000000FFFFFFFF) | ((val & 0x00000000FFFFFFFF) << 32);
+    val ^= 0xAAAAAAAAAAAAAAAA;
+    val >> (2 * (32 - kmer_len))
+}
+
+impl DBGraph for SortedDbGraph<'_> {
+    type Node = SortedNode;
+
+    fn get_node(&self, kmer: &Kmer) -> Self::Node {
+        let kmer_len = self.kmers.kmer_len();
+        if kmer_len <= 32 {
+            self.get_node_val(kmer.get_val())
+        } else {
+            let rkmer = kmer.revcomp(kmer_len);
+            if *kmer < rkmer {
+                let idx = self.kmers.find(kmer);
+                if idx == self.kmers.size() {
+                    SortedNode::invalid()
+                } else {
+                    SortedNode(2 * (idx + 1))
+                }
+            } else {
+                let idx = self.kmers.find(&rkmer);
+                if idx == self.kmers.size() {
+                    SortedNode::invalid()
+                } else {
+                    SortedNode(2 * (idx + 1) + 1)
+                }
             }
         }
     }
@@ -234,7 +272,8 @@ impl DBGraph for SortedDbGraph<'_> {
     }
 
     fn get_node_seq(&self, node: &Self::Node) -> String {
-        self.get_node_kmer(node).to_kmer_string(self.kmers.kmer_len())
+        self.get_node_kmer(node)
+            .to_kmer_string(self.kmers.kmer_len())
     }
 
     fn get_node_successors(&self, node: &Self::Node) -> Vec<Successor<Self::Node>> {

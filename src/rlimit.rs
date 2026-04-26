@@ -38,9 +38,7 @@ pub fn apply_from_env() {
         let gb: u64 = match gb_str.parse() {
             Ok(g) if g > 0 => g,
             _ => {
-                eprintln!(
-                    "SKESA_RS_RLIMIT_GB={gb_str:?}: not a positive integer, ignoring"
-                );
+                eprintln!("SKESA_RS_RLIMIT_GB={gb_str:?}: not a positive integer, ignoring");
                 return;
             }
         };

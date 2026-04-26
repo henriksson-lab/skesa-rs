@@ -122,12 +122,8 @@ pub fn run_assembly(
             .iter()
             .any(|r| r[0].read_num() > 0 && r[0].contains_paired());
     // Build graph at min_kmer
-    let (mut kmers, mut average_count) = build_graph(
-        reads,
-        params.min_kmer,
-        params.min_count,
-        params.memory_gb,
-    );
+    let (mut kmers, mut average_count) =
+        build_graph(reads, params.min_kmer, params.min_count, params.memory_gb);
     let bins = sorted_counter::get_bins(&kmers);
     let genome_size = histogram::calculate_genome_size(&bins);
 
@@ -181,11 +177,8 @@ pub fn run_assembly(
         ..digger_params
     };
     let contigs = if seeds.is_empty() {
-        let mut contigs = graph_digger::assemble_contigs(
-            &mut kmers,
-            params.min_kmer,
-            &seed_digger_params,
-        );
+        let mut contigs =
+            graph_digger::assemble_contigs(&mut kmers, params.min_kmer, &seed_digger_params);
 
         if params.allow_snps {
             graph_digger::check_repeats(&mut contigs, &kmers, params.min_kmer, &digger_params);
@@ -281,6 +274,7 @@ pub fn run_assembly(
                 &kmers,
                 params.min_kmer,
                 10000,
+                params.ncores,
                 params.fraction,
                 params.min_count,
                 true,
@@ -381,12 +375,8 @@ pub fn run_assembly(
                 }
             }
 
-            let (mut iter_kmers, iter_avg) = build_graph(
-                &iter_reads,
-                kmer_len,
-                params.min_count,
-                params.memory_gb,
-            );
+            let (mut iter_kmers, iter_avg) =
+                build_graph(&iter_reads, kmer_len, params.min_count, params.memory_gb);
             if iter_kmers.size() == 0 {
                 eprintln!(
                     "Empty graph for kmer length: {} skipping this and longer kmers",
@@ -515,7 +505,7 @@ pub fn run_assembly(
                 connection_reads = cleanup.remaining_pairs;
                 let mut iter = cleanup.internal_reads.string_iter();
                 while !iter.at_end() {
-                    internal_connected_reads.push_back_str(&iter.get());
+                    internal_connected_reads.push_back_iter(&iter);
                     iter.advance();
                 }
             } else {
@@ -559,7 +549,7 @@ Connecting mate pairs using kmer length: {}",
             );
             let mut iter = pair_result.connected.string_iter();
             while !iter.at_end() {
-                connected_reads.push_back_str(&iter.get());
+                connected_reads.push_back_iter(&iter);
                 iter.advance();
             }
             remaining_pairs = vec![[pair_result.not_connected, ReadHolder::new(false)]];
@@ -570,12 +560,12 @@ Connecting mate pairs using kmer length: {}",
             let mut combined_connected_reads = ReadHolder::new(false);
             let mut iter = internal_connected_reads.string_iter();
             while !iter.at_end() {
-                combined_connected_reads.push_back_str(&iter.get());
+                combined_connected_reads.push_back_iter(&iter);
                 iter.advance();
             }
             let mut iter = connected_reads.string_iter();
             while !iter.at_end() {
-                combined_connected_reads.push_back_str(&iter.get());
+                combined_connected_reads.push_back_iter(&iter);
                 iter.advance();
             }
             let mut added = 0usize;
@@ -843,10 +833,7 @@ fn expand_contig_variants(contig: &ContigSequence) -> Vec<String> {
 }
 
 fn combine_similar_contigs(contigs: &mut ContigSequenceList) {
-    let mut all_variants: Vec<String> = contigs
-        .iter()
-        .flat_map(expand_contig_variants)
-        .collect();
+    let mut all_variants: Vec<String> = contigs.iter().flat_map(expand_contig_variants).collect();
     all_variants.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
 
     let delta = crate::glb_align::SMatrix::new_dna(1, -2);
@@ -927,7 +914,8 @@ fn combine_similar_contigs(contigs: &mut ContigSequenceList) {
     for mut group in all_groups {
         if group.len() == 1 {
             let mut contig = ContigSequence::new();
-            contig.insert_new_chunk_with(group.remove(0).into_iter().filter(|&c| c != '-').collect());
+            contig
+                .insert_new_chunk_with(group.remove(0).into_iter().filter(|&c| c != '-').collect());
             new_contigs.push(contig);
             continue;
         }
@@ -962,8 +950,10 @@ fn combine_similar_contigs(contigs: &mut ContigSequenceList) {
             while len <= group[0].len() {
                 let next_mism = next_mismatch(&group, len);
                 if next_mism >= len + min_uniq_len || next_mism == group[0].len() {
-                    let mut varmap: std::collections::BTreeMap<Vec<char>, std::collections::BTreeSet<Vec<char>>> =
-                        std::collections::BTreeMap::new();
+                    let mut varmap: std::collections::BTreeMap<
+                        Vec<char>,
+                        std::collections::BTreeSet<Vec<char>>,
+                    > = std::collections::BTreeMap::new();
                     for seq in &group {
                         varmap
                             .entry(seq[..len].to_vec())
@@ -1019,7 +1009,11 @@ fn mark_previous_contigs(
     build_same_k_node_state(contigs, kmers, kmer_len)
 }
 
-fn kmer_index_in_graph(kmer: crate::kmer::Kmer, kmers: &KmerCount, kmer_len: usize) -> Option<usize> {
+fn kmer_index_in_graph(
+    kmer: crate::kmer::Kmer,
+    kmers: &KmerCount,
+    kmer_len: usize,
+) -> Option<usize> {
     let rc = kmer.revcomp(kmer_len);
     let canonical = if kmer < rc { kmer } else { rc };
     let idx = kmers.find(&canonical);
@@ -1040,7 +1034,7 @@ fn mark_sequence_multicontig(
         return;
     }
     let mut rh = crate::read_holder::ReadHolder::new(false);
-    rh.push_back_str(&seq.iter().collect::<String>());
+    rh.push_back_chars(seq);
     let mut ki = rh.kmer_iter(kmer_len);
     while !ki.at_end() {
         let kmer = ki.get();
@@ -1064,7 +1058,7 @@ fn collect_sequence_kmer_indices_partial(
         return (Vec::new(), true);
     }
     let mut rh = crate::read_holder::ReadHolder::new(false);
-    rh.push_back_str(&seq.iter().collect::<String>());
+    rh.push_back_chars(seq);
     let mut ki = rh.kmer_iter(kmer_len);
     let mut indices = Vec::new();
     while !ki.at_end() {
@@ -1145,7 +1139,11 @@ fn remove_short_uniq_intervals_for_marking(
         let seq0 = contig.chunk(0)[0].clone();
         contig.insert_new_chunk();
         contig.extend_top_variant(seq0[0]);
-        if let Some(first_chunk) = contig.chunks.first_mut().and_then(|chunk| chunk.first_mut()) {
+        if let Some(first_chunk) = contig
+            .chunks
+            .first_mut()
+            .and_then(|chunk| chunk.first_mut())
+        {
             first_chunk.remove(0);
         }
         remove_short_uniq_intervals_for_marking(contig, min_uniq_len);
@@ -1191,7 +1189,10 @@ fn min_unique_circular_kmer_pos(seq: &str, kmer_len: usize) -> Option<(usize, i8
         let kmer = std::str::from_utf8(&doubled[pos..pos + search_k]).expect("ASCII DNA");
         let rkmer = reverse_complement_string(kmer);
         if kmer <= rkmer.as_str() {
-            occurrences.entry(kmer.to_string()).or_default().push((pos, 1));
+            occurrences
+                .entry(kmer.to_string())
+                .or_default()
+                .push((pos, 1));
         } else {
             occurrences.entry(rkmer).or_default().push((pos, -1));
         }
@@ -1229,10 +1230,7 @@ fn trim_circular_suffix_overlap(contig: &mut ContigSequence, mut clip: usize) {
     }
 }
 
-pub(crate) fn rotate_circular_contig_to_min_kmer(
-    contig: &mut ContigSequence,
-    kmer_len: usize,
-) {
+pub(crate) fn rotate_circular_contig_to_min_kmer(contig: &mut ContigSequence, kmer_len: usize) {
     if !contig.circular || contig.is_empty() {
         return;
     }
@@ -1261,7 +1259,11 @@ pub(crate) fn rotate_circular_contig_to_min_kmer(
             };
             pos = found_pos;
         }
-        if let Some(first) = contig.chunks.first_mut().and_then(|chunk| chunk.first_mut()) {
+        if let Some(first) = contig
+            .chunks
+            .first_mut()
+            .and_then(|chunk| chunk.first_mut())
+        {
             first.rotate_left(pos);
         }
         contig.left_extend = 0;
@@ -1347,9 +1349,10 @@ fn contract_variable_intervals_post_marking(contig: &mut ContigSequence) {
         let first = contig.chunk(i)[0].clone();
         let mut left_len = 0usize;
         loop {
-            let all_same = contig.chunk(i).iter().all(|seq| {
-                seq.len() > left_len && seq[left_len] == first[left_len]
-            });
+            let all_same = contig
+                .chunk(i)
+                .iter()
+                .all(|seq| seq.len() > left_len && seq[left_len] == first[left_len]);
             if all_same {
                 left_len += 1;
             } else {
@@ -1519,7 +1522,9 @@ fn normalize_same_k_contig_for_marking(
             seq.extend_from_slice(&next_chunk[..right]);
             if cur == 1
                 && contig.circular
-                && !circular_ext.as_ref().is_some_and(|(_, _, extended)| *extended)
+                && !circular_ext
+                    .as_ref()
+                    .is_some_and(|(_, _, extended)| *extended)
                 && contig.len() == 3
             {
                 let prefix: Vec<char> = seq.iter().take(kmer_len - 1).copied().collect();
@@ -1562,12 +1567,7 @@ pub(crate) fn build_same_k_node_state(
                 .as_ref()
                 .map(|(_, last, _)| last.as_slice())
                 .unwrap_or(&contig.chunk(last_chunk)[0]);
-            mark_sequence_multicontig(
-                last_seq,
-                kmers,
-                kmer_len,
-                &mut node_state,
-            );
+            mark_sequence_multicontig(last_seq, kmers, kmer_len, &mut node_state);
         }
 
         let mut i = last_chunk as i32 - 1;
@@ -1577,12 +1577,7 @@ pub(crate) fn build_same_k_node_state(
             let next = (i + 1) as usize;
 
             if contig.chunk_len_max(prev) >= kmer_len {
-                mark_sequence_multicontig(
-                    &contig.chunk(prev)[0],
-                    kmers,
-                    kmer_len,
-                    &mut node_state,
-                );
+                mark_sequence_multicontig(&contig.chunk(prev)[0], kmers, kmer_len, &mut node_state);
             }
 
             let left = (kmer_len - 1).min(contig.chunk_len_max(prev));
@@ -1605,13 +1600,16 @@ pub(crate) fn build_same_k_node_state(
                 seq.extend_from_slice(&next_chunk[..right]);
                 if cur == 1
                     && contig.circular
-                    && !circular_ext.as_ref().is_some_and(|(_, _, extended)| *extended)
+                    && !circular_ext
+                        .as_ref()
+                        .is_some_and(|(_, _, extended)| *extended)
                     && contig.len() == 3
                 {
                     let prefix: Vec<char> = seq.iter().take(kmer_len - 1).copied().collect();
                     seq.extend(prefix);
                 }
-                let (indices, all_valid) = collect_sequence_kmer_indices_partial(&seq, kmers, kmer_len);
+                let (indices, all_valid) =
+                    collect_sequence_kmer_indices_partial(&seq, kmers, kmer_len);
                 if all_valid {
                     valid_variant_kmers.push(indices);
                 } else {
@@ -1708,29 +1706,48 @@ fn connect_and_extend_contigs(
     let is_mult_contig = |kmer: crate::kmer::Kmer| -> bool {
         kmer_index_in_graph(kmer, kmers, kmer_len).is_some_and(|idx| mult_contig[idx])
     };
-    let node_exists = |kmer: crate::kmer::Kmer| -> bool {
-        kmer_index_in_graph(kmer, kmers, kmer_len).is_some()
-    };
+    let node_exists =
+        |kmer: crate::kmer::Kmer| -> bool { kmer_index_in_graph(kmer, kmers, kmer_len).is_some() };
 
     // C++ carries graph-owned visited/multi state from SContig construction
     // into same-k extension. Use the same normalized node-state derivation
-    // here instead of only marking the primary sequence.
-    let mut visited = node_state;
+    // here instead of only marking the primary sequence. The atomic wrapper
+    // mirrors C++ `m_visited` (DBGraph.hpp:301), `vector<SAtomic<uint8_t>>`,
+    // so the parallel ExtendContigsJob threads can claim contigs and mark
+    // visited concurrently.
+    use std::sync::atomic::AtomicU8;
+    let visited: Vec<AtomicU8> = node_state.into_iter().map(AtomicU8::new).collect();
 
-    // Create extension fragments: for each contig, extend left and right in new graph
-    let mut extensions: Vec<LinkedContig> = Vec::new();
-    let mut connectors = 0;
-    let mut extenders = 0;
-    for contig_idx in 0..contigs.len() {
-        let mut parent = LinkedContig::new(normalized_contigs[contig_idx].clone(), kmer_len);
-        parent.left_extend = contigs[contig_idx].left_extend;
-        parent.right_extend = contigs[contig_idx].right_extend;
-        if parent.seq.circular || parent.seq.len_max() < kmer_len {
-            continue;
-        }
+    // Create extension fragments — mirror C++ `ExtendContigsJob`
+    // (graphdigger.hpp:3243): each thread atomically claims a contig from
+    // the shared list and produces its extension(s), then a per-thread
+    // output is merged. Rayon's `par_iter_mut().enumerate()` partitions the
+    // contigs across worker threads; per-contig writes are disjoint
+    // (`contigs[contig_idx]`) and the visited bitmap is atomic.
+    use rayon::prelude::*;
+    let normalized_contigs_ref = &normalized_contigs;
+    let visited_ref: &[AtomicU8] = &visited;
+    let max_kmer_ref = &max_kmer;
+    let good_node_fn = &good_node;
+    let is_mult_contig_fn = &is_mult_contig;
+    let node_exists_fn = &node_exists;
+    let per_contig: Vec<(Vec<LinkedContig>, usize)> = contigs
+        .par_iter_mut()
+        .enumerate()
+        .map(|(contig_idx, contig)| {
+            let mut local_extensions: Vec<LinkedContig> = Vec::with_capacity(2);
+            let mut local_extenders = 0usize;
+            let mut parent =
+                LinkedContig::new(normalized_contigs_ref[contig_idx].clone(), kmer_len);
+            parent.left_extend = contig.left_extend;
+            parent.right_extend = contig.right_extend;
+            if parent.seq.circular || parent.seq.len_max() < kmer_len {
+                *contig = parent.seq;
+                return (local_extensions, local_extenders);
+            }
 
-        // Extend right end
-        if parent.seq.right_repeat < kmer_len as i32 {
+            // Extend right end
+            if parent.seq.right_repeat < kmer_len as i32 {
             let seq = parent.seq.primary_sequence();
             let right_chunk_idx = parent.seq.len() - 1;
             let allowed_right_intrusion = parent
@@ -1740,13 +1757,13 @@ fn connect_and_extend_contigs(
             let last_kmer = parent
                 .back_kmer()
                 .expect("connect/extend parent has full right kmer");
-            if good_node(last_kmer) && !is_mult_contig(last_kmer) {
+            if good_node_fn(last_kmer) && !is_mult_contig_fn(last_kmer) {
                 let right_ext = graph_digger::extend_right_for_connect(
                     kmers,
                     &last_kmer,
                     kmer_len,
-                    &max_kmer,
-                    &mut visited,
+                    max_kmer_ref,
+                    visited_ref,
                     params,
                     allowed_right_intrusion,
                 );
@@ -1772,7 +1789,7 @@ fn connect_and_extend_contigs(
                             let clipped = crate::kmer::Kmer::from_kmer_str(
                                 &seq[clipped_start..clipped_start + kmer_len],
                             );
-                            if !node_exists(clipped) {
+                            if !node_exists_fn(clipped) {
                                 skip = true;
                             }
                         }
@@ -1804,8 +1821,8 @@ fn connect_and_extend_contigs(
                                 takeoff.to_kmer_string(kmer_len),
                             );
                         }
-                        extenders += 1;
-                        extensions.push(ext);
+                        local_extenders += 1;
+                        local_extensions.push(ext);
                     }
                 }
             }
@@ -1817,13 +1834,13 @@ fn connect_and_extend_contigs(
                 .front_kmer()
                 .expect("connect/extend parent has full left kmer");
             let allowed_left_intrusion = parent.seq.chunk_len_max(0).saturating_sub(kmer_len);
-            if good_node(first_kmer) && !is_mult_contig(first_kmer) {
+            if good_node_fn(first_kmer) && !is_mult_contig_fn(first_kmer) {
                 let left_ext = graph_digger::extend_left_for_connect(
                     kmers,
                     &first_kmer,
                     kmer_len,
-                    &max_kmer,
-                    &mut visited,
+                    max_kmer_ref,
+                    visited_ref,
                     params,
                     allowed_left_intrusion,
                 );
@@ -1849,7 +1866,7 @@ fn connect_and_extend_contigs(
                             let clipped = crate::kmer::Kmer::from_kmer_str(
                                 &seq[left_ext.intrusion..left_ext.intrusion + kmer_len],
                             );
-                            if !node_exists(clipped) {
+                            if !node_exists_fn(clipped) {
                                 skip = true;
                             }
                         }
@@ -1881,14 +1898,28 @@ fn connect_and_extend_contigs(
                                 takeoff.to_kmer_string(kmer_len),
                             );
                         }
-                        extenders += 1;
-                        extensions.push(ext);
+                        local_extenders += 1;
+                        local_extensions.push(ext);
                     }
                 }
             }
         }
 
-        contigs[contig_idx] = parent.seq;
+        *contig = parent.seq;
+        (local_extensions, local_extenders)
+    })
+    .collect();
+
+    let total_extensions: usize = per_contig
+        .iter()
+        .map(|(local_extensions, _)| local_extensions.len())
+        .sum();
+    let mut extensions: Vec<LinkedContig> = Vec::with_capacity(total_extensions);
+    let mut connectors = 0;
+    let mut extenders: usize = 0;
+    for (mut local_extensions, local_extenders) in per_contig {
+        extensions.append(&mut local_extensions);
+        extenders += local_extenders;
     }
 
     if extensions.is_empty() {
@@ -1946,10 +1977,9 @@ fn connect_and_extend_contigs(
     select_connect_and_extend_chain_starts(&mut arena, parent_count);
 
     for start in 0..parent_count {
-        if arena[start].is_taken != 0 {
+        if !arena[start].claim_if_untaken() {
             continue;
         }
-        arena[start].is_taken = 1;
         let before_len = arena[start].seq.len_max();
         let before_left_extend = arena[start].left_extend;
         let before_right_extend = arena[start].right_extend;
@@ -1972,12 +2002,15 @@ fn connect_and_extend_contigs(
             }
 
             let child_copy = arena[child].clone();
-            chain_trace.push(format!("R:{parent}->{child}:len{}", child_copy.seq.len_max()));
+            chain_trace.push(format!(
+                "R:{parent}->{child}:len{}",
+                child_copy.seq.len_max()
+            ));
             arena[start].add_to_right(&child_copy);
             if num % 2 == 1 {
                 arena[start].seq.right_repeat = child_copy.seq.right_repeat;
             }
-            arena[child].is_taken = 2;
+            arena[child].set_taken(2);
             if circular {
                 arena[start].seq.circular = arena[start].seq.len_max() >= 2 * kmer_len - 1;
                 if arena[start].seq.circular {
@@ -2012,12 +2045,15 @@ fn connect_and_extend_contigs(
                 arena[child].reverse_complement();
             }
             let child_copy = arena[child].clone();
-            chain_trace.push(format!("L:{parent}->{child}:len{}", child_copy.seq.len_max()));
+            chain_trace.push(format!(
+                "L:{parent}->{child}:len{}",
+                child_copy.seq.len_max()
+            ));
             arena[start].add_to_left(&child_copy);
             if num % 2 == 1 {
                 arena[start].seq.left_repeat = child_copy.seq.left_repeat;
             }
-            arena[child].is_taken = 2;
+            arena[child].set_taken(2);
             parent = child;
             num += 1;
         }
@@ -2042,14 +2078,19 @@ fn connect_and_extend_contigs(
                 &seq_summary[seq_summary.len() - suffix_len..],
             );
             if !chain_trace.is_empty() {
-                eprintln!("CE_TRACE k={} start={} {}", kmer_len, start, chain_trace.join(" "));
+                eprintln!(
+                    "CE_TRACE k={} start={} {}",
+                    kmer_len,
+                    start,
+                    chain_trace.join(" ")
+                );
             }
         }
     }
 
     contigs.clear();
     for linked in arena.iter().take(parent_count) {
-        if linked.is_taken == 2 || linked.seq.len_min() < kmer_len {
+        if linked.is_taken() == 2 || linked.seq.len_min() < kmer_len {
             continue;
         }
         let mut seq = linked.seq.clone();
@@ -2147,11 +2188,11 @@ fn select_connect_and_extend_chain_starts(
     parent_count: usize,
 ) {
     for idx in 0..parent_count {
-        if arena[idx].is_taken != 0 {
+        if arena[idx].is_taken() != 0 {
             continue;
         }
         if arena[idx].left_link.is_none() && arena[idx].right_link.is_none() {
-            arena[idx].is_taken = 1;
+            arena[idx].set_taken(1);
             continue;
         }
 
@@ -2159,7 +2200,7 @@ fn select_connect_and_extend_chain_starts(
         let mut child = arena[parent].right_link;
         let mut circular = false;
         while let Some(child_idx) = child {
-            arena[child_idx].is_taken = 1;
+            arena[child_idx].set_taken(1);
             child = if arena[child_idx].left_link == Some(parent) {
                 arena[child_idx].right_link
             } else {
@@ -2178,7 +2219,7 @@ fn select_connect_and_extend_chain_starts(
         parent = idx;
         child = arena[parent].left_link;
         while let Some(child_idx) = child {
-            arena[child_idx].is_taken = 1;
+            arena[child_idx].set_taken(1);
             child = if arena[child_idx].left_link == Some(parent) {
                 arena[child_idx].right_link
             } else {
@@ -2573,9 +2614,8 @@ fn collect_contig_orientation_kmers(
         if i as usize == last {
             if contig.chunk_len_max(last) >= kmer_len {
                 let seq = &contig.chunk(last)[0];
-                let seq_str: String = seq.iter().collect();
                 let mut rh = crate::read_holder::ReadHolder::new(false);
-                rh.push_back_str(&seq_str);
+                rh.push_back_chars(seq);
                 let mut ki = rh.kmer_iter(kmer_len);
                 while !ki.at_end() {
                     let kmer = ki.get();
@@ -2599,9 +2639,8 @@ fn collect_contig_orientation_kmers(
 
         if contig.chunk_len_max(uniq_idx) >= kmer_len {
             let seq = &contig.chunk(uniq_idx)[0];
-            let seq_str: String = seq.iter().collect();
             let mut rh = crate::read_holder::ReadHolder::new(false);
-            rh.push_back_str(&seq_str);
+            rh.push_back_chars(seq);
             let mut ki = rh.kmer_iter(kmer_len);
             while !ki.at_end() {
                 let kmer = ki.get();
@@ -2631,9 +2670,8 @@ fn collect_contig_orientation_kmers(
             if seq.len() < kmer_len {
                 continue;
             }
-            let seq_str: String = seq.iter().collect();
             let mut rh = crate::read_holder::ReadHolder::new(false);
-            rh.push_back_str(&seq_str);
+            rh.push_back_chars(&seq);
             let mut ki = rh.kmer_iter(kmer_len);
             while !ki.at_end() {
                 let kmer = ki.get();
@@ -2668,7 +2706,8 @@ fn stabilize_contig_directions(contigs: &mut ContigSequenceList, kmer_len: usize
         let mut kmers: std::collections::HashMap<crate::kmer::Kmer, (u32, bool)> =
             std::collections::HashMap::new();
         for (canonical, is_reverse) in collect_contig_orientation_kmers(contig, kmer_len) {
-            kmers.entry(canonical)
+            kmers
+                .entry(canonical)
                 .and_modify(|entry| entry.0 += 1)
                 .or_insert((1, is_reverse));
         }
@@ -2853,7 +2892,9 @@ mod tests {
         assert!(once_marked.contains(&NODE_STATE_VISITED));
         assert!(state.contains(&NODE_STATE_MULTI_CONTIG));
         assert!(
-            state.iter().all(|&s| s == NODE_STATE_UNSET || s == NODE_STATE_MULTI_CONTIG),
+            state
+                .iter()
+                .all(|&s| s == NODE_STATE_UNSET || s == NODE_STATE_MULTI_CONTIG),
             "expected only unset or multi-contig after remarking same sequence"
         );
     }
@@ -2946,9 +2987,13 @@ mod tests {
         stabilize_contig_directions(&mut contigs, 3);
 
         let orientation_kmers = collect_contig_orientation_kmers(&contigs[0], 3);
-        let mut counts: std::collections::HashMap<Kmer, (u32, bool)> = std::collections::HashMap::new();
+        let mut counts: std::collections::HashMap<Kmer, (u32, bool)> =
+            std::collections::HashMap::new();
         for (kmer, is_reverse) in orientation_kmers {
-            counts.entry(kmer).and_modify(|entry| entry.0 += 1).or_insert((1, is_reverse));
+            counts
+                .entry(kmer)
+                .and_modify(|entry| entry.0 += 1)
+                .or_insert((1, is_reverse));
         }
         let min_unique_is_reverse = counts
             .into_iter()

@@ -1,8 +1,8 @@
+use crate::assembler::{build_same_k_node_state, NODE_STATE_MULTI_CONTIG};
 use crate::contig::ContigSequence;
 use crate::counter::KmerCount;
 use crate::read_holder::ReadHolder;
 use crate::reads_getter::ReadPair;
-use crate::assembler::{build_same_k_node_state, NODE_STATE_MULTI_CONTIG};
 /// Read cleaning: remove reads that fully map inside assembled contigs.
 ///
 /// Port of SKESA's CleanReads / RemoveUsedReadsJob from assembler.hpp.
@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 
 /// Information about where a k-mer appears in a contig
+#[derive(Clone)]
 struct KmerPosition {
     /// Position in the contig (0-based, from the end of the k-mer)
     position: i32,
@@ -49,8 +50,7 @@ fn collect_sequence_kmers(seq: &[char], kmer_len: usize, out: &mut HashSet<Vec<u
         return;
     }
     let mut rh = ReadHolder::new(false);
-    let text: String = seq.iter().collect();
-    rh.push_back_str(&text);
+    rh.push_back_chars(seq);
     let mut ki = rh.kmer_iter(kmer_len);
     while !ki.at_end() {
         out.insert(canonical_kmer_key(ki.get(), kmer_len));
@@ -102,7 +102,11 @@ fn remove_short_uniq_intervals_for_seed_cleanup(contig: &mut ContigSequence, min
         let seq0 = contig.chunk(0)[0].clone();
         contig.insert_new_chunk();
         contig.extend_top_variant(seq0[0]);
-        if let Some(first_chunk) = contig.chunks.first_mut().and_then(|chunk| chunk.first_mut()) {
+        if let Some(first_chunk) = contig
+            .chunks
+            .first_mut()
+            .and_then(|chunk| chunk.first_mut())
+        {
             first_chunk.remove(0);
         }
         remove_short_uniq_intervals_for_seed_cleanup(contig, min_uniq_len);
@@ -160,10 +164,12 @@ fn build_kmer_to_contig_map(
     unique_only: bool,
     graph: Option<CleanupGraphParams<'_>>,
 ) -> HashMap<Vec<u64>, KmerPosition> {
+    use rayon::prelude::*;
+
     let precision = kmer_len.div_ceil(32);
     let mut key_counts: HashMap<Vec<u64>, usize> = HashMap::new();
     let mut entries: Vec<(Vec<u64>, KmerPosition)> = Vec::new();
-    let mut eligible_contigs = Vec::new();
+    let mut eligible_contigs = Vec::with_capacity(contigs.len());
     let seed_kmers = build_seed_kmer_set(seed_contigs, kmer_len);
 
     for (contig_idx, contig) in contigs.iter().enumerate() {
@@ -173,87 +179,101 @@ fn build_kmer_to_contig_map(
         eligible_contigs.push(contig_idx);
     }
 
-    let graph_multicontig_state = graph.map(|graph_params| {
-        build_same_k_node_state(contigs, graph_params.kmers, kmer_len)
-    });
+    let graph_multicontig_state =
+        graph.map(|graph_params| build_same_k_node_state(contigs, graph_params.kmers, kmer_len));
 
-    for (contig_idx, contig) in contigs.iter().enumerate() {
-        if !eligible_contigs.contains(&contig_idx) {
-            continue;
-        }
-        let base_seq = contig.primary_sequence();
-        let seq = if contig.circular && base_seq.len() >= kmer_len {
-            let mut extended = base_seq.clone();
-            extended.push_str(&base_seq[..kmer_len - 1]);
-            extended
-        } else {
-            base_seq
-        };
-        if seq.len() < kmer_len {
-            continue;
-        }
-
-        let mut rh = ReadHolder::new(false);
-        rh.push_back_str(&seq);
-        let mut ki = rh.kmer_iter(kmer_len);
-        let mut pos = if contig.circular {
-            contig.chunk_len_max(0) as i32 - 1
-        } else {
-            (seq.len() - kmer_len) as i32
-        };
-        let mut contig_entries: Vec<(Vec<u64>, KmerPosition)> = Vec::new();
-        let mut found_repeat = false;
-
-        while !ki.at_end() {
-            let kmer = ki.get();
-            let rkmer = kmer.revcomp(kmer_len);
-            let is_direct = kmer <= rkmer;
-            let canonical = if is_direct { kmer } else { rkmer };
-            let key = canonical.as_words()[..precision].to_vec();
-
-            if let Some(graph_params) = graph {
-                let idx = graph_params.kmers.find(&canonical);
-                if idx < graph_params.kmers.size() {
-                    let abundance = (graph_params.kmers.get_count(idx) & 0xFFFF_FFFF) as f64;
-                    if abundance * graph_params.fraction > graph_params.average_count {
-                        ki.advance();
-                        pos -= 1;
-                        continue;
-                    }
-                }
-                if let Some(node_state) = &graph_multicontig_state {
-                    if idx < node_state.len() && node_state[idx] == NODE_STATE_MULTI_CONTIG {
-                        found_repeat = true;
-                        break;
-                    }
-                }
+    let mut local_results: Vec<(usize, Vec<(Vec<u64>, KmerPosition)>)> = eligible_contigs
+        .par_iter()
+        .fold(Vec::new, |mut local_results, &contig_idx| {
+            let contig = &contigs[contig_idx];
+            let base_seq = contig.primary_sequence();
+            let seq = if contig.circular && base_seq.len() >= kmer_len {
+                let mut extended = base_seq.clone();
+                extended.push_str(&base_seq[..kmer_len - 1]);
+                extended
+            } else {
+                base_seq
+            };
+            if seq.len() < kmer_len {
+                return local_results;
             }
 
-            contig_entries.push((
-                key,
-                KmerPosition {
-                    position: pos,
-                    is_direct,
-                    contig_idx,
-                },
-            ));
+            let mut rh = ReadHolder::new(false);
+            rh.push_back_str(&seq);
+            let mut ki = rh.kmer_iter(kmer_len);
+            let mut pos = if contig.circular {
+                contig.chunk_len_max(0) as i32 - 1
+            } else {
+                (seq.len() - kmer_len) as i32
+            };
+            let mut contig_entries: Vec<(Vec<u64>, KmerPosition)> =
+                Vec::with_capacity(seq.len() - kmer_len + 1);
+            let mut found_repeat = false;
 
-            ki.advance();
-            pos -= 1;
-        }
+            while !ki.at_end() {
+                let kmer = ki.get();
+                let rkmer = kmer.revcomp(kmer_len);
+                let is_direct = kmer <= rkmer;
+                let canonical = if is_direct { kmer } else { rkmer };
+                let key = canonical.as_words()[..precision].to_vec();
 
-        if !found_repeat {
-            for (key, pos_info) in contig_entries {
-                if seed_kmers.contains(&key) {
-                    continue;
+                if let Some(graph_params) = graph {
+                    let idx = graph_params.kmers.find(&canonical);
+                    if idx < graph_params.kmers.size() {
+                        let abundance = (graph_params.kmers.get_count(idx) & 0xFFFF_FFFF) as f64;
+                        if abundance * graph_params.fraction > graph_params.average_count {
+                            ki.advance();
+                            pos -= 1;
+                            continue;
+                        }
+                    }
+                    if let Some(node_state) = &graph_multicontig_state {
+                        if idx < node_state.len() && node_state[idx] == NODE_STATE_MULTI_CONTIG {
+                            found_repeat = true;
+                            break;
+                        }
+                    }
                 }
-                *key_counts.entry(key.clone()).or_insert(0) += 1;
-                entries.push((key, pos_info));
+
+                if !seed_kmers.contains(&key) {
+                    contig_entries.push((
+                        key,
+                        KmerPosition {
+                            position: pos,
+                            is_direct,
+                            contig_idx,
+                        },
+                    ));
+                }
+
+                ki.advance();
+                pos -= 1;
             }
+
+            if found_repeat {
+                return local_results;
+            }
+
+            local_results.push((contig_idx, contig_entries));
+            local_results
+        })
+        .reduce(Vec::new, |mut left, mut right| {
+            left.append(&mut right);
+            left
+        });
+
+    local_results.sort_unstable_by_key(|(contig_idx, _)| *contig_idx);
+    let total_entries = local_results.iter().map(|(_, entries)| entries.len()).sum();
+    key_counts.reserve(total_entries);
+    entries.reserve(total_entries);
+    for (_, contig_entries) in local_results {
+        for (key, pos_info) in contig_entries {
+            *key_counts.entry(key.clone()).or_insert(0) += 1;
+            entries.push((key, pos_info));
         }
     }
 
-    let mut map = HashMap::new();
+    let mut map = HashMap::with_capacity(entries.len());
     for (key, pos_info) in entries {
         if !unique_only || key_counts.get(&key) == Some(&1usize) {
             map.insert(key, pos_info);
@@ -410,19 +430,57 @@ pub fn check_and_clip_read_lite(
 }
 
 fn pair_span_is_deep(pos: i32, plus: i32, contig: &ContigSequence, margin: i32, span: i32) -> bool {
-    let clen = contig.len_max() as i32;
-    let lr = contig.left_repeat;
-    let rr = contig.right_repeat;
-    contig.circular
+    pair_span_is_deep_values(
+        pos,
+        plus,
+        contig.circular,
+        contig.len_max() as i32,
+        contig.left_repeat,
+        contig.right_repeat,
+        margin,
+        span,
+    )
+}
+
+fn pair_span_is_deep_values(
+    pos: i32,
+    plus: i32,
+    circular: bool,
+    clen: i32,
+    lr: i32,
+    rr: i32,
+    margin: i32,
+    span: i32,
+) -> bool {
+    circular
         || (plus > 0 && pos >= margin + lr && pos + span - 1 < clen - margin - rr)
         || (plus < 0 && pos - span + 1 >= margin + lr && pos < clen - margin - rr)
 }
 
 fn read_is_deep(pos: i32, plus: i32, contig: &ContigSequence, margin: i32, read_len: i32) -> bool {
-    let clen = contig.len_max() as i32;
-    let lr = contig.left_repeat;
-    let rr = contig.right_repeat;
-    contig.circular
+    read_is_deep_values(
+        pos,
+        plus,
+        contig.circular,
+        contig.len_max() as i32,
+        contig.left_repeat,
+        contig.right_repeat,
+        margin,
+        read_len,
+    )
+}
+
+fn read_is_deep_values(
+    pos: i32,
+    plus: i32,
+    circular: bool,
+    clen: i32,
+    lr: i32,
+    rr: i32,
+    margin: i32,
+    read_len: i32,
+) -> bool {
+    circular
         || (plus > 0 && pos >= margin + lr && pos + read_len - 1 < clen - margin - rr)
         || (plus < 0 && pos - read_len + 1 >= margin + lr && pos < clen - margin - rr)
 }
@@ -485,6 +543,7 @@ pub fn clean_reads(
     let contig_lens: Vec<usize> = contigs.iter().map(|c| c.len_max()).collect();
     let contig_left_reps: Vec<i32> = contigs.iter().map(|c| c.left_repeat).collect();
     let contig_right_reps: Vec<i32> = contigs.iter().map(|c| c.right_repeat).collect();
+    let contig_circular: Vec<bool> = contigs.iter().map(|c| c.circular).collect();
 
     // Mirror C++ `RemoveUsedReads` (assembler.hpp:658-664): one job per
     // input ReadPair group, parallelized via `RunThreads(ncores, jobs)`.
@@ -523,10 +582,28 @@ pub fn clean_reads(
                     let span = insert_size as i32;
 
                     let should_remove = if let Some((p1, plus1, ci1)) = pos1 {
-                        if pair_span_is_deep(p1, plus1, &contigs[ci1], m, span) {
+                        if pair_span_is_deep_values(
+                            p1,
+                            plus1,
+                            contig_circular[ci1],
+                            contig_lens[ci1] as i32,
+                            contig_left_reps[ci1],
+                            contig_right_reps[ci1],
+                            m,
+                            span,
+                        ) {
                             true
                         } else if let Some((p2, plus2, ci2)) = pos2 {
-                            if pair_span_is_deep(p2, plus2, &contigs[ci2], m, span) {
+                            if pair_span_is_deep_values(
+                                p2,
+                                plus2,
+                                contig_circular[ci2],
+                                contig_lens[ci2] as i32,
+                                contig_left_reps[ci2],
+                                contig_right_reps[ci2],
+                                m,
+                                span,
+                            ) {
                                 true
                             } else if ci1 == ci2 && plus1 != plus2 {
                                 let clen = contig_lens[ci1] as i32;
@@ -541,7 +618,16 @@ pub fn clean_reads(
                             false
                         }
                     } else if let Some((p2, plus2, ci2)) = pos2 {
-                        pair_span_is_deep(p2, plus2, &contigs[ci2], m, span)
+                        pair_span_is_deep_values(
+                            p2,
+                            plus2,
+                            contig_circular[ci2],
+                            contig_lens[ci2] as i32,
+                            contig_left_reps[ci2],
+                            contig_right_reps[ci2],
+                            m,
+                            span,
+                        )
                     } else {
                         false
                     };
@@ -566,9 +652,16 @@ pub fn clean_reads(
 
                     let pos = find_read_position(&read, kmer_len, &map, contigs);
                     let should_remove = match pos {
-                        Some((p, plus, ci)) => {
-                            read_is_deep(p, plus, &contigs[ci], margin as i32, read.len() as i32)
-                        }
+                        Some((p, plus, ci)) => read_is_deep_values(
+                            p,
+                            plus,
+                            contig_circular[ci],
+                            contig_lens[ci] as i32,
+                            contig_left_reps[ci],
+                            contig_right_reps[ci],
+                            margin as i32,
+                            read.len() as i32,
+                        ),
                         None => false,
                     };
 
@@ -612,84 +705,154 @@ pub fn clean_pair_connection_reads(
     );
     let m = margin as i32;
     let span = insert_size as i32;
+    let contig_lens: Vec<usize> = contigs.iter().map(|c| c.len_max()).collect();
+    let contig_left_reps: Vec<i32> = contigs.iter().map(|c| c.left_repeat).collect();
+    let contig_right_reps: Vec<i32> = contigs.iter().map(|c| c.right_repeat).collect();
+    let contig_circular: Vec<bool> = contigs.iter().map(|c| c.circular).collect();
 
-    for rp in reads {
-        let mut cleaned_paired = ReadHolder::new(true);
-        if rp[0].read_num() > 0 {
-            let mut si = rp[0].string_iter();
-            while !si.at_end() {
-                let read1 = si.get();
-                si.advance();
-                if si.at_end() {
-                    break;
-                }
-                let read2 = si.get();
-                si.advance();
+    use rayon::prelude::*;
+    let work_items = cleanup_pair_work_items(reads);
+    let per_group: Vec<(ReadPair, ReadHolder)> = work_items
+        .par_iter()
+        .map(|work| {
+            let rp = work.read_pair;
+            let mut cleaned_paired = ReadHolder::new(true);
+            let mut internal_reads = ReadHolder::new(false);
+            if rp[0].read_num() > 0 {
+                let mut si = rp[0].string_iter_at(work.start_pair * 2);
+                let mut processed = 0usize;
+                while !si.at_end() && processed < work.pair_count {
+                    let read1 = si.get();
+                    si.advance();
+                    if si.at_end() {
+                        break;
+                    }
+                    let read2 = si.get();
+                    si.advance();
+                    processed += 1;
 
-                if read1.len() < kmer_len || read2.len() < kmer_len {
-                    cleaned_paired.push_back_str(&read1);
-                    cleaned_paired.push_back_str(&read2);
-                    continue;
-                }
-
-                let pos1 = find_read_position(&read1, kmer_len, &map, contigs);
-                let pos2 = find_read_position(&read2, kmer_len, &map, contigs);
-                let mut classified = false;
-                if let Some((p1, plus1, ci1)) = pos1 {
-                    if pair_span_is_deep(p1, plus1, &contigs[ci1], m, span) {
+                    if read1.len() < kmer_len || read2.len() < kmer_len {
+                        cleaned_paired.push_back_str(&read1);
+                        cleaned_paired.push_back_str(&read2);
                         continue;
                     }
-                    if let Some((p2, plus2, ci2)) = pos2 {
+
+                    let pos1 = find_read_position(&read1, kmer_len, &map, contigs);
+                    let pos2 = find_read_position(&read2, kmer_len, &map, contigs);
+                    let mut classified = false;
+                    if let Some((p1, plus1, ci1)) = pos1 {
+                        if pair_span_is_deep_values(
+                            p1,
+                            plus1,
+                            contig_circular[ci1],
+                            contig_lens[ci1] as i32,
+                            contig_left_reps[ci1],
+                            contig_right_reps[ci1],
+                            m,
+                            span,
+                        ) {
+                            continue;
+                        }
+                        if let Some((p2, plus2, ci2)) = pos2 {
+                            if pair_span_is_deep_values(
+                                p2,
+                                plus2,
+                                contig_circular[ci2],
+                                contig_lens[ci2] as i32,
+                                contig_left_reps[ci2],
+                                contig_right_reps[ci2],
+                                m,
+                                span,
+                            ) {
+                                continue;
+                            }
+                            if ci1 == ci2 && plus1 != plus2 {
+                                let contig = &contigs[ci1];
+                                let clen = contig_lens[ci1] as i32;
+                                let lr = contig_left_reps[ci1];
+                                let rr = contig_right_reps[ci1];
+                                let is_deep_inside =
+                                    (plus1 > 0 && p1 >= m + lr && p2 < clen - m - rr)
+                                        || (plus1 < 0 && p2 >= m + lr && p1 < clen - m - rr);
+                                if is_deep_inside {
+                                    continue;
+                                }
+                                if let Some((a, b, seq)) = internal_pair_span(p1, plus1, p2, contig)
+                                {
+                                    let _ = (a, b);
+                                    internal_reads.push_back_str(&seq);
+                                    continue;
+                                }
+                                classified = true;
+                            } else if ci1 != ci2 {
+                                classified = true;
+                            }
+                        } else {
+                            classified = true;
+                        }
+                    } else if let Some((p2, plus2, ci2)) = pos2 {
                         if pair_span_is_deep(p2, plus2, &contigs[ci2], m, span) {
                             continue;
                         }
-                        if ci1 == ci2 && plus1 != plus2 {
-                            // C++ assembler.hpp:599-617 uses pos1/pos2 directly
-                            // (no shift). An older version added ±1 shifts to
-                            // compensate for an off-by-one in find_read_position;
-                            // that is now fixed at the source.
-                            let contig = &contigs[ci1];
-                            let clen = contig.len_max() as i32;
-                            let lr = contig.left_repeat;
-                            let rr = contig.right_repeat;
-                            let is_deep_inside =
-                                (plus1 > 0 && p1 >= m + lr && p2 < clen - m - rr)
-                                    || (plus1 < 0 && p2 >= m + lr && p1 < clen - m - rr);
-                            if is_deep_inside {
-                                continue;
-                            }
-                            if let Some((a, b, seq)) =
-                                internal_pair_span(p1, plus1, p2, contig)
-                            {
-                                let _ = (a, b);
-                                result.internal_reads.push_back_str(&seq);
-                                continue;
-                            }
-                            classified = true;
-                        } else if ci1 != ci2 {
-                            classified = true;
-                        }
-                    } else {
                         classified = true;
                     }
-                } else if let Some((p2, plus2, ci2)) = pos2 {
-                    if pair_span_is_deep(p2, plus2, &contigs[ci2], m, span) {
-                        continue;
-                    }
-                    classified = true;
-                }
 
-                let _ = classified;
-                cleaned_paired.push_back_str(&read1);
-                cleaned_paired.push_back_str(&read2);
+                    let _ = classified;
+                    cleaned_paired.push_back_str(&read1);
+                    cleaned_paired.push_back_str(&read2);
+                }
             }
+            ([cleaned_paired, ReadHolder::new(false)], internal_reads)
+        })
+        .collect();
+
+    for (remaining, internal) in per_group {
+        result.remaining_pairs.push(remaining);
+        let mut iter = internal.string_iter();
+        while !iter.at_end() {
+            result.internal_reads.push_back_iter(&iter);
+            iter.advance();
         }
-        result
-            .remaining_pairs
-            .push([cleaned_paired, ReadHolder::new(false)]);
     }
 
     result
+}
+
+#[derive(Clone, Copy)]
+struct CleanupPairWorkItem<'a> {
+    read_pair: &'a ReadPair,
+    start_pair: usize,
+    pair_count: usize,
+}
+
+fn cleanup_pair_work_items(reads: &[ReadPair]) -> Vec<CleanupPairWorkItem<'_>> {
+    let threads = rayon::current_num_threads();
+    let mut out = Vec::with_capacity(reads.len().max(threads * 4));
+    for rp in reads {
+        let pair_count = rp[0].read_num() / 2;
+        if pair_count < threads * 2 {
+            out.push(CleanupPairWorkItem {
+                read_pair: rp,
+                start_pair: 0,
+                pair_count,
+            });
+            continue;
+        }
+
+        let target_chunks = threads * 4;
+        let chunk_pairs = pair_count.div_ceil(target_chunks).max(1);
+        let mut start_pair = 0;
+        while start_pair < pair_count {
+            let len = (pair_count - start_pair).min(chunk_pairs);
+            out.push(CleanupPairWorkItem {
+                read_pair: rp,
+                start_pair,
+                pair_count: len,
+            });
+            start_pair += len;
+        }
+    }
+    out
 }
 
 pub fn clean_internal_reads(
@@ -764,7 +927,10 @@ mod tests {
         let mut contig = ContigSequence::new();
         contig.insert_new_chunk_with("ACGTACGTACGTACGTACGTACGTAAAA".chars().collect());
         let map = build_kmer_to_contig_map(&[contig], &[seed], 21, 0, false, None);
-        assert!(map.is_empty(), "seed kmers should not be indexed for cleanup");
+        assert!(
+            map.is_empty(),
+            "seed kmers should not be indexed for cleanup"
+        );
     }
 
     #[test]

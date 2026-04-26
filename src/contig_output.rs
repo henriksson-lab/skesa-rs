@@ -360,11 +360,7 @@ fn stabilize_iteration_directions(contigs: &mut crate::contig::ContigSequenceLis
         }
 
         let seq = contig.primary_sequence();
-        let kmer_len = contig
-            .left_repeat
-            .max(contig.right_repeat)
-            .max(0) as usize
-            + 1;
+        let kmer_len = contig.left_repeat.max(contig.right_repeat).max(0) as usize + 1;
         if kmer_len == 0 || seq.len() < kmer_len {
             continue;
         }

@@ -46,7 +46,8 @@ pub fn find_contig_connections(
     // Build endpoint k-mer maps
     // Right endpoints: last kmer of each contig → (contig_idx, is_rc=false)
     // Left endpoints (as RC): RC of first kmer → (contig_idx, is_rc for connection)
-    let mut target_kmers: HashMap<Vec<u64>, Vec<(usize, bool)>> = HashMap::new();
+    let mut target_kmers: HashMap<Vec<u64>, Vec<(usize, bool)>> =
+        HashMap::with_capacity(contigs.len().saturating_mul(2));
 
     for (i, seq) in contigs.iter().enumerate() {
         if seq.len() < kmer_len {
@@ -60,7 +61,7 @@ pub fn find_contig_connections(
         } else {
             rc_first
         };
-        let key = canonical.to_words()[..precision].to_vec();
+        let key = canonical.as_words()[..precision].to_vec();
         target_kmers.entry(key).or_default().push((i, false));
 
         // Last k-mer (for right-side connections)
@@ -71,7 +72,7 @@ pub fn find_contig_connections(
         } else {
             rc_last
         };
-        let key_last = canonical_last.to_words()[..precision].to_vec();
+        let key_last = canonical_last.as_words()[..precision].to_vec();
         target_kmers.entry(key_last).or_default().push((i, true));
     }
 
@@ -85,8 +86,8 @@ pub fn find_contig_connections(
         let last_kmer = Kmer::from_kmer_str(&seq[seq.len() - kmer_len..]);
 
         // BFS
-        let mut frontier: VecDeque<(Kmer, Vec<char>, usize)> = VecDeque::new(); // (current, path, steps)
-        let mut visited: HashSet<Vec<u64>> = HashSet::new();
+        let mut frontier: VecDeque<(Kmer, Vec<char>, usize)> = VecDeque::with_capacity(4); // (current, path, steps)
+        let mut visited: HashSet<Vec<u64>> = HashSet::with_capacity(max_distance.saturating_mul(4));
 
         // Initial successors
         let shifted = (last_kmer.shl(2)) & max_kmer;
@@ -98,9 +99,8 @@ pub fn find_contig_connections(
             if idx < kmers.size() {
                 let count = (kmers.get_count(idx) & 0xFFFFFFFF) as u32;
                 if count >= 2 {
-                    let key = canonical.to_words()[..precision].to_vec();
                     // Check if we reached a target
-                    if let Some(targets) = target_kmers.get(&key) {
+                    if let Some(targets) = target_kmers.get(&canonical.as_words()[..precision]) {
                         for &(tgt_idx, is_right_end) in targets {
                             if tgt_idx != src_idx {
                                 connections.push(ContigConnection {
@@ -113,6 +113,7 @@ pub fn find_contig_connections(
                             }
                         }
                     }
+                    let key = canonical.as_words()[..precision].to_vec();
                     if visited.insert(key) {
                         frontier.push_back((next, vec![bin2nt[nt as usize]], 1));
                     }
@@ -135,9 +136,8 @@ pub fn find_contig_connections(
                 if idx < kmers.size() {
                     let count = (kmers.get_count(idx) & 0xFFFFFFFF) as u32;
                     if count >= 2 {
-                        let key = canonical.to_words()[..precision].to_vec();
-
-                        if let Some(targets) = target_kmers.get(&key) {
+                        if let Some(targets) = target_kmers.get(&canonical.as_words()[..precision])
+                        {
                             for &(tgt_idx, is_right_end) in targets {
                                 if tgt_idx != src_idx {
                                     let mut conn_seq = path.clone();
@@ -153,6 +153,7 @@ pub fn find_contig_connections(
                             }
                         }
 
+                        let key = canonical.as_words()[..precision].to_vec();
                         if visited.insert(key) {
                             let mut new_path = path.clone();
                             new_path.push(bin2nt[nt as usize]);

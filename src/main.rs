@@ -120,6 +120,10 @@ struct SkesaArgs {
     #[arg(long, alias = "hash_count", default_value_t = false)]
     hash_count: bool,
 
+    /// C++ compatibility flag for hash-based read finding (default off)
+    #[arg(long, alias = "hash_find", default_value_t = false)]
+    hash_find: bool,
+
     /// Estimated number of distinct k-mers for bloom filter (millions, only for hash counter)
     #[arg(long, alias = "estimated_kmers", default_value_t = 100)]
     estimated_kmers: i32,
@@ -447,6 +451,7 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
         );
         return 1;
     }
+    let _hash_find = args.hash_find;
     if input_files.is_empty() {
         eprintln!("Provide some input reads");
         return 1;
@@ -533,7 +538,8 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
     }
 
     // Load reads
-    let rg = match ReadsGetter::new(&input_files, args.use_paired_ends) {
+    let ncores = resolve_cores(args.cores);
+    let rg = match ReadsGetter::new_with_ncores(&input_files, args.use_paired_ends, ncores) {
         Ok(rg) => rg,
         Err(e) => {
             eprintln!("{}", e);
@@ -589,7 +595,7 @@ fn run_skesa(args: &SkesaArgs) -> i32 {
         force_single_reads: args.force_single_ends,
         insert_size: args.insert_size as usize,
         allow_snps: args.allow_snps,
-        ncores: resolve_cores(args.cores),
+        ncores,
         memory_gb: args.memory as usize,
     };
 
@@ -847,7 +853,7 @@ fn run_kmercounter(args: &KmercounterArgs) -> i32 {
     }
 
     // Load reads
-    let rg = match ReadsGetter::new(&args.reads, false) {
+    let rg = match ReadsGetter::new_with_ncores(&args.reads, false, resolve_cores(args.cores)) {
         Ok(rg) => rg,
         Err(e) => {
             eprintln!("{}", e);

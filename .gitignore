@@ -1,0 +1,16 @@
+/target/
+/.tmp/
+
+# Downloaded/generated benchmark and parity fixtures.
+/tests/external-data/
+
+# Local agent/editor state.
+/.claude/
+/.codex
+*.swp
+*.swo
+
+# Profiling output.
+perf.data
+perf.data.old
+*.perf.data

@@ -3,7 +3,6 @@
 /// Stores (u64_key, u64_count) pairs directly without Vec<u64> indirection.
 /// This eliminates millions of heap allocations during k-mer counting.
 use crate::kmer::Kmer;
-use crate::large_int::oahash64;
 
 use std::collections::HashMap;
 
@@ -12,7 +11,6 @@ use std::collections::HashMap;
 pub struct FlatKmerCount {
     entries: Vec<(u64, u64)>,
     kmer_len: usize,
-    hash_index: Option<HashMap<u64, Vec<usize>>>,
 }
 
 impl FlatKmerCount {
@@ -21,7 +19,6 @@ impl FlatKmerCount {
         FlatKmerCount {
             entries: Vec::new(),
             kmer_len,
-            hash_index: None,
         }
     }
 
@@ -40,13 +37,11 @@ impl FlatKmerCount {
     /// Push a (kmer_value, count) pair
     pub fn push(&mut self, val: u64, count: u64) {
         self.entries.push((val, count));
-        self.hash_index = None;
     }
 
     /// Sort by kmer value
     pub fn sort(&mut self) {
         self.entries.sort_unstable_by_key(|e| e.0);
-        self.hash_index = None;
     }
 
     /// Sort, aggregate duplicates, keep entries with count >= min_count
@@ -78,33 +73,15 @@ impl FlatKmerCount {
         self.entries.truncate(write);
     }
 
-    /// Build hash index for O(1) lookups
-    pub fn build_hash_index(&mut self) {
-        let mut index: HashMap<u64, Vec<usize>> = HashMap::with_capacity(self.entries.len());
-        for (i, (val, _)) in self.entries.iter().enumerate() {
-            let hash = oahash64(*val);
-            index.entry(hash).or_default().push(i);
-        }
-        self.hash_index = Some(index);
-    }
+    /// No-op kept for API compatibility. C++ has no per-counter hash index.
+    #[inline]
+    pub fn build_hash_index(&mut self) {}
 
-    /// Find by kmer value. Returns index or size() if not found.
+    /// Find by kmer value via binary search (mirrors C++ `TKmerCount::Find`).
     pub fn find_val(&self, val: u64) -> usize {
-        if let Some(ref index) = self.hash_index {
-            let hash = oahash64(val);
-            if let Some(indices) = index.get(&hash) {
-                for &idx in indices {
-                    if self.entries[idx].0 == val {
-                        return idx;
-                    }
-                }
-            }
-            self.entries.len()
-        } else {
-            match self.entries.binary_search_by_key(&val, |e| e.0) {
-                Ok(idx) => idx,
-                Err(_) => self.entries.len(),
-            }
+        match self.entries.binary_search_by_key(&val, |e| e.0) {
+            Ok(idx) => idx,
+            Err(_) => self.entries.len(),
         }
     }
 

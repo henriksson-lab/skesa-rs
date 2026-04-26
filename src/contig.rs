@@ -193,7 +193,13 @@ impl ContigSequence {
 
     /// Get the primary (first variant of each chunk) sequence as a string
     pub fn primary_sequence(&self) -> String {
-        let mut result = String::new();
+        let len = self
+            .chunks
+            .iter()
+            .filter_map(|chunk| chunk.first())
+            .map(|variant| variant.len())
+            .sum();
+        let mut result = String::with_capacity(len);
         for chunk in &self.chunks {
             if let Some(first) = chunk.first() {
                 result.extend(first.iter());

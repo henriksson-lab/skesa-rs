@@ -1284,7 +1284,7 @@ pub(crate) fn rotate_circular_contig_to_min_kmer(contig: &mut ContigSequence, km
 
     trim_circular_suffix_overlap(contig, search_k.saturating_sub(1));
 
-    if contig.chunks.iter().all(|chunk| chunk.len() == 1) {
+    if contig.len() == 1 && contig.chunks.iter().all(|chunk| chunk.len() == 1) {
         if strand < 0 {
             contig.reverse_complement();
             let seq_rc = contig.primary_sequence();
@@ -1298,7 +1298,10 @@ pub(crate) fn rotate_circular_contig_to_min_kmer(contig: &mut ContigSequence, km
             .first_mut()
             .and_then(|chunk| chunk.first_mut())
         {
-            first.rotate_left(pos);
+            if !first.is_empty() {
+                let shift = pos % first.len();
+                first.rotate_left(shift);
+            }
         }
         contig.left_extend = 0;
         contig.right_extend = 0;
@@ -1345,7 +1348,10 @@ pub(crate) fn rotate_circular_contig_to_min_kmer(contig: &mut ContigSequence, km
 
     if contig.len() == 1 {
         if let Some(first) = contig.chunks[0].first_mut() {
-            first.rotate_left(first_base);
+            if !first.is_empty() {
+                let shift = first_base % first.len();
+                first.rotate_left(shift);
+            }
         }
         return;
     }
@@ -1356,7 +1362,10 @@ pub(crate) fn rotate_circular_contig_to_min_kmer(contig: &mut ContigSequence, km
             last.extend(moved_front.iter().copied());
         }
         contig.chunks.remove(0);
-        contig.chunks.rotate_left(first_chunk - 1);
+        if !contig.chunks.is_empty() {
+            let shift = (first_chunk - 1) % contig.chunks.len();
+            contig.chunks.rotate_left(shift);
+        }
     }
     if first_base > 0 && !contig.chunks.is_empty() {
         let last = contig.len() - 1;
